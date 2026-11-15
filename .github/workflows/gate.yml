@@ -1,0 +1,140 @@
+name: Gate
+
+# フォーク専用: 修正ブランチを upstream の最新 master とマージした状態で
+# `make gate` を流し、PR に貼る要約（Tests: / scale-test / gate: の行）を
+# ジョブの要約に出す。ブランチごとに別のランナーで動くので、何本でも並行して流せる。
+#
+#   gh workflow run gate.yml --repo waka/spinel -f branch=<ブランチ名>
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: gate にかけるブランチ（このフォークのもの）
+        required: true
+      base:
+        description: マージする matz/spinel の ref
+        required: false
+        default: master
+
+run-name: gate ${{ inputs.branch }} (+ upstream ${{ inputs.base }})
+
+# 同じブランチをもう一度流したら、古い方は止める
+concurrency:
+  group: gate-${{ inputs.branch }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    # GitHub のホストランナーの上限
+    timeout-minutes: 360
+    env:
+      # ci.yml と同じく sccache のディスクキャッシュを使う
+      # （common.mk が PATH 上の sccache を見つけて cc を包む）
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_STARTUP_TIMEOUT: "30"
+      SCCACHE_IDLE_TIMEOUT: "0"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+
+      # CONTRIBUTING.md: gate は「ブランチを現在の master とマージした状態」で流す
+      - name: Merge upstream master
+        id: merge
+        run: |
+          git config user.name gate
+          git config user.email gate@localhost
+          git remote add upstream https://github.com/matz/spinel.git
+          git fetch --no-tags upstream "${{ inputs.base }}"
+          git merge --no-edit FETCH_HEAD
+          {
+            echo "branch=$(git rev-parse --short HEAD^2 2>/dev/null || git rev-parse --short HEAD)"
+            echo "upstream=$(git rev-parse --short FETCH_HEAD)"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libsqlite3-dev libssl-dev zlib1g-dev libffi-dev libyaml-dev time
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      # キーは毎回変わる（run id を含む）ので、復元は直近のものから。
+      # 保存はジョブの最後に、gate が失敗しても行う。
+      - name: Restore the sccache store
+        uses: actions/cache/restore@v6
+        with:
+          path: .sccache
+          key: gate-sccache-${{ github.run_id }}
+          restore-keys: gate-sccache-
+
+      - name: Restore the result cache
+        uses: actions/cache/restore@v6
+        with:
+          path: build/result-cache
+          key: gate-result-cache-${{ github.run_id }}
+          restore-keys: gate-result-cache-
+
+      - name: Pre-start sccache server
+        run: sccache --start-server
+
+      - name: Fetch dependencies
+        run: |
+          for i in 1 2 3 4 5; do make deps && exit 0; sleep 5; done
+          exit 1
+
+      - name: make gate
+        run: |
+          set -o pipefail
+          start=$(date +%s)
+          make gate 2>&1 | tee gate.log
+          echo "elapsed=$(( $(date +%s) - start ))" >> "$GITHUB_ENV"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "## make gate: \`${{ inputs.branch }}\`"
+            echo
+            echo "branch \`${{ steps.merge.outputs.branch }}\` merged with matz/spinel ${{ inputs.base }} \`${{ steps.merge.outputs.upstream }}\`"
+            echo "on $(uname -m), gcc $(gcc -dumpfullversion), $(getconf _NPROCESSORS_ONLN) CPUs${elapsed:+, $(( elapsed / 60 )) min}"
+            echo
+            echo '```'
+            grep -E 'Tests:|scale-test|gate:' gate.log 2>/dev/null || echo "(no summary lines: see gate.log)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload gate.log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-log
+          path: gate.log
+          if-no-files-found: ignore
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
+      - name: Save the sccache store
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: .sccache
+          key: gate-sccache-${{ github.run_id }}
+
+      - name: Save the result cache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: build/result-cache
+          key: gate-result-cache-${{ github.run_id }}
