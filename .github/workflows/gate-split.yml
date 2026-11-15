@@ -8,6 +8,7 @@ name: Gate (split)
 #
 # 段階の分け方は Makefile の gate-legs に合わせている。テストプログラム全体は
 # ci.yml と同じく TEST_SHARD で分け、1 つ目だけが C 側のテスト（make test）も流す。
+# ruby/spec は Makefile の RUBYSPEC_SHARD で分ける（k=1..n で全部を 1 回ずつ流す）。
 on:
   workflow_dispatch:
     inputs:
@@ -20,6 +21,10 @@ on:
         default: master
       shards:
         description: テストプログラム全体を何分割するか
+        required: false
+        default: "4"
+      rubyspec_shards:
+        description: ruby/spec を何分割するか
         required: false
         default: "4"
 
@@ -42,11 +47,13 @@ jobs:
         run: |
           echo "upstream=$(git ls-remote https://github.com/matz/spinel.git "refs/heads/${{ inputs.base }}" | cut -f1)" >> "$GITHUB_OUTPUT"
           echo "branch=$(git ls-remote "https://github.com/${{ github.repository }}.git" "refs/heads/${{ inputs.branch }}" | cut -f1)" >> "$GITHUB_OUTPUT"
-      # 段階の一覧（テストプログラム全体は shards 個に分ける）
+      # 段階の一覧（テストプログラム全体は shards 個、ruby/spec は rubyspec_shards 個に分ける）
       - id: legs
         run: |
           n=${{ inputs.shards }}
-          legs='"rubyspec","bench","optcarrot","rubyboy","pkg-ondemand","props"'
+          m=${{ inputs.rubyspec_shards }}
+          legs='"bench","optcarrot","rubyboy","pkg-ondemand","props"'
+          for k in $(seq "$m" -1 1); do legs="\"rubyspec-$k\",$legs"; done
           for k in $(seq 1 "$n"); do legs="$legs,\"test-$k\""; done
           echo "legs=[$legs]" >> "$GITHUB_OUTPUT"
 
@@ -130,7 +137,7 @@ jobs:
           start=$(date +%s)
           n=${{ inputs.shards }}
           case "$LEG" in
-            rubyspec)     cmd="make gate-rubyspec" ;;
+            rubyspec-*)   cmd="make gate-rubyspec RUBYSPEC_SHARD=${LEG#rubyspec-}/${{ inputs.rubyspec_shards }}" ;;
             bench)        cmd="make gate-bench" ;;
             # gate-method-table は gate-optcarrot に依存するので、一緒に流す
             optcarrot)    cmd="make gate-method-table" ;;
