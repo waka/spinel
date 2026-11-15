@@ -1,0 +1,228 @@
+name: Gate (split)
+
+# フォーク専用: gate.yml と同じことを、段階ごとに別のランナーで同時に流す。
+# 待ち時間は一番遅い段階の分まで縮む。最後の summary ジョブが、PR に貼る要約
+# （Tests: / scale-test / gate: の行）をジョブの要約に出す。
+#
+#   gh workflow run gate-split.yml --repo waka/spinel -f branch=<ブランチ名>
+#
+# 段階の分け方は Makefile の gate-legs に合わせている。テストプログラム全体は
+# ci.yml と同じく TEST_SHARD で分け、1 つ目だけが C 側のテスト（make test）も流す。
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: gate にかけるブランチ（このフォークのもの）
+        required: true
+      base:
+        description: マージする matz/spinel の ref
+        required: false
+        default: master
+      shards:
+        description: テストプログラム全体を何分割するか
+        required: false
+        default: "4"
+
+run-name: gate-split ${{ inputs.branch }} (+ upstream ${{ inputs.base }})
+
+concurrency:
+  group: gate-split-${{ inputs.branch }}
+  cancel-in-progress: true
+
+jobs:
+  # 全ジョブが同じ upstream のコミットとマージするように、ここで 1 つに決める
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      upstream: ${{ steps.pick.outputs.upstream }}
+      branch: ${{ steps.pick.outputs.branch }}
+      legs: ${{ steps.legs.outputs.legs }}
+    steps:
+      - id: pick
+        run: |
+          echo "upstream=$(git ls-remote https://github.com/matz/spinel.git "refs/heads/${{ inputs.base }}" | cut -f1)" >> "$GITHUB_OUTPUT"
+          echo "branch=$(git ls-remote "https://github.com/${{ github.repository }}.git" "refs/heads/${{ inputs.branch }}" | cut -f1)" >> "$GITHUB_OUTPUT"
+      # 段階の一覧（テストプログラム全体は shards 個に分ける）
+      - id: legs
+        run: |
+          n=${{ inputs.shards }}
+          legs='"rubyspec","bench","optcarrot","rubyboy","pkg-ondemand","props"'
+          for k in $(seq 1 "$n"); do legs="$legs,\"test-$k\""; done
+          echo "legs=[$legs]" >> "$GITHUB_OUTPUT"
+
+  leg:
+    needs: prepare
+    name: ${{ matrix.leg }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        leg: ${{ fromJSON(needs.prepare.outputs.legs) }}
+    env:
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_STARTUP_TIMEOUT: "30"
+      SCCACHE_IDLE_TIMEOUT: "0"
+      # キャッシュのキーに使う段階名（test-k は shard ごと）
+      LEG: ${{ matrix.leg }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.branch }}
+          fetch-depth: 0
+
+      - name: Merge upstream
+        run: |
+          git config user.name gate
+          git config user.email gate@localhost
+          git fetch --no-tags https://github.com/matz/spinel.git "${{ needs.prepare.outputs.upstream }}"
+          git merge --no-edit FETCH_HEAD
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libsqlite3-dev libssl-dev zlib1g-dev libffi-dev libyaml-dev time
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      # 同じ段階の最新を優先し、無ければどの段階のものでも使う。
+      # 結果のキャッシュはハッシュで引くので、別の段階のものでも当たる分は当たる。
+      - name: Restore the sccache store
+        uses: actions/cache/restore@v6
+        with:
+          path: .sccache
+          key: gate-sccache-${{ matrix.leg }}-${{ github.run_id }}
+          restore-keys: |
+            gate-sccache-${{ matrix.leg }}-
+            gate-sccache-
+
+      - name: Restore the result cache
+        uses: actions/cache/restore@v6
+        with:
+          path: build/result-cache
+          key: gate-result-cache-${{ matrix.leg }}-${{ github.run_id }}
+          restore-keys: |
+            gate-result-cache-${{ matrix.leg }}-
+            gate-result-cache-
+
+      - name: Pre-start sccache server
+        run: sccache --start-server
+
+      - name: Fetch dependencies
+        run: |
+          for i in 1 2 3 4 5; do make deps && exit 0; sleep 5; done
+          exit 1
+
+      # gate はまず make all が通ることを確かめる（Makefile の gate と同じ）
+      - name: make all
+        run: make all
+
+      - name: Run the leg
+        run: |
+          set -o pipefail
+          start=$(date +%s)
+          n=${{ inputs.shards }}
+          case "$LEG" in
+            rubyspec)     cmd="make gate-rubyspec" ;;
+            bench)        cmd="make gate-bench" ;;
+            # gate-method-table は gate-optcarrot に依存するので、一緒に流す
+            optcarrot)    cmd="make gate-method-table" ;;
+            rubyboy)      cmd="make gate-rubyboy" ;;
+            pkg-ondemand) cmd="make gate-pkg-ondemand" ;;
+            props)        cmd="make gate-props" ;;
+            test-1)       cmd="make gate-test TEST_SHARD=1/$n" ;;
+            test-*)
+              k=${LEG#test-}
+              # 2 つ目以降はテストプログラムだけ（ci.yml の test-corpus と同じ）。
+              # パッケージのテストは TEST_SHARD で分かれず毎回流れるので、
+              # 1 つ目に任せて外す（Tests: の合計が重複しないように）
+              cmd="make gate-pch && make test-corpus OPT=-O1 TEST_PLAN_CHECK=--plan-check TEST_SHARD=$k/$n PKG_TESTS= && tools/plan_check.sh --from-results build/test-results" ;;
+            *) echo "unknown leg $LEG"; exit 2 ;;
+          esac
+          echo "leg $LEG: $cmd"
+          bash -c "$cmd" 2>&1 | tee "leg-$LEG.log"
+          rc=${PIPESTATUS[0]}
+          echo "$(( $(date +%s) - start ))" > "leg-$LEG.seconds"
+          exit $rc
+
+      - name: Upload the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: leg-${{ matrix.leg }}
+          path: |
+            leg-${{ matrix.leg }}.log
+            leg-${{ matrix.leg }}.seconds
+          if-no-files-found: ignore
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats || true
+
+      - name: Save the sccache store
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: .sccache
+          key: gate-sccache-${{ matrix.leg }}-${{ github.run_id }}
+
+      - name: Save the result cache
+        if: always()
+        uses: actions/cache/save@v6
+        with:
+          path: build/result-cache
+          key: gate-result-cache-${{ matrix.leg }}-${{ github.run_id }}
+
+  summary:
+    needs: [prepare, leg]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: leg-*
+          merge-multiple: true
+
+      - name: Summary
+        run: |
+          shopt -s nullglob
+          # テストプログラム全体の Tests: 行（shard ごと）を合計して 1 行にする
+          pass=0; fail=0; err=0; nshard=0
+          for f in leg-test-*.log; do
+            l=$(grep -E '^Tests: [0-9]+ pass' "$f" | tail -1) || continue
+            set -- $(echo "$l" | grep -oE '[0-9]+')
+            pass=$((pass + $1)); fail=$((fail + $2)); err=$((err + $3)); nshard=$((nshard + 1))
+          done
+          ok=${{ needs.leg.result == 'success' && 1 || 0 }}
+          {
+            echo "## make gate (split): \`${{ inputs.branch }}\`"
+            echo
+            echo "branch \`${{ needs.prepare.outputs.branch }}\` merged with matz/spinel ${{ inputs.base }} \`${{ needs.prepare.outputs.upstream }}\`"
+            echo
+            echo '```'
+            [ "$nshard" -gt 0 ] && echo "Tests: $pass pass, $fail fail, $err error"
+            # テストプログラム以外の段階が出す Tests: / scale-test 行はそのまま
+            for f in leg-*.log; do
+              case "$f" in leg-test-*) continue ;; esac
+              grep -E 'Tests:|scale-test' "$f" || true
+            done
+            if [ "$ok" = 1 ]; then echo "gate: ALL GREEN"; else echo "gate: FAILED (see the failed legs)"; fi
+            echo '```'
+            echo
+            echo "| leg | minutes |"
+            echo "|---|---|"
+            for s in leg-*.seconds; do
+              leg=${s#leg-}; leg=${leg%.seconds}
+              echo "| $leg | $(( $(cat "$s") / 60 )) |"
+            done
+            [ "$nshard" -ne ${{ inputs.shards }} ] && echo && echo "(only $nshard of ${{ inputs.shards }} corpus shards reported a Tests: line)"
+            true
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ "$ok" = 1 ]
