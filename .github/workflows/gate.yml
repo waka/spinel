@@ -47,12 +47,11 @@ jobs:
           git config user.name gate
           git config user.email gate@localhost
           git remote add upstream https://github.com/matz/spinel.git
+          # マージする前のブランチのコミットを記録する
+          echo "branch=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
           git fetch --no-tags upstream "${{ inputs.base }}"
           git merge --no-edit FETCH_HEAD
-          {
-            echo "branch=$(git rev-parse --short HEAD^2 2>/dev/null || git rev-parse --short HEAD)"
-            echo "upstream=$(git rev-parse --short FETCH_HEAD)"
-          } >> "$GITHUB_OUTPUT"
+          echo "upstream=$(git rev-parse --short FETCH_HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Install system packages
         run: |
