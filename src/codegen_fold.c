@@ -10341,6 +10341,15 @@ int default_refs_earlier_param(Compiler *c, Scope *m) {
   return 0;
 }
 
+/* Does a default after parameter k assign it (`b = (a = 4)` for a)? The
+   call passes k's temp, which takes the value the default left. */
+static int later_default_writes_param(Compiler *c, Scope *m, int k) {
+  if (!m->pnames || !m->pnames[k] || !m->pdefault) return 0;
+  for (int j = k + 1; j < m->nparams; j++)
+    if (m->pdefault[j] >= 0 && subtree_writes_local(c, m->pdefault[j], m->pnames[k])) return 1;
+  return 0;
+}
+
 static void emit_argument_error(const char *msg);
 /* See codegen_internal.h. CRuby evaluates every argument before the callee
    refuses them or judges a keyword, and converts each `**` operand where it
@@ -13245,10 +13254,16 @@ else {
          whole call, once per enclosing call (`E.new.child(E.new.on_click
          { })...` gave 2^depth copies of each block). An enclosing binding
          is recorded for emit_dispatch, which names it in g_pre when the
-         dispatch put anything there to run ahead of it. */
+         dispatch put anything there to run ahead of it. A parameter a
+         later default assigns takes that value in its temp (below), and
+         an enclosing binding's temp is still read after the call: a
+         setter's value temp (setter_value_open) answered the default's
+         value for `x = 1` through `define_method(:x=) { |a, b = (a = 4)| }`.
+         It keeps a temp of its own. */
       int ran_t = provided >= 0 && repr_of(c, provided).as_ty == att
                     ? ran_first_temp(provided, argov_saved_d, ab.p, &atmp_o[k]) : -1;
-      if (ran_t < 0 && provided >= 0 && repr_of(c, provided).as_ty == att && g_n_disp_outer < MAX_ARG_OVERRIDE) {
+      if (ran_t < 0 && provided >= 0 && repr_of(c, provided).as_ty == att && g_n_disp_outer < MAX_ARG_OVERRIDE &&
+          !(pd_active && later_default_writes_param(c, pm, k))) {
         ran_t = ran_first_temp(provided, 0, ab.p, &atmp_o[k]);
         if (ran_t >= 0) g_disp_outer_t[g_n_disp_outer++] = ran_t;
       }
@@ -13297,17 +13312,13 @@ else {
      alias, or its cell when a closure captures the parameter; the call
      passes the temp, which takes the value */
   for (int k = 0; pd_active && k < np; k++)
-    if (pd_alias[k]) {
+    if (pd_alias[k] && later_default_writes_param(c, pm, k)) {
       LocalVar *cp = scope_local(pm, pm->pnames[k]);
       int cell = cp && cp->is_cell && !cp->byref_out;
-      for (int j = k + 1; j < pm->nparams; j++)
-        if (pm->pdefault && pm->pdefault[j] >= 0 && subtree_writes_local(c, pm->pdefault[j], pm->pnames[k])) {
-          emit_indent(g_pre, g_indent);
-          if (!cell) buf_printf(g_pre, "_t%d = lv__pd%d_%d;\n", atmp[k], pd_uid, k);
-          else if (cp->type == TY_PROC) buf_printf(g_pre, "_t%d = (sp_Proc *)(uintptr_t)*_cell__pd%d_%d;\n", atmp[k], pd_uid, k);
-          else buf_printf(g_pre, "_t%d = *_cell__pd%d_%d;\n", atmp[k], pd_uid, k);
-          break;
-        }
+      emit_indent(g_pre, g_indent);
+      if (!cell) buf_printf(g_pre, "_t%d = lv__pd%d_%d;\n", atmp[k], pd_uid, k);
+      else if (cp->type == TY_PROC) buf_printf(g_pre, "_t%d = (sp_Proc *)(uintptr_t)*_cell__pd%d_%d;\n", atmp[k], pd_uid, k);
+      else buf_printf(g_pre, "_t%d = *_cell__pd%d_%d;\n", atmp[k], pd_uid, k);
     }
   free(pd_alias);
   g_nren = pd_ren_base;   /* the renames served the defaults only */
