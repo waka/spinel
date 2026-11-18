@@ -820,7 +820,7 @@ static int nf_call(NF *f, int v) {
   /* a removal from an object Array: a queue or a stack the program empties,
      whose nil a call on the element then meets */
   if (r >= 0 && ty_is_obj_array(rt) &&
-      (sp_streq(nm, "pop") || sp_streq(nm, "shift") || sp_streq(nm, "delete_at")))
+      (sp_streq(nm, "pop") || sp_streq(nm, "shift") || sp_streq(nm, "delete_at") || sp_streq(nm, "delete")))
     return NFW_TAKEN;
   /* an element read that can miss, a pick that finds nothing */
   if (r >= 0 && nf_container(rt)) {
@@ -1701,7 +1701,7 @@ static void nf_calls(NF *f, int **yields, int *nyields) {
         Scope *s = comp_scope_of(c, id);
         if (s && s->is_cmethod && s->class_id >= 0) k = s->class_id;
       }
-      if (k >= 0) mi = cplan_new_initialize(c, id, k, NULL);
+      if (k >= 0) mi = cplan_hook_target(c, id, k, "initialize", NULL);
       dispatch = CP_DIRECT;
     }
     if (mi >= 0) {

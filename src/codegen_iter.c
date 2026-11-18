@@ -2,6 +2,7 @@
    lowering, split out of codegen_call.c. Pure code movement, no logic change. */
 
 #include "codegen_internal.h"
+#include "codegen_call_arms.h"
 #include "codegen_poly.h"
 #include "share.h"
 #include "repr.h"
@@ -570,7 +571,6 @@ static void inline_target_lookup(Compiler *c, int id, const char *name, int recv
                         ? key_name(c, recv) : NULL;
     /* (the class the node names: an alias's too) */
   int ci = cname ? const_node_class_index(c, recv) : rk == NK_SelfNode && class_body_self_ci(c, recv) >= 0 ? class_body_self_ci(c, recv) : self_class_static_ci(c, recv);
-  if (ci < 0 && cname) ci = comp_class_index(c, cname);
     if ((t->mi = class_reopen_cmethod(c, id, recv, name)) >= 0) {
       t->cm_class = c->scopes[t->mi].class_id;
       t->cm_self_id = builtin_class_id(cname);
@@ -686,7 +686,6 @@ static int inline_target_plan(Compiler *c, int id, const char *name, int recv, i
   }
   /* (the class the node names: an alias's too) */
   int ci = cname ? const_node_class_index(c, recv) : bci >= 0 ? bci : self_class_static_ci(c, recv);
-  if (ci < 0 && cname) ci = comp_class_index(c, cname);
   if (p.via == UC_CMETH && !p.by_name && (cname || ci >= 0)) {
     if (ci >= 0 && p.owner_ci == ci) { t->mi = p.mi; t->cm_class = ci; return 1; }
     if (!narrow && cname && builtin_class_id(cname) && p.owner_ci == c->scopes[p.mi].class_id &&
@@ -1403,8 +1402,25 @@ void emit_yield_proc_call(Compiler *c, int site, TyKind result_ty, Buf *b, int i
   for (int i = 0; i < nk; i++) needed |= proc_body_node(c, ks[i]) < 0 || used_block_param(c, ks[i]) != NULL;
   if (proc_body_node(c, g_yield_proc_expr) >= 0) needed = used_block_param(c, g_yield_proc_expr) != NULL;
   int blk = needed ? literal : -1;
+  /* (also a forwarded proc's `blk&.call`: a super into a block-taking
+     parent drives its yields through the caller's &blk, which is nil
+     when the caller got no block) */
+  if (nt_safe_nav(nt, site) && g_sn_skip != site) {
+    int receiver = nt_ref(nt, site, "receiver"), rv = view_push(c, receiver, TY_PROC);
+    int slot = view_bind(receiver, "%s", g_yield_proc_ref);
+    int view = view_push(c, site, as_expr ? result_ty : TY_POLY);
+    int guarded = emit_call_safe_nav_arms(c, site, b, nt, nt_str(nt, site, "name"), receiver);
+    view_pop(c, view);
+    view_unbind(slot); view_pop(c, rv);
+    if (guarded) { if (!as_expr) buf_puts(b, ";\n"); return; }
+  }
   Buf recv = {0};
-  if (literal >= 0) buf_printf(&recv, "sp_proc_recv(%s, \"%s\")", g_yield_proc_ref, blockless_block_param_call_name(c, site));
+  if (literal >= 0) {
+    buf_puts(&recv, "sp_proc_recv(");
+    if (g_sn_skip == site) emit_expr(c, nt_ref(nt, site, "receiver"), &recv);
+    else buf_puts(&recv, g_yield_proc_ref);
+    buf_printf(&recv, ", \"%s\")", blockless_block_param_call_name(c, site));
+  }
   const char *ref = recv.p ? recv.p : g_yield_proc_ref;
   if (!as_expr && blk < 0) {
     emit_indent(b, indent);
@@ -1587,6 +1603,10 @@ static int block_tail_needs_value_form(Compiler *c, int id) {
      if-modifier) left the outer splice void (`{ |__fwd| yield __fwd }`, the
      forward of a named &block, handed on to a builtin). */
   if (nt_kind(nt, id) == NK_YieldNode) return 1;
+  /* a tail `super` into a parent that yields: the statement form splices
+     the parent's body as a compound statement, whose value is void
+     (`tx { super }`, the parent using its &block) */
+  if (nt_kind(nt, id) == NK_SuperNode || nt_kind(nt, id) == NK_ForwardingSuperNode) return 1;
   /* a definition as the tail (`{ def m = 1 }`, `{ attr_reader :a }`,
      `{ private def m = 1 }`): the definition emits with its class and its
      statement form is nothing, while the expression is the name as a
@@ -1609,6 +1629,11 @@ static int block_tail_needs_value_form(Compiler *c, int id) {
   if (nt_kind(nt, id) != NK_CallNode) return 0;
   const char *nm = nt_str(nt, id, "name");
   if (!nm) return 0;
+  /* `obj.x = v` as the tail: the block answers v, as every assignment does.
+     The statement form of a class's writer (`Klass.x = v`) runs it for its
+     effect, and the statement expression's value was what the writer's body
+     returns (`try { Config.limit = 5 }` read a String as an Integer) */
+  if (call_is_setter_assign(nt, id)) return 1;
   /* `system(cmd)` as the tail: its statement form is a compound (the argv
      array is built inside braces), whose value is void, while the call has
      a value (the exit status as a boolean) that the block answers with.
@@ -2726,7 +2751,14 @@ void emit_block_invoke(Compiler *c, int site, Buf *b, int indent, int as_expr,
     }
     char ref[32] = "NULL"; if (t >= 0) snprintf(ref, sizeof ref, "_t%d", t);
     BI_BLOCK_SIDE();
-    emit_iter_param_assign(c, blk, bpn, rename_local(bpn), TY_PROC, ref, b, indent);
+    Scope *bsc = comp_scope_of(c, blk); LocalVar *blv = bsc ? scope_local(bsc, bpn) : NULL;
+    emit_param_cell_fresh(c, blk, bpn, b, as_expr ? 0 : indent);
+    if (emit_proc_cell_lvalue(c, blk, bpn, b)) buf_printf(b, "%s);\n", ref);
+    else if (blv && blv->is_cell) {
+      emit_local_ref(c, blk, bpn, b); buf_puts(b, " = ");
+      emit_boxed_text(c, TY_PROC, ref, b); buf_puts(b, ";\n");
+    }
+    else emit_iter_param_assign(c, blk, bpn, rename_local(bpn), TY_PROC, ref, b, indent);
     BI_METHOD_SIDE();
   }
   emit_block_binds(c, blk, yargs, yc, b, indent, as_expr, &bi);
@@ -3808,7 +3840,6 @@ int call_targets_yielding_method(Compiler *c, int id) {
                      ? key_name(c, recv) : NULL;
     /* (the class the node names, as inline_target_lookup asks) */
     int ci = cn ? const_node_class_index(c, recv) : rk == NK_SelfNode ? class_body_self_ci(c, recv) : -1;
-    if (ci < 0 && cn) ci = comp_class_index(c, cn);
     if (ci >= 0) mi = call_target(c, id, ci, name, CT_CMETHOD, NULL);
     else if (ty_is_object(rt)) mi = call_target(c, id, ty_object_class(rt), name, 0, NULL);
   }
@@ -4505,12 +4536,12 @@ int emit_takewhile_with_index(Compiler *c, int id, Buf *b) {
   emit_indent(g_pre, g_indent + 1);
   if (is_take) {
     buf_printf(g_pre, "if (!(%s)) break;\n", cb.p ? cb.p : "0");
-    emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, sp_streq(k, "Str") ? "sp_%sArray_push(_t%d, SP_STR_B(%s));\n" : "sp_%sArray_push(_t%d, %s);\n", k, tr, es);
+    emit_indent(g_pre, g_indent + 1); emit_kind_push(c, g_pre, k, tr, es); buf_puts(g_pre, ";\n");
   }
   else {
     buf_printf(g_pre, "if (_t%d && (%s)) continue;\n", tdrop, cb.p ? cb.p : "0");
     emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "_t%d = 0;\n", tdrop);
-    emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, sp_streq(k, "Str") ? "sp_%sArray_push(_t%d, SP_STR_B(%s));\n" : "sp_%sArray_push(_t%d, %s);\n", k, tr, es);
+    emit_indent(g_pre, g_indent + 1); emit_kind_push(c, g_pre, k, tr, es); buf_puts(g_pre, ";\n");
   }
   free(cb.p);
   emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
@@ -5055,6 +5086,9 @@ int emit_array_filter_loop(Compiler *c, int recv, int block, TyKind rt, const ch
   /* an Integer or Float element is held with its nil, so a kept nil is
      written down as nil */
   int ote = oint_kind(et) && !live;
+  /* an Array that holds the handle compacts by moving the handles, whatever its block's parameter binds
+     (one_h): the row's `_e` entries */
+  TyKind hrt = live || ote ? TY_UNKNOWN : rt;   /* (what the entries are asked of: the container row) */
   char lv[32], lenf[48], getf[48], setf[48];
   snprintf(lv, sizeof lv, "_t%d", live ? g_face_live_box : t);
   if (live) {
@@ -5065,12 +5099,12 @@ int emit_array_filter_loop(Compiler *c, int recv, int block, TyKind rt, const ch
   }
   else {
     snprintf(lenf, sizeof lenf, "sp_%sArray_length", kk);
-    snprintf(getf, sizeof getf, "sp_%sArray_%s", kk, ote ? "oget" : one_h ? "get_e" : "get");
+    { Buf ge = {0}; emit_elem_entry(&ge, 0, hrt, kk, ote ? "oget" : "get", ""); snprintf(getf, sizeof getf, "%s", ge.p); free(ge.p); }
     /* (a kept element written past the end of an array the block cut
        fills the gap with nil, as CRuby's store does, and as the setters of
        the other kinds do; the plain pointer setter drops it) */
-    snprintf(setf, sizeof setf, "sp_%sArray_%s", kk,
-             ote ? "oset" : one_h ? "set_e" : sp_streq(kk, "Ptr") ? "set_grow" : "set");
+    { Buf se = {0}; emit_elem_entry(&se, 0, hrt, kk, ote ? "oset" : ty_is_obj_array(rt) ? "set_grow" : "set", "");
+      snprintf(setf, sizeof setf, "%s", se.p); free(se.p); }
   }
   Buf rb = expr_buf(c, recv);
   /* rooted: a receiver that is a temporary has no other holder once its own
@@ -5093,7 +5127,7 @@ int emit_array_filter_loop(Compiler *c, int recv, int block, TyKind rt, const ch
   buf_printf(b, " sp_RbVal _t%d = sp_box_nil(); SP_GC_ROOT_RBVAL(_t%d);\n", tnv, tnv);
   emit_indent(b, indent);
   if (ote) buf_printf(b, "%s _t%d = %s;\n", oint_ctype(et), te, oint_nil(et));
-  else if (one_h) buf_printf(b, "sp_String *_t%d = NULL; SP_GC_ROOT(_t%d);\n", te, te);
+  else if (typed_elem_held(hrt) == TY_STRBUF) buf_printf(b, "sp_String *_t%d = NULL; SP_GC_ROOT(_t%d);\n", te, te);
   else {
     emit_ctype(c, et, b);
     if (et == TY_POLY) buf_printf(b, " _t%d = sp_box_nil(); SP_GC_ROOT_RBVAL(_t%d);\n", te, te);
@@ -6066,7 +6100,8 @@ static int iter_range_upto_arms(Compiler *c, int id, Buf *b, int indent, const N
     const int *argv = NULL;
     if (args >= 0) argv = nt_arr(nt, args, "arguments", &argc);
     if (argc != 1) return 0;
-    Buf lo; memset(&lo, 0, sizeof lo); emit_expr(c, recv, &lo);
+    Buf lo; memset(&lo, 0, sizeof lo);
+    if (!emit_scalar_recv_maybe_nil(c, recv, name, &lo)) emit_expr(c, recv, &lo);
     /* a boxed limit (the receiver reached this arm through the poly face,
        and its limit is boxed too) is unboxed to the counter's sp_int; it did
        not compile against it (#4665). A typed limit stays as it is: a Float
@@ -7078,7 +7113,7 @@ static int iter_ewi_zip_poly_arms(Compiler *c, int id, Buf *b, int indent, const
        the method called (enum_walk_name) */
     const char *wn = enum_walk_name(c, id, recv, name);
     emit_indent(b, indent); emit_poly_iter_obj_reject_as(c, id, ta, name, wn, b);
-    emit_indent(b, indent); emit_poly_iter_obj_normalize(c, ta, b);
+    emit_indent(b, indent); emit_poly_iter_obj_normalize(c, id, ta, b);
     emit_walk_arity_raise(c, id, recv, name, ta, indent, b);
     /* a boxed Dir walks its entries under `each` (sp_poly_block_iter_check);
        only a program that names Dir can hold one, so any other keeps the
@@ -7566,6 +7601,18 @@ static int step_recv_hoists(Compiler *c, int id, int argc, const int *argv) {
   int paren = 0;
   for (int i = 0; i < argc && !paren; i++) paren = nt_kind(c->nt, argv[i]) == NK_ParenthesesNode;
   return paren && g_pre && g_sn_skip != id;
+}
+
+/* The receiver of an Integer or Float `step`: a nil one is the NoMethodError
+   its call raises (emit_scalar_recv_maybe_nil), not the argument's TypeError */
+static void emit_step_recv_int(Compiler *c, int recv, Buf *b) {
+  if (!emit_scalar_recv_maybe_nil(c, recv, "step", b)) emit_int_expr(c, recv, b);
+}
+static void emit_step_recv_float(Compiler *c, int recv, Buf *b) {
+  Buf rb; memset(&rb, 0, sizeof rb);
+  if (!emit_scalar_recv_maybe_nil(c, recv, "step", &rb)) { emit_float_expr(c, recv, b); return; }
+  buf_printf(b, comp_ntype(c, recv) == TY_INT ? "(sp_float)(%s)" : "%s", rb.p ? rb.p : "0");
+  free(rb.p);
 }
 
 static int step_bind_recv(Compiler *c, int id, int recv, const char *cty, void (*emit)(Compiler *, int, Buf *),
@@ -8092,7 +8139,7 @@ static int emit_iteration_stmt_body(Compiler *c, int id, Buf *b, int indent) {
   if (sp_streq(name, "times") && (rt == TY_INT || rr.big)) {
     int t = ++g_tmp;
     Buf rb; memset(&rb, 0, sizeof rb);
-    emit_int_expr(c, recv, &rb);
+    if (rr.big || !emit_scalar_recv_maybe_nil(c, recv, "times", &rb)) emit_int_expr(c, recv, &rb);
     /* The count is evaluated ONCE, so a receiver that can change (or change
        something) between rounds has to be hoisted: spliced into the loop
        condition, `rng.next_int(n).times` re-rolled the die every round, and
@@ -8177,7 +8224,7 @@ static int emit_iteration_stmt_body(Compiler *c, int id, Buf *b, int indent) {
                    (nt_kind(nt, sargv[0]) == NK_NilNode);
     if (no_limit && rt == TY_INT &&
         (sargc < 2 || comp_ntype(c, sargv[1]) != TY_FLOAT)) {
-      int tr = step_recv_hoists(c, id, sargc, sargv) ? step_bind_recv(c, id, recv, "sp_int", emit_int_expr, sargc, sargv, b, indent) : 0;
+      int tr = step_recv_hoists(c, id, sargc, sargv) ? step_bind_recv(c, id, recv, "sp_int", emit_step_recv_int, sargc, sargv, b, indent) : 0;
       int t = ++g_tmp, ts = ++g_tmp;
       emit_indent(b, indent); buf_printf(b, "sp_int _t%d = ", ts);
       if (sargc >= 2) emit_int_expr(c, sargv[1], b); else buf_puts(b, "1");
@@ -8185,7 +8232,7 @@ static int emit_iteration_stmt_body(Compiler *c, int id, Buf *b, int indent) {
       emit_indent(b, indent);
       buf_printf(b, "if (_t%d == 0) sp_raise_cls(\"ArgumentError\", \"step can't be 0\");\n", ts);
       emit_indent(b, indent);
-      buf_printf(b, "for (sp_int _t%d = ", t); if (tr) buf_printf(b, "_t%d", tr); else emit_int_expr(c, recv, b);
+      buf_printf(b, "for (sp_int _t%d = ", t); if (tr) buf_printf(b, "_t%d", tr); else emit_step_recv_int(c, recv, b);
       buf_printf(b, "; ; _t%d += _t%d) {\n", t, ts);
       if (p0) { char ts2[32]; snprintf(ts2, sizeof ts2, "_t%d", t); emit_iter_param_assign(c, block, p0_orig, p0, TY_INT, ts2, b, indent + 1); }
       { char rs_es[32]; snprintf(rs_es, sizeof rs_es, "_t%d", t);
@@ -8200,7 +8247,7 @@ static int emit_iteration_stmt_body(Compiler *c, int id, Buf *b, int indent) {
                    (sargc >= 2 && comp_ntype(c, sargv[1]) == TY_FLOAT);
     if (!is_float) {
       int t = ++g_tmp, tl = ++g_tmp, ts = ++g_tmp, tv = 0;
-      int tr = nt_kind(nt, recv) == NK_IntegerNode ? 0 : step_bind_recv(c, id, recv, "sp_int", emit_expr, sargc, sargv, b, indent);
+      int tr = nt_kind(nt, recv) == NK_IntegerNode ? 0 : step_bind_recv(c, id, recv, "sp_int", emit_step_recv_int, sargc, sargv, b, indent);
       if (repr_of(c, sargv[0]).kind == RK_BOXED) {
         char tvs[32]; tv = ++g_tmp; snprintf(tvs, sizeof tvs, "_t%d", tv);
         emit_indent(b, indent); buf_printf(b, "sp_RbVal _t%d = ", tv); emit_boxed(c, sargv[0], b);
@@ -8255,7 +8302,7 @@ static int emit_iteration_stmt_body(Compiler *c, int id, Buf *b, int indent) {
       emit_indent(b, indent); buf_puts(b, "}\n");
       return 1;
     }
-    int tb = step_bind_recv(c, id, recv, "sp_float", emit_float_expr, sargc, sargv, b, indent), tl = ++g_tmp, ts = ++g_tmp, tn = ++g_tmp, ti = ++g_tmp;
+    int tb = step_bind_recv(c, id, recv, "sp_float", emit_step_recv_float, sargc, sargv, b, indent), tl = ++g_tmp, ts = ++g_tmp, tn = ++g_tmp, ti = ++g_tmp;
     /* the limit and the step through the Float slot's conversion: a BOXED
        one (an Integer local under --int-overflow=promote, the argument of a
        boxed receiver's Float arm) unboxes, a typed Integer widens, and a

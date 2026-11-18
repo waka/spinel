@@ -40,6 +40,8 @@
 #define SP_BUILTIN_REGEX       (-33)
 /* ARGF: the one static sp_argf_obj, never GC heap, so it is not traced */
 #define SP_BUILTIN_ARGF        (-51)
+/* ENV: the one static sp_env_obj, never GC heap either */
+#define SP_BUILTIN_ENV         (-54)
 /* Wide value types (heap-copied crossing into a poly slot). Shared here so
    lib/sp_marshal.c can recognize them by cls_id. */
 #define SP_BUILTIN_COMPLEX  (-26)
@@ -583,6 +585,8 @@ extern int sp_gc_ph_on;
 void sp_gc_collect(void);
 /* the collector the program installs; NULL under --gc=none (sp_alloc.c) */
 extern void (*sp_gc_collect_fn)(void);
+extern int sp_gc_full_next;
+long long sp_gc_live_objects(void);   /* GC.stat's heap_live_slots: the objects the heap holds (sp_gc.c) */   /* GC.start's: the next collection is a full one (sp_alloc.c) */
 #ifdef SP_THREADS
 /* Sweep one worker's young list on that worker (see sp_gc.c). Survivors come
    back as a local list for the collector to splice into the old heap. */
@@ -665,7 +669,7 @@ extern const char *(*sp_ivtbl_inspect_fn)(void *tbl);
  * sp_gc_mark_all / sp_gc_collect invoke them through these pointers, the
  * same way fibers register sp_gc_mark_suspended_fibers_hook. */
 extern void (*sp_gc_mark_globals_hook)(void);
-extern void (*sp_gc_mark_io_timeouts_hook)(void);
+extern void (*sp_gc_mark_static_streams_hook)(void);
 #ifdef SP_CEXT
 extern void (*sp_gc_mark_cext_hook)(void);
 extern void (*sp_gc_sweep_cext_hook)(int full);
@@ -832,7 +836,7 @@ static inline void sp_mark_rbval(sp_RbVal v) {
      are not heap strings and mark as nothing. */
   else if (v.tag == SP_TAG_CLASS && v.cls_id == SP_CLASS_BY_NAME) sp_mark_string(v.v.s);
   else if (v.tag == SP_TAG_OBJ && v.cls_id != SP_BUILTIN_FOREIGN_PTR &&
-           v.cls_id != SP_BUILTIN_REGEX && v.cls_id != SP_BUILTIN_ARGF) sp_gc_mark(v.v.p);
+           v.cls_id != SP_BUILTIN_REGEX && v.cls_id != SP_BUILTIN_ARGF && v.cls_id != SP_BUILTIN_ENV) sp_gc_mark(v.v.p);
   else if (v.tag == SP_TAG_BIGINT) sp_gc_mark(v.v.p);
 }
 /* A scratch root: the proc calling convention's side channel keeps its last
@@ -844,7 +848,7 @@ static inline void sp_mark_rbval(sp_RbVal v) {
 static inline void sp_mark_rbval_scratch(sp_RbVal v) {
   const void *h = NULL;
   if (v.tag == SP_TAG_STR || (v.tag == SP_TAG_CLASS && v.cls_id == SP_CLASS_BY_NAME)) { if (v.v.s && ((unsigned char)v.v.s[-1] | 0x04) == 0xfe) h = ((const sp_str_hdr *)(v.v.s - 1)) - 1; }
-  else if ((v.tag == SP_TAG_OBJ && v.cls_id != SP_BUILTIN_FOREIGN_PTR && v.cls_id != SP_BUILTIN_REGEX && v.cls_id != SP_BUILTIN_ARGF) || v.tag == SP_TAG_BIGINT) { if (v.v.p) h = (const char *)v.v.p - sizeof(sp_gc_hdr); }
+  else if ((v.tag == SP_TAG_OBJ && v.cls_id != SP_BUILTIN_FOREIGN_PTR && v.cls_id != SP_BUILTIN_REGEX && v.cls_id != SP_BUILTIN_ARGF && v.cls_id != SP_BUILTIN_ENV) || v.tag == SP_TAG_BIGINT) { if (v.v.p) h = (const char *)v.v.p - sizeof(sp_gc_hdr); }
   /* (a String born inside its handle: the handle's GC object is the slot) */
   if (h && v.tag != SP_TAG_OBJ && v.tag != SP_TAG_BIGINT) {
     const void *o = SP_STR_BORN_LINK((const sp_str_hdr *)h);

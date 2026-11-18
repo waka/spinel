@@ -52,6 +52,17 @@ candidates, as the ffi gem takes them:
 - an Array (`["libz.1.dylib", "z"]`) links the first candidate this machine
   has a library file for, or the first one when it has none.
 
+Each name is a compile-time string, folded as `ffi_cflags` folds its
+argument: a literal, adjacent literals, `String#+`, `__dir__`, or
+`File.expand_path` of those, so a library beside the source is
+`ffi_lib File.expand_path("lib/libfoo.so", __dir__)`; with no base,
+`File.expand_path` is relative to the working directory of the compile,
+where the link runs. A name that does not fold (one read from a variable or
+`ENV`) is a compile error, every candidate of an Array included; under
+`require "ffi"` a module that `extend`s `FFI::Library` takes such a name at
+run time instead. The ffi gem's constants (`FFI::Library::LIBC`) name
+what every program links already, alone or as an Array's only candidates.
+
 ### `ffi_cflags "..."`
 
 Declares cflags (include dirs, defines, link-search paths) needed for
@@ -398,6 +409,9 @@ Declares a C function-pointer type usable as an `ffi_func` argument spec.
 Passing `method(:some_method)` to an argument of that type compiles a
 trampoline that converts the C arguments, calls the method, and converts the
 result back, so a Ruby method can be handed to a C API that takes a callback.
+A `:str` parameter reaches the method as a new String holding a copy of the
+bytes C passed, or nil for NULL: the method may change it, and C's buffer
+stays as it was.
 
 ```ruby
 module L

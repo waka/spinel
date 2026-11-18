@@ -53,7 +53,9 @@ enum {
   BCR_GVAR = 256u,  /* $stdout or $stderr holding the object: the assignment is a write of a port global, whose row keeps it */
   BCR_HOOK = 512u,  /* the receiver, a class or module of the program: a singleton hook it defines that the builtin calls (const_get: const_missing) */
   BCR_KEY = 1024u,  /* with BLOCK: the answer is compared with another answer of the block (sort_by, min_by), not with a number of the builtin's own (bsearch's 0): a property of the BLOCK call, never a call of its own */
-  BCR_ALL = 2047u
+  BCR_MADE = 2048u, /* an object the builtin makes and initializes (Class#new: the instance's initialize): no value handed to the builtin */
+  BCR_ALL = 4095u,
+  BCR_HANDED = BCR_ALL & ~BCR_MADE   /* the roles of a value handed to a builtin: all but MADE */
 };
 typedef struct { const char *name; unsigned roles; } BopCallback;
 /* What any core method called `builtin` may call back, the union over its
@@ -211,6 +213,7 @@ typedef enum {
   BOPE_STRING_INSERT,
   BOPE_STRING_CLEAR,
   BOPE_STRING_SLICE,
+  BOPE_STRING_BYTESPLICE,
   BOPE_STRING_DEDUP,     /* String#dedup: -@ under the name a nil receiver is raised with */
   BOPE_STRING_SCRUB_BLOCK, /* String#scrub with a block */
   BOPE_BOXED_ARRAY_COUNT, /* a count-taking Enumerable read through a box */
@@ -228,7 +231,7 @@ typedef enum {
 /* A set of argument kinds, one bit per TyKind: BOP_K(TY_INT) | BOP_K(TY_FLOAT) */
 typedef unsigned long long BopKinds;
 #define BOP_K(k) (1ULL << (k))
-_Static_assert(TY_OBJ_RANGE < 64, "a BopKinds set holds a bit per TyKind");
+_Static_assert(TY_ENV < 64, "a BopKinds set holds a bit per TyKind");
 
 typedef struct BuiltinOp {
   TyKind recv;            /* receiver kind the row applies to */
@@ -395,9 +398,9 @@ typedef struct BuiltinOp {
                                            kind; a String array's is boxed (it only
                                            raises, or answers 0 when empty). Float results are
                                            boxed too; Integer results defer to mode-aware inference. */
-#define BOPR_ARRAY_INDEX ((TyKind)-18)  /* Array#index/find_index/rindex(v): an Int,
-                                           Str or Float array's boxed (nil on a miss),
-                                           any other's an Integer */
+#define BOPR_ARRAY_INDEX ((TyKind)-18)  /* Array#index/find_index/rindex(v), and a String
+                                           Range's find_index(v): an Integer, nil on a
+                                           miss (an oint), whatever the receiver */
 #define BOPR_ARRAY_TUPLES ((TyKind)-19) /* blockless combination & co.: a poly array
                                            whose position keeps the tuples (BOPX_KEPT)
                                            materializes them, any other call answers an
@@ -466,6 +469,13 @@ int bop_flags(TyKind rt, const char *name);
 int bop_name_kwless(const char *name);
 /* Is there a row of `name` that takes keywords (BOPF_KEYWORDS)? */
 int bop_name_keywords(const char *name);
+/* Does a builtin class below Object have a row of `name`, a method it
+   defines as the compiler implements it (StopIteration#result, IO#write),
+   in a library the program has (builtin_library_fact_holds)?
+   A row of one of Object's own methods (itself, class, !=) says how a call
+   on that kind is emitted, not that the class defines it, and does not
+   count. */
+int bop_below_object_answers(const char *name);
 /* Does the builtin answer `name` on a class (or module) itself, taking argc
    arguments and a block when has_block, where no method of the program's
    of the name runs yet: Module's own, as its builtin-op rows (TY_CLASS)
@@ -550,6 +560,11 @@ TyKind bop_result_args(const BuiltinOp *op, TyKind rt, int argc, BopArgKind arg_
 #define BOPX_PROMOTE 1  /* --int-overflow=promote */
 #define BOPX_KEPT    2  /* a blockless combination & co. whose position keeps
                            the tuples as an Array (an_blockless_tuples_kept) */
+#define BOPX_BOXED_USE 4 /* an index query of a typed Array or a String Range in a program
+                           that reads an Integer with a call nil answers
+                           otherwise -- `& | ^`, `method`, ...
+                           (an_int_nil_sensitive_use): it answers boxed, as it
+                           did before it answered the oint */
 
 /* The BOPF_BOXED row of kind rt for `name`, or NULL. */
 const BuiltinOp *bop_find_boxed(TyKind rt, const char *name, int argc, int has_block);

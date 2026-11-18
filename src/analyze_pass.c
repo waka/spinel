@@ -8,6 +8,7 @@
 #include "repr.h"
 #include "holder.h"
 #include "share.h"
+#include "method_table_check.h"
 int callee_has_kwarg(Compiler *c, Scope *m, const char *name);
 int callee_declares_kwargs(Compiler *c, Scope *m);
 int callee_param_is_declared_kwarg(Compiler *c, Scope *m, const char *name);
@@ -204,8 +205,8 @@ static int recv_has_array_write(Compiler *c, int recv) {
          class through a reader named `gname` (alias resolution is per-class,
          so this asks every class, exactly as the outer loop did). */
       for (int k = 0; k < c->nclasses; k++) {
-        int rdcls = k;
-        if (comp_reader_in_chain(c, k, gname, &rdcls) && rdcls == wc) return 1;
+        MethodLookup rl = { .def_class = k };
+        if (call_attr_target(c, -1, k, gname, CT_ATTR, &rl) && rl.def_class == wc) return 1;
       }
     }
     /* A hand-written getter (`def list = @list`) is the same READER: its
@@ -504,6 +505,9 @@ int infer_param_hash_value(Compiler *c) {
       if (p == sc->rest_idx || p == sc->kwrest_idx) continue;
       LocalVar *lv = scope_local(sc, sc->pnames[p]);
       if (!lv || lv->is_block_param) continue;
+      /* a parameter defaulting to ENV holds ENV where no argument is passed:
+         its `p[k] = v` is ENV's store, no evidence of a Hash */
+      if (sc->pdefault && sc->pdefault[p] >= 0 && infer_type(c, sc->pdefault[p]) == TY_ENV) continue;
       TyKind cur = lv->type;
       /* An already-CONCRETE hash type is a caller's, and the object is shared:
          narrowing str->poly to str->str here does not convert anything, it
@@ -644,7 +648,7 @@ int local_all_writes_empty_array(Compiler *c, Scope *sc, const char *name) {
 /* 1 iff every write of local `name` in `sc` builds a new array (and there is
    one): a value nothing else holds, so rebuilding it as another array kind
    loses no sharing. */
-static int local_all_writes_fresh_array(Compiler *c, Scope *sc, const char *name) {
+int local_all_writes_fresh_array(Compiler *c, Scope *sc, const char *name) {
   const NodeTable *nt = c->nt;
   int saw = 0;
   int si = (int)(sc - c->scopes);
@@ -1009,13 +1013,14 @@ static int map_literal_elem_types(Compiler *c, int value, TyKind *out, int max) 
    to_ary return type when it defines one (CRuby coerces the splice source);
    without to_ary it inserts as a single heterogeneous element. Stable across
    the fixpoint: scopes[].ret settles monotonically, and an unsettled ret
-   simply contributes no evidence that iteration. */
-static TyKind splice_incoming_elem(Compiler *c, int rhs) {
+   simply contributes no evidence that iteration. The plan answers the to_ary
+   at the call id the source is an argument of. */
+static TyKind splice_incoming_elem(Compiler *c, int id, int rhs) {
   TyKind t = infer_type(c, rhs);
   if (t == TY_POLY_ARRAY) return TY_POLY_ARRAY;  /* heterogeneous source */
   if (ty_is_array(t)) return ty_array_elem(t);
   if (ty_is_object(t)) {
-    int mi = comp_implicit_to_ary_mi(c, ty_object_class(t));
+    int mi = cplan_to_ary_method(c, id, rhs, ty_object_class(t));
     if (mi >= 0) {
       TyKind r = (TyKind)c->scopes[mi].ret;
       if (r == TY_POLY_ARRAY) return TY_POLY_ARRAY;
@@ -1046,12 +1051,11 @@ static TyKind pm_deconstruct_arr_ty(Compiler *c, TyKind scrutinee_t) {
    which read a boxed Symbol's bits as a small int and bound 1 and 2 for
    `[:x, :y]` (#3954). The method's return type says what the elements really
    are; TY_UNKNOWN means the class has no #deconstruct to ask. */
-static TyKind pm_object_deconstruct_array(Compiler *c, TyKind scrut) {
+static TyKind pm_object_deconstruct_array(Compiler *c, int pat, TyKind scrut) {
   if (!ty_is_object(scrut)) return TY_UNKNOWN;
   int cid = ty_object_class(scrut);
   if (cid < 0 || cid >= c->nclasses) return TY_UNKNOWN;
-  int defcls = cid;
-  int mi = comp_method_in_chain(c, cid, "deconstruct", &defcls);
+  int mi = cplan_implied_target(c, pat, NTI_MATCHED, cid, "deconstruct", CIT_TABLE, NULL);
   if (mi < 0) return TY_UNKNOWN;
   TyKind rt = c->scopes[mi].ret;
   return ty_is_array(rt) ? rt : TY_POLY_ARRAY;
@@ -1157,7 +1161,7 @@ int case_in_lambda_param(Compiler *c, int lam) {
   if (lambda_body_jumps(nt, body, 0)) return -1;
   /* a body that writes its parameter keeps master's path: the parameter is typed from the subject */
   if (subtree_writes_var(c, body, nt_str(nt, reqs[0], "name"), VW_LOCAL)) return -1;
-  int pci = comp_class_index(c, "Proc"), dc = -1;
+  int pci = comp_builtin_class_named(c, "Proc"), dc = -1;
   if (pci >= 0 && comp_method_in_chain(c, pci, "===", &dc) >= 0 && dc >= 0) {
     const char *dn = c->classes[dc].name;
     if (!dn || !builtin_answers_ahead_of("Proc", "===", dn)) return -1;
@@ -1366,7 +1370,7 @@ static int infer_case_pattern_locals(Compiler *c) {
              element's bits and produced garbage. An object scrutinee's elements
              come from its own #deconstruct, whose return type says what they
              are; only an object with none left to ask keeps the legacy default. */
-          TyKind darr = pm_object_deconstruct_array(c, array_scrutinee);
+          TyKind darr = pm_object_deconstruct_array(c, array_pat, array_scrutinee);
           TyKind et = (elem_t != TY_UNKNOWN) ? elem_t
                     : (darr != TY_UNKNOWN) ? ty_array_elem(darr)
                     : ty_is_object(array_scrutinee) ? TY_INT : TY_POLY;
@@ -1389,7 +1393,7 @@ static int infer_case_pattern_locals(Compiler *c) {
                  array, so its rest slice is a poly array -- not an int array.
                  TY_INT_ARRAY reinterpreted sp_poly_slice's boxed poly array and
                  rendered garbage. Object scrutinees keep the legacy default. */
-              TyKind darr2 = pm_object_deconstruct_array(c, array_scrutinee);
+              TyKind darr2 = pm_object_deconstruct_array(c, array_pat, array_scrutinee);
               TyKind rest_arr = ty_is_array(array_scrutinee) ? array_scrutinee
                               : (darr2 != TY_UNKNOWN) ? darr2
                               : ty_is_object(array_scrutinee) ? TY_INT_ARRAY : TY_POLY_ARRAY;
@@ -2000,7 +2004,7 @@ static int alias_side(Compiler *c, int n, AliasSide *out) {
     /* a Struct member of a Struct with no initialize of its own is set by
        the constructor's arguments, which struct_new_types_members_at widens
        with it or, where they cannot widen, keeps the member boxed */
-    int member = ci->is_struct && iv >= 0 && iv < ci->nmembers && comp_method_in_chain(c, dc, "initialize", NULL) < 0;
+    int member = ci->is_struct && iv >= 0 && iv < ci->nmembers && cplan_hook_target(c, -1, dc, "initialize", NULL) < 0;
     if (iv < 0 || class_ivar_pinned(ci, ivn) || ci->ivar_int_table[iv] ||
         reader_ivar_set_outside(c, dc, ivn) || (!member && !ivar_writes_fresh(c, dc, ivn, 0, NULL))) return 0;
     out->slot = &ci->ivar_types[iv]; out->cid = dc; out->iv = iv; out->reader = 1;
@@ -2106,6 +2110,8 @@ static int join_container_alias_groups(Compiler *c) {
       LocalVar *lv = &c->scopes[s].locals[i];
       if (lv->rbs_seeded) for (int j = 0; j < lv->nctr_sites; j++) excl[lv->ctr_sites[j]] = 1;
     }
+  /* (and a site an --rbs-pinned ivar may hold, likewise copied there: ctr_site_excl) */
+  if (c->ctr_site_excl) for (int i = 0; i < n; i++) if (c->ctr_site_excl[i]) excl[i] = 1;
   /* a local's first site no seed copies, -1 for none */
 #define CTR_FIRST(lv) ({ int _f = -1; for (int _j = 0; _j < (lv)->nctr_sites && _f < 0; _j++) if (!excl[(lv)->ctr_sites[_j]]) _f = (lv)->ctr_sites[_j]; _f; })
   for (int s = 0; s < ns; s++)
@@ -2694,11 +2700,12 @@ static int getter_ivar_targets(Compiler *c, int call, int cid, int cside, const 
 }
 
 /* Does class `k` itself define the instance getter `mname`, as a method or
-   an attr_reader (not one it inherits)? */
+   an attr_reader (not one it inherits)? A candidate owner of the getter, at
+   any point: the evidence it gives is for every call of it. */
 static int class_owns_getter(Compiler *c, int k, const char *mname) {
   MethodLookup ml = { .def_class = -1 };
   if (call_attr_target(c, -1, k, mname, 0, &ml)) return ml.def_class == k;
-  return comp_method_in_class(c, k, mname) >= 0;
+  return comp_name_responder(c, k, mname, CT_OWN) >= 0;
 }
 
 /* The getter call or ivar read a hash local aliases: `x` read at `recv`,
@@ -2761,7 +2768,7 @@ static int ivar_has_array_write(Compiler *c, const LWIndex *ivw, int cls, const 
 
 static int widen_arg_hash(Compiler *c, int arg);
 static int widen_returned_hashes(Compiler *c, int call);
-static int widen_arg_array(Compiler *c, int arg);
+int widen_arg_array(Compiler *c, int arg);
 static int widen_boxed_array_sources(Compiler *c, int v, TyKind elem, int depth);
 static int widen_proc_call_hash_args(Compiler *c, int lit, const char *pn, TyKind hk, TyKind hv);
 
@@ -3042,7 +3049,7 @@ static int local_is_kept_block_param(Compiler *c, Scope *sc, const char *nm) {
     if (sp_streq(mn, "new")) {
       const char *cn = recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode ? nt_str(nt, recv, "name") : NULL;
       int ci = cn ? const_node_class_index(c, recv) : -1;
-      int si = ci >= 0 ? cplan_new_initialize(c, call, ci, NULL) : -1;
+      int si = ci >= 0 ? cplan_hook_target(c, call, ci, "initialize", NULL) : -1;
       if (si < 0) return 0;
       Scope *d = &c->scopes[si];
       return !d->yields && d->blk_param && d->blk_param[0];
@@ -3349,7 +3356,7 @@ static int boxed_store_hash_subclass_evidence(Compiler *c, TyKind kt, TyKind vt)
   int changed = 0;
   for (int k = 0; k < c->nclasses; k++) {
     if (!c->classes[k].ary_hash || comp_ary_root(c, k) != k) continue;
-    if (comp_method_in_chain(c, k, "[]=", NULL) >= 0) continue;
+    if (call_target(c, -1, k, "[]=", CT_METHODS | CT_SHARED, NULL) >= 0) continue;
     TyKind was = c->classes[k].ary_kind, now = was;
     if (now == TY_UNKNOWN) continue;
     fold_evidence(&now, 0, 0, kt, vt);
@@ -3366,7 +3373,7 @@ static int arysub_container_evidence(Compiler *c, int id, int recv, int is_push,
   /* a String subclass's String has one kind, whatever goes into it */
   if (c->classes[root].ary_str) return 1;
   if (nt_kind(c->nt, id) == NK_CallNode ? !comp_arysub_call(c, id, rt, &k)
-                                        : comp_method_in_chain(c, ty_object_class(rt), "[]=", NULL) >= 0)
+                                        : call_target(c, id, ty_object_class(rt), "[]=", CT_METHODS, NULL) >= 0)
     return 1;
   TyKind *slot = &c->classes[root].ary_kind, was = *slot, now = was;
   if (c->classes[root].ary_hash) {
@@ -3406,10 +3413,9 @@ static TyKind index_op_write_value_type(Compiler *c, int id, int recv, TyKind vt
    `@v << a << b` pushes b into @v, as `@v << a; @v << b` does. Only the
    builtin Array push answers its receiver; any other `<<` (an Integer
    shift, a user class's, a reopened Array's) ends the chain. */
-static int array_push_reopened(Compiler *c, const char *nm) {
-  for (int k = 0; k < c->nclasses; k++)
-    if (sp_streq(c->classes[k].name, "Array") && comp_method_in_chain(c, k, nm, NULL) >= 0) return 1;
-  return 0;
+static int array_push_reopened(Compiler *c, int id, const char *nm) {
+  int ak = comp_core_class(c, CORE_ARRAY);
+  return ak >= 0 && call_target(c, id, ak, nm, CT_METHODS, NULL) >= 0;
 }
 static int push_chain_base(Compiler *c, int recv) {
   const NodeTable *nt = c->nt;
@@ -3420,7 +3426,7 @@ static int push_chain_base(Compiler *c, int recv) {
     if (base < 0 || !nm || an < 1) break;
     if (!(sp_streq(nm, "<<") && an == 1) && !sp_streq(nm, "push") && !sp_streq(nm, "append")) break;
     TyKind bt = infer_type(c, base);
-    if (!ty_is_array(bt) || infer_type(c, recv) != bt || array_push_reopened(c, nm)) break;
+    if (!ty_is_array(bt) || infer_type(c, recv) != bt || array_push_reopened(c, recv, nm)) break;
     recv = base;
   }
   return recv;
@@ -3439,7 +3445,7 @@ static int push_chain_base(Compiler *c, int recv) {
    reads, a path inference does not follow), given an element the Array
    cannot hold: the Arrays the call can answer become the general Array.
    One rule for every such path, not a walk of each. */
-static int widen_arg_array(Compiler *c, int arg);
+int widen_arg_array(Compiler *c, int arg);
 static int push_widens_arrays(const NodeTable *nt, int call, TyKind t);
 static int push_escape_widen(Compiler *c, int id, int recv, int is_push, TyKind vt) {
   if (!is_push || g_infer_optimistic || vt == TY_UNKNOWN || vt == TY_POLY) return 0;
@@ -3523,7 +3529,7 @@ static int push_escape_widen_each(Compiler *c, int id, int recv, int is_push, Ty
   int cat = nm && sp_streq(nm, "concat"), from = nm && sp_streq(nm, "insert") ? 1 : 0;
   int changed = 0;
   for (int k = from; k < an && an > 1; k++)
-    changed |= push_escape_widen(c, id, recv, is_push, cat ? splice_incoming_elem(c, av[k]) : push_elem_ty(c, av[k]));
+    changed |= push_escape_widen(c, id, recv, is_push, cat ? splice_incoming_elem(c, id, av[k]) : push_elem_ty(c, av[k]));
   return changed;
 }
 
@@ -3733,8 +3739,8 @@ static int infer_write_container_usage(Compiler *c, const NodeTable *nt, int nfb
         /* concat(other, ...): each other array's elements splice in, so
            every argument is evidence, as push's are; one that is no array
            raises before anything is stored */
-        is_push = 1; vt = splice_incoming_elem(c, argv[0]);
-        for (int ai = 1; ai < an; ai++) vt = ty_unify(vt, splice_incoming_elem(c, argv[ai]));
+        is_push = 1; vt = splice_incoming_elem(c, id, argv[0]);
+        for (int ai = 1; ai < an; ai++) vt = ty_unify(vt, splice_incoming_elem(c, id, argv[ai]));
         for (int ai = 0; ai < an && !concat_scalar; ai++) {
           TyKind cat = infer_type(c, argv[ai]);
           concat_scalar = cat != TY_UNKNOWN && cat != TY_POLY && !ty_is_array(cat);
@@ -3756,7 +3762,7 @@ static int infer_write_container_usage(Compiler *c, const NodeTable *nt, int nfb
            into it somewhere. Without the first, `h1.replace(h2)` widened a
            hash local into an array; without the second, `h.replace([1, 2])`
            did -- and each stopped compiling. */
-        is_push = 1; vt = splice_incoming_elem(c, argv[0]);
+        is_push = 1; vt = splice_incoming_elem(c, id, argv[0]);
       }
       else if (name && sp_streq(name, "default_proc=") && an == 1) {
         /* installing a default proc needs the poly-valued variant (the proc
@@ -3839,7 +3845,7 @@ static int infer_write_container_usage(Compiler *c, const NodeTable *nt, int nfb
         knode = argv[0]; vnode = argv[1];
         /* a range key is a splice: the RHS contributes element evidence */
         if (kt == TY_RANGE) {
-          is_splice = 1; vt = splice_incoming_elem(c, argv[1]);
+          is_splice = 1; vt = splice_incoming_elem(c, id, argv[1]);
           splice_arr = ty_is_array(infer_type(c, argv[1])) && vt != TY_POLY_ARRAY;
         }
         /* an empty [] / {} literal value carries no element type but is
@@ -3896,7 +3902,7 @@ static int infer_write_container_usage(Compiler *c, const NodeTable *nt, int nfb
       }
       else if (name && sp_streq(name, "[]=") && an == 3) {
         /* a[start, len] = rhs: a splice over the (start, len) span */
-        is_idx_write = 1; is_splice = 1; vt = splice_incoming_elem(c, argv[2]);
+        is_idx_write = 1; is_splice = 1; vt = splice_incoming_elem(c, id, argv[2]);
         vnode = argv[2];
         splice_arr = ty_is_array(infer_type(c, argv[2])) && vt != TY_POLY_ARRAY;
       }
@@ -4556,7 +4562,7 @@ static int infer_write_container_usage(Compiler *c, const NodeTable *nt, int nfb
            a module main extends answers the name first. */
         int at_main = (!caller || (caller->class_id < 0 && !caller->is_cmethod && caller->def_node < 0)) &&
                       self_is_main(c, recv);
-        if (at_main && !comp_toplevel_mod_defines(c, mname, 1))
+        if (at_main && !comp_toplevel_mod_defines(c, recv, mname, 1))
           tl_getter = call_target(c, recv, -1, mname, CT_TOP, NULL);
         const char *tl_ivs[8];
         if (tl_getter >= 0 && (c->scopes[tl_getter].class_id >= 0 || c->scopes[tl_getter].is_cmethod ||
@@ -4797,14 +4803,89 @@ int join_local_proc_rets(Compiler *c) {
   return changed;
 }
 
+/* The type a multiple assignment from a run-time value (`_, x = t`,
+   `a, *r = line.split`) gives a local target: the value's element, the
+   value itself for the splat target, a box when the value is boxed.
+   TY_UNKNOWN for the shapes typed another way (a tuple literal, a call
+   answering a fixed tuple, a scalar). infer_write_multi_assign types the
+   targets so; rejoin_local_writes asks again once the passes after
+   infer_write_types have widened the value (`t << "s"` after `t = [1.5]`).
+   The element is answered, and the splat target's type set in *whole. */
+static TyKind masgn_runtime_target_ty(Compiler *c, int mw, TyKind *whole) {
+  const NodeTable *nt = c->nt;
+  int value = nt_ref(nt, mw, "value");
+  *whole = TY_UNKNOWN;
+  if (value < 0 || masgn_tuple_rhs(nt, value)) return TY_UNKNOWN;
+  NodeKind vk = nt_kind(nt, value);
+  int multi_src = vk == NK_CallNode || vk == NK_SuperNode || vk == NK_ForwardingSuperNode || vk == NK_YieldNode;
+  int ln = 0, rn = 0;
+  nt_arr(nt, mw, "lefts", &ln);
+  nt_arr(nt, mw, "rights", &rn);
+  if (ln >= 2 && rn == 0 && nt_ref(nt, mw, "rest") < 0) {
+    TyKind elems[16];
+    int en = multi_return_elem_types(c, value, elems, 16);
+    if (en == 0) en = map_literal_elem_types(c, value, elems, 16);
+    /* (a call answering a tuple of that many values is typed element by
+       element whatever each is: one of them boxed, an Integer under
+       --int-overflow=promote, leaves the others their own kinds) */
+    const int *els = NULL;
+    if (en != ln && multi_return_elem_nodes(c, value, &els) == ln) en = ln;
+    if (en == ln) return TY_UNKNOWN;
+  }
+  TyKind st = infer_type(c, value);
+  if (ty_is_array(st) || ty_is_obj_array(st)) { *whole = st; return ty_array_elem(st); }
+  if (st == TY_POLY || (st != TY_UNKNOWN && (ty_is_hash(st) || multi_src))) {
+    *whole = TY_POLY_ARRAY;
+    return TY_POLY;
+  }
+  return TY_UNKNOWN;
+}
+
+/* Calls `fn` with each plain local target of multiple assignment `mw` (a
+   parameter, a block parameter or an RBS-seeded slot is typed elsewhere)
+   and the type masgn_runtime_target_ty gives it */
+typedef void (*MasgnTargetFn)(Compiler *c, int mw, int tgt, LocalVar *lv, TyKind v, void *ud);
+static void masgn_runtime_targets(Compiler *c, int mw, MasgnTargetFn fn, void *ud) {
+  const NodeTable *nt = c->nt;
+  if (mw >= c->node_cap) return;
+  int rest = nt_ref(nt, mw, "rest");
+  int rin = rest >= 0 && nt_kind(nt, rest) == NK_SplatNode ? nt_ref(nt, rest, "expression") : -1;
+  TyKind elem = TY_UNKNOWN, whole = TY_UNKNOWN;
+  int got = 0;
+  const char *sides[2] = { "lefts", "rights" };
+  for (int s = 0; s < 3; s++) {
+    int n = 0;
+    const int *ts = s < 2 ? nt_arr(nt, mw, sides[s], &n) : &rin;
+    if (s == 2) n = rin >= 0;
+    for (int i = 0; i < n; i++) {
+      int t = ts[i];
+      if (t < 0 || t >= c->node_cap || nt_kind(nt, t) != NK_LocalVariableTargetNode) continue;
+      const char *nm = nt_str(nt, t, "name");
+      LocalVar *lv = nm ? scope_local(comp_scope_of(c, mw), nm) : NULL;
+      if (!lv || lv->is_param || lv->is_block_param || lv->rbs_seeded) continue;
+      if (!got) { elem = masgn_runtime_target_ty(c, mw, &whole); got = 1; }
+      fn(c, mw, t, lv, s == 2 ? whole : elem, ud);
+    }
+  }
+}
+/* What a target takes, noted as the main loop notes a write's (lw_joined),
+   when its assignment is typed: a later assignment in the same pass can
+   widen the value (`t, u = ["s"], 0` after `_, x = t`), which x did not take */
+static void masgn_note_joined(Compiler *c, int mw, int tgt, LocalVar *lv, TyKind v, void *ud) {
+  (void)mw; (void)lv; (void)ud;
+  c->lw_joined[tgt] = v;
+}
+
 /* infer_write_types's pass over multiple assignments: each target takes its
    element's type (answers whether it changed a type) */
-static int infer_write_multi_assign(Compiler *c, const NodeTable *nt) {
+static int infer_write_multi_assign(Compiler *c, const NodeTable *nt, const unsigned char *only) {
   int changed = 0;
   /* Multiple assignment `a, b = e0, e1`: each target gets its element's
-     type (the RHS ArrayNode is a tuple here, not an array value). */
+     type (the RHS ArrayNode is a tuple here, not an array value). `only`,
+     when given, names the assignments (by node) to type. */
   for (int id = 0; id < nt->count; id++) {
     if (nt_kind(nt, id) != NK_MultiWriteNode) continue;
+    if (only && !only[id]) continue;
     int ln = 0;
     const int *lefts = nt_arr(nt, id, "lefts", &ln);
     int value = nt_ref(nt, id, "value");
@@ -4827,6 +4908,10 @@ static int infer_write_multi_assign(Compiler *c, const NodeTable *nt) {
         if (hen == 0 && !ty_is_hash(c->hash_want[hv])) { comp_set_hash_want(c, hv, TY_POLY_POLY_HASH); changed = 1; }
       }
     }
+    /* (each target as this assignment types it, the empty `{}` settled;
+       not after the container fold (`only`), which has widened the values
+       since: a later re-join reads them against the round's first types) */
+    if (!only) masgn_runtime_targets(c, id, masgn_note_joined, NULL);
     const char *vty = nt_type(nt, value);
     NodeKind vk = nt_kind(nt, value);
     /* `r, w = IO.pipe` / `a, b = Socket.pair(...)` -> both targets are IO
@@ -5197,6 +5282,28 @@ typedef struct {
   int next;       /* the next such write reading the same local, or -1 */
 } ReadWrite;
 
+/* Every scope's locals in one index: scope s's local i is base[s] + i, and
+   base[c->nscopes] is the count. */
+static int *all_locals_base(Compiler *c) {
+  int *base = malloc(sizeof(int) * ((size_t)c->nscopes + 1));
+  if (!base) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  base[0] = 0;
+  for (int s = 0; s < c->nscopes; s++) base[s + 1] = base[s] + c->scopes[s].nlocals;
+  return base;
+}
+
+/* The local value `v` reads, itself or through a chain of calls on it
+   (`t[1]`, `t[1].succ`, `t.first(2).last`), with its scope in *sc; NULL
+   when the chain ends elsewhere. */
+static LocalVar *value_read_root(Compiler *c, const NodeTable *nt, int v, Scope **sc) {
+  int r = v;
+  for (int hop = 0; hop < 8 && r >= 0 && nt_kind(nt, r) == NK_CallNode; hop++) r = nt_ref(nt, r, "receiver");
+  if (r < 0 || nt_kind(nt, r) != NK_LocalVariableReadNode) return NULL;
+  const char *rn = nt_str(nt, r, "name");
+  *sc = comp_scope_of(c, r);
+  return rn ? scope_local(*sc, rn) : NULL;
+}
+
 /* A slot narrowed to a pointer array, a nested table or a table's element
    type (oa_pin) that re-derives as the poly array or the poly scalar its
    writes still read takes the pin back; 0 when it derives as neither, and
@@ -5257,9 +5364,14 @@ static void pin_shadow_lift(PinShadow *ps) {
    plain writes (`a, *b = t`) -- saw the narrower type, and the slot it
    fills kept it: an Integer slot read a String's box as 0, a String
    Array slot read a String's (a crash). Once every write of the round is
-   in, a write whose value is, or calls on, a local now held boxed is
-   typed again, and its slot widens when the value now is. Only those
-   writes: re-inferring every value would double the pass. The slot is
+   in, a write whose value is, or calls on, a local now held boxed (or a
+   chain of calls on one, `t[1].succ`) is typed again, and its slot widens
+   when the value now is. Only those writes: re-inferring every value
+   would double the pass. infer_write_types runs this again once the
+   container fold has widened its containers, with `seed` naming the
+   locals (by all_locals_base's index) the fold widened: the writes that
+   read those are typed again then, and a local already boxed is not a
+   seed (its readers were typed here before). The slot is
    one the round resets, so no change is reported (the stash comparison
    at the end of the pass is the detector).
    A slot this widens is read in turn: in `d = c; c = b; b = "xy"` inside
@@ -5270,14 +5382,11 @@ static void pin_shadow_lift(PinShadow *ps) {
    at once if it already has). A slot widens once (a boxed one is not
    typed again), so a list is drained once and each write is typed at most
    once: the work stays linear in the writes, whatever their order. */
-static void infer_write_reads_widened(Compiler *c, const NodeTable *nt, PinShadow *pins) {
+static void infer_write_reads_widened(Compiler *c, const NodeTable *nt, PinShadow *pins, const unsigned char *seed) {
   int nw = 0;
   const int *ws = nt_nodes_of_kind(nt, NK_LocalVariableWriteNode, &nw);
   if (nw == 0) return;
-  int *base = malloc(sizeof(int) * ((size_t)c->nscopes + 1));
-  if (!base) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-  base[0] = 0;
-  for (int s = 0; s < c->nscopes; s++) base[s + 1] = base[s] + c->scopes[s].nlocals;
+  int *base = all_locals_base(c);
   int nl = base[c->nscopes];
   int *head = malloc(sizeof(int) * (size_t)(nl > 0 ? nl : 1));
   int *queue = malloc(sizeof(int) * (size_t)nw);
@@ -5288,23 +5397,19 @@ static void infer_write_reads_widened(Compiler *c, const NodeTable *nt, PinShado
   for (int j = 0; j < nw; j++) {
     int id = ws[j];
     int v = nt_ref(nt, id, "value");
-    int r = v;
-    if (r >= 0 && nt_kind(nt, r) == NK_CallNode) r = nt_ref(nt, r, "receiver");
-    if (r < 0 || nt_kind(nt, r) != NK_LocalVariableReadNode) continue;
-    const char *rn = nt_str(nt, r, "name"), *wn = nt_str(nt, id, "name");
-    Scope *rs = comp_scope_of(c, r), *wsc = comp_scope_of(c, id);
-    LocalVar *rl = rn ? scope_local(rs, rn) : NULL;
+    Scope *rs = NULL;
+    LocalVar *rl = value_read_root(c, nt, v, &rs);
+    const char *wn = nt_str(nt, id, "name");
+    Scope *wsc = comp_scope_of(c, id);
     LocalVar *lv = rl && wn ? scope_local(wsc, wn) : NULL;
     if (!lv || lv == rl || lv->is_param || lv->is_block_param || lv->rbs_seeded || ty_degraded(lv->type))
       continue;
     ReadWrite *w = &rw[nrw];
     w->val = v; w->dst = lv; w->dst_ix = base[wsc - c->scopes] + (int)(lv - wsc->locals);
     w->next = -1;
-    if (ty_degraded(rl->type)) queue[nq++] = nrw;
-    else {
-      int ri = base[rs - c->scopes] + (int)(rl - rs->locals);
-      w->next = head[ri]; head[ri] = nrw;
-    }
+    int ri = base[rs - c->scopes] + (int)(rl - rs->locals);
+    if (seed ? seed[ri] : ty_degraded(rl->type)) queue[nq++] = nrw;
+    else { w->next = head[ri]; head[ri] = nrw; }
     nrw++;
   }
   for (int q = 0; q < nq; q++) {
@@ -5520,7 +5625,7 @@ static void lv_keep_decisions(Compiler *c, LocalVar *lv, int stashed) {
    puts the pin back only at the end of infer_write_types: read as the poly
    array, each target of `x, y = cells[i]` took a boxed element. The rest
    of the pass reads the local as before, so the pin is lifted again after. */
-static int infer_write_multi_assign_pinned(Compiler *c, const NodeTable *nt) {
+static int infer_write_multi_assign_pinned(Compiler *c, const NodeTable *nt, const unsigned char *only) {
   int n = 0, cap = 0;
   LocalVar **pinned = NULL;
   for (int s = 0; s < c->nscopes; s++)
@@ -5535,7 +5640,7 @@ static int infer_write_multi_assign_pinned(Compiler *c, const NodeTable *nt) {
       pinned[n++] = lv;
       lv_set_type(lv, lv->oa_pin);
     }
-  int changed = infer_write_multi_assign(c, nt);
+  int changed = infer_write_multi_assign(c, nt, only);
   for (int k = 0; k < n; k++)
     if (pinned[k]->type == pinned[k]->oa_pin) lv_set_type(pinned[k], TY_POLY_ARRAY);
   free(pinned);
@@ -5767,8 +5872,8 @@ int infer_write_types(Compiler *c) {
     pin_shadow_take(c, &pins, lv, newt, val_id);
   }
 
-  changed |= infer_write_multi_assign_pinned(c, nt);
-  infer_write_reads_widened(c, nt, &pins);
+  changed |= infer_write_multi_assign_pinned(c, nt, NULL);
+  infer_write_reads_widened(c, nt, &pins, NULL);
   pin_shadow_lift(&pins);
 
   changed |= infer_case_pattern_locals(c);
@@ -5802,6 +5907,14 @@ int infer_write_types(Compiler *c) {
     }
   }
 
+  /* each local's type before the container fold, for the readers of the
+     containers it widens (below) */
+  int fold_ns0 = c->nscopes, *fold_base0 = all_locals_base(c);
+  TyKind *fold_ty0 = malloc(sizeof *fold_ty0 * (size_t)(fold_base0[fold_ns0] + 1));
+  if (!fold_ty0) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  for (int s = 0; s < fold_ns0; s++)
+    for (int i = 0; i < c->scopes[s].nlocals; i++) fold_ty0[fold_base0[s] + i] = c->scopes[s].locals[i].type;
+
   changed |= infer_write_container_usage(c, nt, nfb, fb, lw_ix, ivw_ix);
 
   /* Container widening across direct aliases (`b = a`): the fold above
@@ -5809,6 +5922,44 @@ int infer_write_types(Compiler *c) {
      source widened would keep the narrower container kind. */
   changed |= propagate_alias_widening(c, &ivw_ix);
   changed |= join_container_alias_groups(c);
+  /* The fold has widened containers whose readers the main loop typed with
+     the kind the containers' writes alone give: `w = t[1]` and `_, w = t`
+     read t as a String Array, before the fold counted `t[1] = 3` and made
+     it the general Array. The multiple assignments and the writes that read
+     such a container are typed again now, so what the round binds from w
+     (a parameter, a Struct member) takes the box. Only those: a table held
+     at its narrowed kind during the joins reads as the poly array again by
+     now, and a target the fold widened past its literal's kind would join
+     the two kinds to a box. */
+  {
+    /* indexed as the locals are now, which infer_write_reads_widened reads
+       it by; a local the fold added has no type before it to compare */
+    int *fold_base = all_locals_base(c), nseed = 0;
+    unsigned char *seed = calloc((size_t)fold_base[c->nscopes] + 1, 1);
+    if (!seed) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int s = 0; s < c->nscopes && s < fold_ns0; s++)
+      for (int i = 0; i < c->scopes[s].nlocals && i < fold_base0[s + 1] - fold_base0[s]; i++)
+        if (!ty_degraded(fold_ty0[fold_base0[s] + i]) && ty_degraded(c->scopes[s].locals[i].type)) {
+          seed[fold_base[s] + i] = 1; nseed++;
+        }
+    if (nseed) {
+      unsigned char *mw_sel = calloc((size_t)nt->count + 1, 1);
+      if (!mw_sel) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+      int nsel = 0;
+      NT_FOREACH_KIND(nt, NK_MultiWriteNode, mw) {
+        Scope *rs = NULL;
+        LocalVar *rl = value_read_root(c, nt, nt_ref(nt, mw, "value"), &rs);
+        if (rl && seed[fold_base[rs - c->scopes] + (int)(rl - rs->locals)]) { mw_sel[mw] = 1; nsel++; }
+      }
+      PinShadow fold_pins = {0};
+      if (nsel) changed |= infer_write_multi_assign_pinned(c, nt, mw_sel);
+      infer_write_reads_widened(c, nt, &fold_pins, seed);
+      pin_shadow_lift(&fold_pins);
+      free(mw_sel);
+    }
+    free(seed); free(fold_base);
+  }
+  free(fold_base0); free(fold_ty0);
 
   /* The container-usage fold above can widen a hash's value layout after the
      main write-site scan has already typed a destination local. Reconcile the
@@ -5901,6 +6052,33 @@ static TyKind lw_join(TyKind cur, TyKind v) {
   return ty_unify(cur, v);
 }
 
+typedef struct { int changed; LocalVar **boxed; int nboxed, cboxed; } Rejoin;
+/* Joins write `id` (a local write, or a multiple assignment's target) of
+   `lv`, whose value `vnode` now reads `v`, into the slot. */
+static void rejoin_one(Compiler *c, Rejoin *rj, int id, LocalVar *lv, TyKind v, int vnode) {
+  if (v == TY_UNKNOWN || v == c->lw_joined[id]) return;
+  TyKind was = lv->type;
+  TyKind m = lw_join(was, v);
+  c->lw_joined[id] = v;
+  if (m == was) return;
+  slot_set(c, lv, m, v, vnode);
+  if (lv->oa_pin != TY_UNKNOWN && lv->type != lv->oa_pin) lv->oa_pin = TY_UNKNOWN;
+  lv_keep_decisions(c, lv, 0);
+  if (lv->type == was) return;
+  rj->changed = 1;
+  if (lv->type != TY_POLY) return;
+  if (rj->nboxed == rj->cboxed) {
+    rj->cboxed = rj->cboxed ? rj->cboxed * 2 : 8;
+    LocalVar **nb = (LocalVar **)realloc(rj->boxed, sizeof *nb * (size_t)rj->cboxed);
+    if (!nb) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    rj->boxed = nb;
+  }
+  rj->boxed[rj->nboxed++] = lv;
+}
+static void rejoin_masgn_target(Compiler *c, int mw, int tgt, LocalVar *lv, TyKind v, void *ud) {
+  rejoin_one(c, (Rejoin *)ud, tgt, lv, v, nt_ref(c->nt, mw, "value"));
+}
+
 /* Re-join every local with the writes whose values read differently since
    the slot was last joined with them (lw_joined). infer_write_types fixes a
    local's type from its writes, but the passes after it still widen what
@@ -5915,39 +6093,25 @@ static TyKind lw_join(TyKind cur, TyKind v) {
    says nothing new, so a deliberate narrowing of the slot (an Integer local
    over boxed writes, narrow_poly_int_locals) stays. A pointer-array pin is
    the one decision a widened write does undo: the element read hands it a
-   box now. */
+   box now. A multiple assignment's local target is re-joined the same way
+   with the element it takes from a run-time value (masgn_runtime_target_ty):
+   `_, x = t` read t's elements before the usage fold counted `t << "s"`. */
 int rejoin_local_writes(Compiler *c) {
   const NodeTable *nt = c->nt;
   static const NodeKind kinds[] = { NK_LocalVariableWriteNode, NK_LocalVariableOperatorWriteNode,
                                     NK_LocalVariableOrWriteNode, NK_LocalVariableAndWriteNode };
-  int changed = 0;
-  LocalVar **boxed = NULL; int nboxed = 0, cboxed = 0;
+  Rejoin rj = {0};
   for (unsigned k = 0; k < sizeof kinds / sizeof kinds[0]; k++)
     NT_FOREACH_KIND(nt, kinds[k], id) {
       if (id >= c->node_cap) continue;
       const char *nm = nt_str(nt, id, "name");
       LocalVar *lv = nm ? scope_local(comp_scope_of(c, id), nm) : NULL;
       if (!lv || lv->is_param || lv->is_block_param || lv->rbs_seeded) continue;
-      TyKind v = local_write_ty(c, id, 0);
-      if (v == TY_UNKNOWN || v == c->lw_joined[id]) continue;
-      TyKind was = lv->type;
-      TyKind m = lw_join(was, v);
-      c->lw_joined[id] = v;
-      if (m == was) continue;
-      slot_set(c, lv, m, v, nt_ref(nt, id, "value"));
-      if (lv->oa_pin != TY_UNKNOWN && lv->type != lv->oa_pin) lv->oa_pin = TY_UNKNOWN;
-      lv_keep_decisions(c, lv, 0);
-      if (lv->type == was) continue;
-      changed = 1;
-      if (lv->type != TY_POLY) continue;
-      if (nboxed == cboxed) {
-        cboxed = cboxed ? cboxed * 2 : 8;
-        LocalVar **nb = (LocalVar **)realloc(boxed, sizeof *nb * (size_t)cboxed);
-        if (!nb) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-        boxed = nb;
-      }
-      boxed[nboxed++] = lv;
+      rejoin_one(c, &rj, id, lv, local_write_ty(c, id, 0), nt_ref(nt, id, "value"));
     }
+  NT_FOREACH_KIND(nt, NK_MultiWriteNode, mw) masgn_runtime_targets(c, mw, rejoin_masgn_target, &rj);
+  int changed = rj.changed, nboxed = rj.nboxed;
+  LocalVar **boxed = rj.boxed;
   /* A parameter typed from a local the re-join has just boxed keeps the
      scalar it was typed with: `hit(x, bits)` with `bits` now boxed read the
      box through the Integer slot, nil as the sentinel, which the callee then
@@ -6476,7 +6640,7 @@ static int bind_dynamic_new_initializers(Compiler *c, int call_id) {
   int *seen = (int *)calloc((size_t)(c->nscopes > 0 ? c->nscopes : 1), sizeof(int));
   for (int k = 0; k < c->nclasses; k++) {
     if (!cplan_as_new(c, call_id, k) || !dynamic_new_may_reach(c, call_id, k)) continue;
-    int imi = comp_method_in_chain(c, k, "initialize", NULL);
+    int imi = cplan_new_arm_initialize(c, call_id, k);
     /* A Struct or Data built by its generated constructor from `k.new(a: 1)`:
        a member a keyword names with a value of another type than the one
        the member has is boxed, as the arm would read the value as the
@@ -7411,7 +7575,10 @@ int ivar_src_slot(Compiler *c, int v, const char **ivn) {
     TyKind rt = infer_type(c, r);
     if (ty_is_object(rt)) cls = ty_object_class(rt);
   }
-  if (cls < 0 || !call_attr_target(c, -1, cls, nm, 0, NULL)) return -1;
+  MtabMark mt_was = mtab_push_in(c, v);
+  int attr = cls >= 0 && call_attr_target(c, -1, cls, nm, 0, NULL);
+  mtab_pop(c, mt_was);
+  if (!attr) return -1;
   ivb[0] = '@'; strcpy(ivb + 1, nm);
   *ivn = ivb;
   return cls;
@@ -7778,6 +7945,12 @@ static int array_src_walk(Compiler *c, int v, int pinned, int apply, int *stack,
   return ch;
 }
 
+/* Can every array the value `v` can be be the general Array
+   (array_src_walk without applying it)? */
+int array_sources_widenable(Compiler *c, int v) {
+  int stack[8];
+  return array_src_walk(c, v, 0, 0, stack, 0) == 1;
+}
 /* Widens every array the value `v` can be to the general Array, when all
    of them can be (array_src_walk). Returns 1 on a change. */
 static int widen_array_sources(Compiler *c, int v) {
@@ -7799,7 +7972,7 @@ static int widen_array_sources(Compiler *c, int v) {
 static int widen_iter_param_elems(Compiler *c, Scope *sc, const char *nm, TyKind elem, int depth);
 static int g_wcause_scope = -1;
 static const char *g_wcause_name = NULL;
-static int widen_arg_array(Compiler *c, int arg) {
+int widen_arg_array(Compiler *c, int arg) {
   const NodeTable *nt = c->nt;
   arg = value_node_or_self(nt, arg);   /* `(a; [1])` is the literal */
   NodeKind ak = nt_kind(nt, arg);
@@ -9150,6 +9323,75 @@ static int cext_widen_stores(Compiler *c, const char *name, Scope *scope, CextWa
   }
   return changed;
 }
+/* Does call `call` enter scope si (cplan_entries: a builtin `new` enters
+   the initialize of the class it builds)? */
+static int cext_call_enters(Compiler *c, int call, int si) {
+  int targets[CPT_MAX], n = cplan_entries(c, call, targets, CPT_MAX);
+  for (int q = 0; q < n; q++) if (targets[q] == si) return 1;
+  return 0;
+}
+/* The argument(s) call `call` hands parameter pi of scope, widened. */
+static int cext_widen_param_args(Compiler *c, int call, Scope *scope, int pi, CextWalk *seen) {
+  const NodeTable *nt = c->nt;
+  int changed = 0, arg = nt_ref(nt, call, "arguments"), ac = 0;
+  const int *av = arg >= 0 ? nt_arr(nt, arg, "arguments", &ac) : NULL;
+  ArgLayout layout; call_layout(c, scope, av, ac, &layout);
+  int actual = layout_plain_arg(c, scope, av, &layout, pi);
+  if (actual >= 0) changed |= cext_widen_containers(c, actual, seen);
+  else for (int q = 0; q < ac; q++) if (gather_reaches(c, scope, av, ac, 0, q, pi))
+    changed |= cext_widen_containers(c, av[q], seen);
+  return changed;
+}
+/* The calls that enter each scope, for the walk's parameter reads: every
+   call of the program asked once (cplan_entries) and filed under each scope
+   it enters, in the order the scan below met them. Kept under
+   infer_param_types for one of its shared generations (wbas_gen, the one
+   widen_boxed_array_sources shares: a change the pass reported ends it),
+   since the walk asked the same question of every call for every
+   parameter it reached, once per binding -- on an application with a
+   hundred thousand scopes, most of the pass. Calls appended after the
+   index was built (cext_pin_array_producer's) are scanned as before. */
+static struct { unsigned gen; int nscopes, ncalls, cap_off, cap_calls, *off, *calls; } cwc_idx;
+static void cwc_index_build(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  if (cwc_idx.gen == wbas_gen && cwc_idx.nscopes == c->nscopes) return;
+  int ns = c->nscopes, n = 0, cap = 0, *ps = NULL, *pc = NULL;
+  NT_FOREACH_KIND(nt, NK_CallNode, call) {
+    int targets[CPT_MAX], k = cplan_entries(c, call, targets, CPT_MAX);
+    for (int q = 0; q < k; q++) {
+      int s = targets[q], dup = 0;
+      for (int r = 0; r < q; r++) dup |= targets[r] == s;
+      if (dup || s < 0 || s >= ns) continue;
+      if (n == cap) {
+        cap = cap ? cap * 2 : 1024;
+        ps = (int *)realloc(ps, sizeof(int) * (size_t)cap);
+        pc = (int *)realloc(pc, sizeof(int) * (size_t)cap);
+        if (!ps || !pc) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+      }
+      ps[n] = s; pc[n] = call; n++;
+    }
+  }
+  /* (each array by its own size: one cap for their sum left the offsets
+     short when the scopes grew and the calls filed shrank) */
+  if (cwc_idx.cap_off < ns + 1) {
+    cwc_idx.cap_off = ns + 1;
+    cwc_idx.off = (int *)realloc(cwc_idx.off, sizeof(int) * (size_t)cwc_idx.cap_off);
+  }
+  if (cwc_idx.cap_calls < n || !cwc_idx.calls) {
+    cwc_idx.cap_calls = n ? n : 1;
+    cwc_idx.calls = (int *)realloc(cwc_idx.calls, sizeof(int) * (size_t)cwc_idx.cap_calls);
+  }
+  if (!cwc_idx.off || !cwc_idx.calls) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  memset(cwc_idx.off, 0, sizeof(int) * (size_t)(ns + 1));
+  for (int i = 0; i < n; i++) cwc_idx.off[ps[i] + 1]++;
+  for (int s = 0; s < ns; s++) cwc_idx.off[s + 1] += cwc_idx.off[s];
+  int *cur = (int *)malloc(sizeof(int) * (size_t)(ns ? ns : 1));
+  if (!cur) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  memcpy(cur, cwc_idx.off, sizeof(int) * (size_t)ns);
+  for (int i = 0; i < n; i++) cwc_idx.calls[cur[ps[i]]++] = pc[i];
+  free(cur); free(ps); free(pc);
+  cwc_idx.gen = wbas_gen; cwc_idx.nscopes = ns; cwc_idx.ncalls = nt->count;
+}
 static int cext_widen_containers(Compiler *c, int v, CextWalk *seen) {
   const NodeTable *nt = c->nt;
   v = nt_paren_single(c->nt, v);
@@ -9202,18 +9444,26 @@ static int cext_widen_containers(Compiler *c, int v, CextWalk *seen) {
     int pi = -1;
     if (scope) for (int j = 0; j < scope->nparams; j++)
       if (scope->pnames[j] && sp_streq(scope->pnames[j], name)) { pi = j; break; }
-    if (pi >= 0) NT_FOREACH_KIND(nt, NK_CallNode, call) {
-      /* (a builtin `new` enters the initialize of the class it builds) */
-      int targets[CPT_MAX], n = cplan_entries(c, call, targets, CPT_MAX), reaches = 0;
-      for (int q = 0; q < n; q++) reaches |= targets[q] == si;
-      if (!reaches) continue;
-      int arg = nt_ref(nt, call, "arguments"), ac = 0;
-      const int *av = arg >= 0 ? nt_arr(nt, arg, "arguments", &ac) : NULL;
-      ArgLayout layout; call_layout(c, scope, av, ac, &layout);
-      int actual = layout_plain_arg(c, scope, av, &layout, pi);
-      if (actual >= 0) changed |= cext_widen_containers(c, actual, seen);
-      else for (int q = 0; q < ac; q++) if (gather_reaches(c, scope, av, ac, 0, q, pi))
-        changed |= cext_widen_containers(c, av[q], seen);
+    if (pi >= 0 && wbas_shared) {
+      /* under infer_param_types: the calls that enter the scope, from the
+         index of the pass's generation (a change the pass reported before
+         this ask ends the generation first, as before each binding's walk) */
+      if (wbas_share_changed) wbas_share_step(wbas_share_changed, wbas_share_any);
+      cwc_index_build(c);
+      /* (the list is copied: a walk below may end the generation and
+         rebuild the index) */
+      int cnt = cwc_idx.off[si + 1] - cwc_idx.off[si], ncalls = cwc_idx.ncalls;
+      int *list = (int *)malloc(sizeof(int) * (size_t)(cnt ? cnt : 1));
+      if (!list) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+      memcpy(list, cwc_idx.calls + cwc_idx.off[si], sizeof(int) * (size_t)cnt);
+      for (int i = 0; i < cnt; i++) changed |= cext_widen_param_args(c, list[i], scope, pi, seen);
+      free(list);
+      for (int call = ncalls; call < nt->count; call++)
+        if (nt_kind(nt, call) == NK_CallNode && cext_call_enters(c, call, si))
+          changed |= cext_widen_param_args(c, call, scope, pi, seen);
+    }
+    else if (pi >= 0) NT_FOREACH_KIND(nt, NK_CallNode, call) {
+      if (cext_call_enters(c, call, si)) changed |= cext_widen_param_args(c, call, scope, pi, seen);
     }
   } else if (kind == NK_CallNode) {
     const char *name = nt_str(nt, v, "name");
@@ -9528,6 +9778,14 @@ static int bind_args_params(Compiler *c, int call_id, int mi, const int *argv, i
     LocalVar *p = m->pnames[i] ? scope_local(m, m->pnames[i]) : NULL;
     if (!p || cext_scope(c, mi)) continue;
     int anode = layout_plain_arg(c, m, argv, &L, i);
+    /* a typed Hash passed where the declaration says the boxed-value one
+       (`Hash[Integer, untyped]` and `{1 => 2}`): the caller's hash is that
+       variant, as a foreign store through the parameter makes it below. A
+       copy at the call lost the stores the method makes and the default. */
+    if (p->rbs_seeded && anode >= 0 && (p->rbs_type != TY_UNKNOWN ? p->rbs_type : p->type) == TY_POLY_POLY_HASH) {
+      TyKind at0 = infer_type(c, anode);
+      if (ty_is_hash(at0) && at0 != TY_POLY_POLY_HASH) changed |= widen_arg_hash(c, anode);
+    }
     if (p->rbs_seeded && (anode < 0 || param_seed_holds_arg(c, p, anode, infer_type(c, anode)))) {
       /* the declaration types the parameter; an empty-`{}`-only local passed
          here still takes the Hash it declares, as it takes an inferred
@@ -9806,7 +10064,7 @@ static int bind_args_params(Compiler *c, int call_id, int mi, const int *argv, i
           /* the value is stored boxed: one whose type is not known yet (an
              empty `[]`) holds any class, so the keyword does too */
           TyKind at = infer_type(c, val);
-          if (at == TY_UNKNOWN || at == TY_NIL) at = TY_POLY;
+          if (at == TY_UNKNOWN || at == TY_NIL || at == TY_VOID) at = TY_POLY;
           for (int i = 0; i < m->nparams; i++) {
             if (i == m->kwrest_idx || !m->pnames[i] || !callee_has_kwarg(c, m, m->pnames[i])) continue;
             LocalVar *p = scope_local(m, m->pnames[i]);
@@ -9835,6 +10093,12 @@ static int bind_args_params(Compiler *c, int call_id, int mi, const int *argv, i
         LocalVar *p = scope_local(m, kname);
         if (!p) continue;
         TyKind at = infer_type(c, val);
+        /* A void value (a constant a stub that always raises was to fill)
+           binds the keyword as the positional loop above binds its void
+           argument: poly, so the parameter is declarable. The call never
+           completes, so nothing reads the slot; bound void, the method was
+           refused in codegen as unemittable. */
+        if (at == TY_VOID) at = TY_POLY;
         /* a signature's parameter keeps its type, and still types the
            empty `{}` it is handed */
         if (!param_seed_holds_arg(c, p, val, at)) changed |= slot_take(c, p, at, val);
@@ -9886,7 +10150,7 @@ int propagate_prep_params(Compiler *c) {
       const char *to_name   = cls->prep_to[k];
       /* a class method's chain is keyed `self.<name>` (comp_super_shadow) */
       int cm = strncmp(from_name, "self.", 5) == 0;
-      int from_mi = cm ? comp_cmethod_in_class(c, ci, from_name + 5) : comp_method_in_class(c, ci, from_name);
+      int from_mi = cm ? call_target(c, -1, ci, from_name + 5, CT_CMETHOD | CT_OWN | CT_SHARED, NULL) : call_target(c, -1, ci, from_name, CT_OWN | CT_SHARED, NULL);
       int to_mi = -1;
       for (int s = 0; s < c->nscopes; s++) {
         if (c->scopes[s].class_id == ci && c->scopes[s].is_cmethod == cm &&
@@ -10754,7 +11018,7 @@ int bind_coerce_operator_params(Compiler *c) {
     TyKind a0 = infer_type(c, argv[0]);
     if (!ty_is_object(a0)) continue;
     int acls = ty_object_class(a0);
-    int coerce_mi = comp_method_in_chain(c, acls, "coerce", NULL);
+    int coerce_mi = cplan_implied_target(c, id, recv, acls, "coerce", CIT_TABLE, NULL);
     if (coerce_mi < 0) continue;
     /* The coerce call this route emits has no node of its own either, and it
        passes the numeric receiver BOXED. Nothing else binds that parameter:
@@ -11060,7 +11324,7 @@ static int struct_with_super_types_members(Compiler *c) {
     if (!s || !s->name || !sp_streq(s->name, "with") || s->is_cmethod || s->class_id < 0) continue;
     ClassInfo *cls = &c->classes[s->class_id];
     if (!cls->is_struct || !cls->is_data ||
-        (cls->parent >= 0 && comp_method_in_chain(c, cls->parent, "with", NULL) >= 0)) continue;
+        (cls->parent >= 0 && call_target(c, -1, cls->parent, "with", CT_METHODS, NULL) >= 0)) continue;
     if (pass) {
       for (int j = 0; j < s->nparams; j++) {
         const char *pn = s->pnames[j];
@@ -11118,7 +11382,7 @@ static int struct_new_types_members_at(Compiler *c, int id, int ci, int given_on
   ClassInfo *cls = &c->classes[ci];
   /* A user initialize receives the arguments; its `super` sets the members
      (struct_super_types_members). */
-  int imi = cplan_new_initialize(c, id, ci, NULL);
+  int imi = cplan_hook_target(c, id, ci, "initialize", NULL);
   if (imi >= 0) return bind_call_params(c, id, imi);
   int args = nt_ref(nt, id, "arguments");
   int an = 0;
@@ -11668,7 +11932,7 @@ static int bind_case_eqq_subjects(Compiler *c, int *changed, int *any) {
         NodeKind ck = nt_kind(nt, conds[j]);
         if (ck != NK_ConstantReadNode && ck != NK_ConstantPathNode) continue;
         int ci = const_node_class_index(c, conds[j]);
-        int mi = ci >= 0 ? class_own_cmethod_eqq(c, ci) : -1;
+        int mi = ci >= 0 ? class_own_cmethod_eqq(c, -1, -1, ci) : -1;
         if (mi < 0) continue;
         LocalVar *p = scope_local(&c->scopes[mi], c->scopes[mi].pnames[0]);
         if (!p || p->type != TY_POLY) continue;
@@ -11685,6 +11949,13 @@ static int bind_case_eqq_subjects(Compiler *c, int *changed, int *any) {
   }
   return ch;
 }
+/* The top-level def the call plan binds call id to as a reopening of no class (a public def
+   reached with an explicit receiver), -1 where it binds none or the call is a builtin's */
+static int plan_top_def_target(Compiler *c, int id) {
+  if (cplan_builtin_call(c, id)) return -1;
+  const CallPlan tp = cplan_user_fresh(c, id);
+  return tp.mi >= 0 && tp.via == UC_REOPEN && tp.dispatch == CP_DIRECT && c->scopes[tp.mi].class_id < 0 && !c->scopes[tp.mi].is_cmethod ? tp.mi : -1;
+}
 static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before);
 int infer_param_types(Compiler *c) { return infer_param_types_ex(c, 0, NULL); }
 int infer_param_types_settle(Compiler *c) { return infer_param_types_ex(c, 1, NULL); }
@@ -11693,15 +11964,18 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
   const NodeTable *nt = c->nt;
   int changed = 0, any = 0;
   /* the walks the bindings start share what they found unchanged, until a
-     binding reports a change (widen_boxed_array_sources) */
+     binding reports a change (widen_boxed_array_sources); so do the
+     share-strings walks back from a parameter, each method's callers
+     (strbuf_scope_callers) */
   wbas_share_begin(&changed, &any);
+  sb_targets_share_begin(&changed, &any);
   IptWork w;
   ipt_work_begin(c, &w);
   /* A class method `===` of the program's own is called by `when` and `in`
      arms, grep and a class held as a value, with any kind of value: its
      parameter takes a boxed value. */
   for (int k = 0; k < c->nclasses; k++) {
-    int emi = class_own_cmethod_eqq(c, k);
+    int emi = class_own_cmethod_eqq(c, -1, -1, k);
     if (emi < 0 || c->scopes[emi].nparams < 1) continue;
     LocalVar *ep = scope_local(&c->scopes[emi], c->scopes[emi].pnames[0]);
     if (ep && !ep->rbs_seeded && lv_widen(ep, TY_POLY)) changed = 1;
@@ -11710,8 +11984,10 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
   changed |= struct_with_super_types_members(c);
   const int *ids = NULL;
   int nids = nt->count;
+  MtabMark mt_pass = mtab_mark(c);
   for (;;) {
   for (int k = 0; k < nids; k++, wbas_share_step(&changed, &any)) {
+    mtab_pop(c, mt_pass);
     int id = ids ? ids[k] : k;
     const char *ty = nt_type(nt, id);
     NodeKind ty_k = nt_kind(nt, id);
@@ -11726,28 +12002,32 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
       if (comp_super_is_class_new(c, id)) {
         for (int k = 0; k < c->nclasses; k++) {
           if (k != s->class_id && !is_descendant(c, k, s->class_id)) continue;
-          int imi = comp_method_in_chain(c, k, "initialize", NULL);
-          if (imi < 0) continue;
-          if (ty_k == NK_SuperNode) { changed |= bind_call_params(c, id, imi); continue; }
-          Scope *im = &c->scopes[imi];
-          /* A forwarder (`def self.new(*a, **k, &blk) ... super end`) passes
-             the CONTENTS of its rest array and keyword-rest hash on, not the
-             containers: mapping parameter q to parameter q typed the
-             constructor's first parameter as the array itself. What arrives
-             is decided at run time, so every parameter takes a boxed value. */
-          if (s->rest_idx >= 0 || s->kwrest_idx >= 0) {
-            for (int q = 0; q < im->nparams; q++) {
-              LocalVar *dst = scope_local(im, im->pnames[q]);
-              if (!dst || dst->rbs_seeded) continue;
-              if (lv_widen(dst, TY_POLY)) changed = 1;
+          /* (each initialize a construction of k may run takes them: the
+             super's block and arguments reach whichever it binds) */
+          int ims[VER_MAX_ARMS], whole, nim = cplan_new_initializers(c, k, ims, VER_MAX_ARMS, &whole);
+          for (int vi = 0; vi < nim; vi++) {
+            int imi = ims[vi];
+            if (ty_k == NK_SuperNode) { changed |= bind_call_params(c, id, imi); continue; }
+            Scope *im = &c->scopes[imi];
+            /* A forwarder (`def self.new(*a, **k, &blk) ... super end`) passes
+               the CONTENTS of its rest array and keyword-rest hash on, not the
+               containers: mapping parameter q to parameter q typed the
+               constructor's first parameter as the array itself. What arrives
+               is decided at run time, so every parameter takes a boxed value. */
+            if (s->rest_idx >= 0 || s->kwrest_idx >= 0) {
+              for (int q = 0; q < im->nparams; q++) {
+                LocalVar *dst = scope_local(im, im->pnames[q]);
+                if (!dst || dst->rbs_seeded) continue;
+                if (lv_widen(dst, TY_POLY)) changed = 1;
+              }
+              continue;
             }
-            continue;
-          }
-          for (int q = 0; q < s->nparams && q < im->nparams; q++) {
-            LocalVar *src = scope_local(s, s->pnames[q]);
-            LocalVar *dst = scope_local(im, im->pnames[q]);
-            if (!src || !dst || dst->rbs_seeded || src->type == TY_UNKNOWN) continue;
-            if (lv_widen(dst, src->type)) changed = 1;
+            for (int q = 0; q < s->nparams && q < im->nparams; q++) {
+              LocalVar *src = scope_local(s, s->pnames[q]);
+              LocalVar *dst = scope_local(im, im->pnames[q]);
+              if (!src || !dst || dst->rbs_seeded || src->type == TY_UNKNOWN) continue;
+              if (lv_widen(dst, src->type)) changed = 1;
+            }
           }
         }
         continue;
@@ -11807,6 +12087,7 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
       continue;
     }
     if (ty_k != NK_CallNode) continue;
+    mtab_push_in(c, id);   /* (the call's own binding: what it asks of the tables is the call's) */
     if (nt_int(nt, id, "rt_probe", 0)) continue;  /* analysis-only respond_to? probe:
        its dummy-argument shape must not type real method params */
     const char *name = nt_str(nt, id, "name");
@@ -11867,7 +12148,7 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
         const char *rcn = key_name(c, rav[0]);
         int rci = rcn ? const_node_class_index(c, rav[0]) : -1;
         if (rci >= 0 && class_is_exc_subclass(c, rci)) {
-          int imi = cplan_new_initialize(c, id, rci, NULL);
+          int imi = cplan_hook_target(c, id, rci, "initialize", NULL);
           /* the message is `Cls.new(arg)`'s one argument, into the
              parameter its layout funds: `initialize(a = 5, b)` takes it in b */
           Scope *im = imi >= 0 ? &c->scopes[imi] : NULL;
@@ -11886,12 +12167,16 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
         TyKind at = kt == TY_CLASS || kt == TY_POLY ? infer_type(c, rav[1]) : TY_UNKNOWN;
         for (int rci = 0; at != TY_UNKNOWN && rci < c->nclasses; rci++) {
           if (!class_is_exc_subclass(c, rci) || !class_value_escapes(c, rci)) continue;
-          int imi = comp_method_in_chain(c, rci, "initialize", NULL);
-          Scope *im = imi >= 0 ? &c->scopes[imi] : NULL;
-          for (int i = 0; im && i < im->nparams; i++) {
-            if (call_param_arg(c, im, &rav[1], 1, i) != rav[1]) continue;
-            LocalVar *ip = scope_local(im, im->pnames[i]);
-            if (ip && !ip->rbs_seeded) changed |= slot_take(c, ip, at, rav[1]);
+          /* (the class is any one the value reaches, at any point: every
+             initialize a construction of it may run takes the message) */
+          int ims[VER_MAX_ARMS], whole, nim = cplan_new_initializers(c, rci, ims, VER_MAX_ARMS, &whole);
+          for (int vi = 0; vi < nim; vi++) {
+            Scope *im = &c->scopes[ims[vi]];
+            for (int i = 0; i < im->nparams; i++) {
+              if (call_param_arg(c, im, &rav[1], 1, i) != rav[1]) continue;
+              LocalVar *ip = scope_local(im, im->pnames[i]);
+              if (ip && !ip->rbs_seeded) changed |= slot_take(c, ip, at, rav[1]);
+            }
           }
         }
       }
@@ -11905,7 +12190,7 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
       TyKind drt = infer_type(c, recv);
       if (ty_is_object(drt)) {
         int dcid = ty_object_class(drt);
-        int dmi = comp_method_in_chain(c, dcid, "initialize_copy", NULL);
+        int dmi = cplan_hook_target(c, id, dcid, "initialize_copy", NULL);
         if (dmi >= 0 && c->scopes[dmi].nparams >= 1) {
           LocalVar *dp = scope_local(&c->scopes[dmi], c->scopes[dmi].pnames[0]);
           if (dp && !dp->rbs_seeded) {
@@ -11960,7 +12245,7 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
       int bargs = cvsym ? nt_ref(nt, id, "arguments") : -1;
       int ban = 0; const int *bav = bargs >= 0 ? nt_arr(nt, bargs, "arguments", &ban) : NULL;
       for (int k = 0; ban > 0 && k < c->nclasses; k++) {
-        int tmi = class_value_bind_call_target(c, k, cvsym, NULL);
+        int tmi = class_value_bind_call_target(c, recv, k, cvsym, NULL);
         if (tmi >= 0) changed |= bind_args_params(c, id, tmi, bav + 1, ban - 1);
       }
       if (cvsym) continue;
@@ -12037,7 +12322,9 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
           if (c->classes[s->class_id].is_struct)
             changed |= struct_new_types_members(c, id, s->class_id);
           else {
-            int initmi = comp_method_in_chain(c, s->class_id, "initialize", NULL);
+            /* (a bare `new` runs on self, a class that may be one below this
+               one: the table's initialize, as its construction emits it) */
+            int initmi = cplan_hook_target(c, -1, s->class_id, "initialize", NULL);
             if (initmi >= 0) changed |= bind_call_params(c, id, initmi);
           }
         }
@@ -12087,8 +12374,9 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
          receive the same arg types so the cls_id-switch dispatch is type-safe.
          Also handles the case where only descendants define the method (mi < 0
          from base chain, e.g. Base.find calls adapter_find defined only in
-         Article and Comment descendants). */
-      if (caller_cid >= 0) {
+         Article and Comment descendants). A call the plan pins to one method
+         (cplan_pinned) runs that one on every self: no override takes it. */
+      if (caller_cid >= 0 && !cplan_pinned(c, id)) {
         Scope *caller_sc = comp_scope_of(c, id);
         int is_cm = caller_sc ? caller_sc->is_cmethod : 0;
         int nd = 0; const int *ds = comp_descendants(c, caller_cid, &nd);
@@ -12147,7 +12435,7 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
           int first_splat = 0;
           while (first_splat < nargs && nt_kind(nt, av[first_splat]) != NK_SplatNode) first_splat++;
           for (int k = 0; k < c->nclasses; k++) {
-            int imi = comp_method_in_chain(c, k, "initialize", NULL);
+            int imi = cplan_new_arm_initialize(c, id, k);
             if (imi >= 0) {
               changed |= bind_call_params(c, id, imi);
               /* which element lands in which parameter differs per class and
@@ -12183,7 +12471,9 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
       if (!static_cls && infer_type(c, recv) == TY_CLASS) {
         int bound_any = 0;
         for (int k = 0; k < c->nclasses; k++) {
-          int cmi = call_target(c, id, k, name, CT_OWN | CT_CMETHOD, NULL);
+          /* (a class the call cannot reach binds nothing) */
+          int cmi = is_new_name(name) && (cls_fact_excludes_class_value(c, recv, k) || !dynamic_new_may_reach(c, id, k)) ? -1
+                  : cplan_cmethod_target(c, id, k, name, CT_OWN);
           if (cmi >= 0) { changed |= bind_call_params(c, id, cmi); bound_any = 1; }
         }
         if (bound_any) continue;
@@ -12208,11 +12498,11 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
         int cpath_struct = ci >= 0 && sp_streq(name, "new") && c->classes[ci].is_struct;
         if (cpath_struct) { /* handled below, with the short-name spelling */ }
         else if (ci >= 0 && sp_streq(name, "new")) {
-          int ucnew = comp_cmethod_in_chain(c, ci, "new", NULL);
+          int ucnew = cplan_user_new(c, id, ci);
           if (ucnew >= 0)
             changed |= bind_call_params(c, id, ucnew);
           else
-            changed |= bind_call_params(c, id, cplan_new_initialize(c, id, ci, NULL));
+            changed |= bind_call_params(c, id, cplan_hook_target(c, id, ci, "initialize", NULL));
         }
         else if (ci >= 0)
           changed |= bind_call_params(c, id, call_target(c, id, ci, name, CT_CMETHOD, NULL));
@@ -12240,14 +12530,18 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
             continue;
           }
           if (sp_streq(name, "new")) {
-            int ucnew = comp_cmethod_in_chain(c, ci, "new", NULL);
+            int ucnew = cplan_user_new(c, id, ci);
             if (ucnew >= 0)
               changed |= bind_call_params(c, id, ucnew);
             else
-              changed |= bind_call_params(c, id, cplan_new_initialize(c, id, ci, NULL));
+              changed |= bind_call_params(c, id, cplan_hook_target(c, id, ci, "initialize", NULL));
           }
-          else
-            changed |= bind_call_params(c, id, call_target(c, id, ci, name, CT_CMETHOD, NULL));
+          else {
+            int cmi = call_target(c, id, ci, name, CT_CMETHOD, NULL);
+            /* ...a class method the class lacks leaves the call to a public top-level def (`C.probe(x)`) */
+            if (cmi < 0) cmi = plan_top_def_target(c, id);
+            changed |= bind_call_params(c, id, cmi);
+          }
           continue;
         }
       }
@@ -12273,28 +12567,23 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
         for (int q = 0; q < nloop; q++) {
           int k = every ? q : ks[q];
           if (k < 0 || k >= c->nclasses || !c->classes[k].is_struct ||
-              comp_method_in_chain(c, k, "initialize", NULL) >= 0) continue;
+              cplan_new_arm_initialize(c, id, k) >= 0) continue;
           changed |= struct_new_types_members_at(c, id, k, 1);
         }
       }
-      /* `new` on an INSTANCE whose class defines an instance method `new`
-         is an ordinary method call, not a constructor: bind its params.
+      /* `new` on an INSTANCE is an ordinary method call, not a constructor (the object path below
+         binds its params, to an instance method `new` or to a public top-level def `new`).
          Skipping it left a `Relation#new(attrs = {}) = @model.new(attrs)`
          delegate's param typed by its default alone (a Symbol-keyed hash),
          so a String-keyed hash raised TypeError at runtime. */
-      if (sp_streq(name, "new")) {
-        TyKind rtn = infer_type(c, recv);
-        if (!(ty_is_object(rtn) &&
-              comp_method_in_chain(c, ty_object_class(rtn), "new", NULL) >= 0))
-          continue;
-      }
+      if (is_new_name(name) && !ty_is_object(infer_type(c, recv))) continue;
     }
     /* obj.method -> instance method params */
     TyKind rt = infer_type(c, recv);
     if (name && sp_streq(name, "with") && ty_is_object(rt) && c->classes[ty_object_class(rt)].is_struct &&
-        comp_method_in_chain(c, ty_object_class(rt), "with", NULL) < 0) {
+        call_target(c, -1, ty_object_class(rt), "with", CT_METHODS, NULL) < 0) {
       int wci = ty_object_class(rt);
-      int wimi = comp_method_in_chain(c, wci, "initialize", NULL);
+      int wimi = cplan_hook_target(c, -1, wci, "initialize", NULL);
       changed |= wimi >= 0 ? struct_with_binds_initialize(c, id, wci, wimi)
                            : struct_with_types_members(c, id, wci);
       continue;
@@ -12309,8 +12598,8 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
       for (int q = 0; q < (ks ? nk : c->nclasses); q++) {
         int k = ks ? ks[q] : q;
         if (k < 0 || k >= c->nclasses || !c->classes[k].is_data ||
-            comp_method_in_chain(c, k, "initialize", NULL) >= 0 ||
-            comp_method_in_chain(c, k, "with", NULL) >= 0) continue;
+            cplan_hook_target(c, -1, k, "initialize", NULL) >= 0 ||
+            call_target(c, -1, k, "with", CT_METHODS, NULL) >= 0) continue;
         changed |= struct_with_types_members(c, id, k);
       }
     }
@@ -12375,6 +12664,17 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
           changed |= bind_call_params(c, id, mi4);
       }
     }
+    /* A builtin exception receiver calling a method that reopenings of
+       builtin exception classes define: the plan picks among them by the
+       class name at run time (cplan_exc_reopen), so each one's parameters
+       take the call's arguments, as an object's override in a subclass
+       does. Bound by no call of its own, `StandardError#echo(v)` took its
+       parameter's type from a program subclass's call alone, and
+       `ArgumentError.new.echo(1)` handed 1 to a Symbol slot. */
+    if (name && rt == TY_EXCEPTION) {
+      int xr[8], xn = exc_reopen_definers(c, name, xr, 8);
+      for (int xi = 0; xi < xn; xi++) changed |= bind_call_params(c, id, call_target(c, id, xr[xi], name, 0, NULL));
+    }
     if (ty_is_object(rt)) {
       int cid3 = ty_object_class(rt);
       int mi3 = call_target(c, id, cid3, name, 0, NULL);
@@ -12393,6 +12693,8 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
         int oci3 = comp_core_class(c, CORE_OBJECT);
         if (oci3 >= 0 && oci3 != cid3) mi3 = call_target(c, id, oci3, name, CT_OWN, NULL);
       }
+      /* ...or a top-level def the plan binds to the call (`C.new.m` for a public `def m`) */
+      if (mi3 < 0) mi3 = plan_top_def_target(c, id);
       changed |= bound_name != name && is_eq_op(name) ? bind_delegated_params(c, id, mi3)
                                                      : bind_call_params(c, id, mi3);
       /* Also propagate to descendant overrides: codegen will emit a cls_id
@@ -12486,24 +12788,21 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
       int bc = core_of_type(rt);
       int bci = bc >= 0 && (bc == CORE_RANDOM || bc == CORE_STRING || builtin_class_of_type(rt))
                 ? comp_core_class(c, bc) : -1;
-      int bmi = bci >= 0 && !cplan_builtin_call(c, id)
-                ? call_target(c, id, bci, name, 0, NULL) : -1;
+      int bmi = bci >= 0 ? call_target(c, id, bci, name, 0, NULL) : -1;
       if (bmi >= 0) { changed |= bind_call_params(c, id, bmi); continue; }
       /* Without one, the call reaches Object's universal fallback. */
       int ocb = comp_core_class(c, CORE_OBJECT);
       int omb = ocb >= 0 ? call_target(c, id, ocb, name, 0, NULL) : -1;
       if (omb >= 0 && !c->scopes[omb].is_cmethod) changed |= bind_call_params(c, id, omb);
       /* ...or a top-level def the plan binds to the call */
-      else if (omb < 0 && !cplan_builtin_call(c, id)) {
-        const CallPlan tp = cplan_user_fresh(c, id);
-        if (tp.mi >= 0 && tp.via == UC_REOPEN && tp.dispatch == CP_DIRECT && c->scopes[tp.mi].class_id < 0 && !c->scopes[tp.mi].is_cmethod)
-          changed |= bind_call_params(c, id, tp.mi);
-      }
+      else if (omb < 0) changed |= bind_call_params(c, id, plan_top_def_target(c, id));
     }
   }
+  mtab_pop(c, mt_pass);
   if (!settle || !ipt_work_next(c, &w, &ids, &nids)) break;
   }
   ipt_work_end(&w);
+  sb_targets_share_end();
   wbas_share_end();
   return changed | any;
 }
@@ -13409,7 +13708,7 @@ static int bs_object_to_ary(Compiler *c, TyKind t) {
      census; `instantiated` is unset while the fixpoint runs) */
   const PolyCand *pc = comp_poly_candidates(c, "to_ary", &np);
   for (int i = 0; i < np; i++) {
-    int k = pc[i].cls, mi = comp_implicit_to_ary_mi(c, k);
+    int k = pc[i].cls, mi = comp_implicit_to_ary_mi(c, -1, -1, k);
     if (pc[i].native || mi < 0 || mi != pc[i].mi || c->scopes[mi].nparams != 0) continue;
     if (!(c->classes[k].ctor_reachable || c->classes[k].instantiated)) continue;
     if (k == oc || is_descendant(c, k, oc)) return 1;
@@ -13581,7 +13880,7 @@ static int block_reach(Compiler *c, int si, const BlockSig *s, TyKind *pos,
     else if (nt_kind(nt, recv) == NK_ConstantReadNode || nt_kind(nt, recv) == NK_ConstantPathNode) {
       int ci = const_node_class_index(c, recv);
       if (ci >= 0) t = call_target(c, f, ci, fn, CT_CMETHOD, NULL);
-      if (ci >= 0 && t < 0 && is_new_name(fn)) t = cplan_new_initialize(c, f, ci, NULL);
+      if (ci >= 0 && t < 0 && is_new_name(fn)) t = cplan_hook_target(c, f, ci, "initialize", NULL);
     }
     else {
       TyKind rt = infer_type(c, recv);
@@ -13779,7 +14078,8 @@ static int block_with_own_self(Compiler *c, int call) {
    name / to_s / inspect (which `Foo.name` reaches as the bare call does)? */
 static int bare_call_on_class(Compiler *c, int ci, const char *nm) {
   if (ci < 0 || !nm) return 0;
-  return comp_cmethod_in_chain(c, ci, nm, NULL) >= 0 || is_name_reader(nm);
+  /* (what self is inside the block does not move with where the def is: the class's table, asked with no site) */
+  return call_target(c, -1, ci, nm, CT_CMETHOD | CT_SHARED, NULL) >= 0 || is_name_reader(nm);
 }
 static void subtree_self_to_const(Compiler *c, int root, const char *cname, int ci, int depth) {
   NodeTable *nt = (NodeTable *)c->nt;
@@ -13796,6 +14096,7 @@ static void subtree_self_to_const(Compiler *c, int root, const char *cname, int 
     int cr = nt_new_node(nt, "ConstantReadNode");
     if (cr < 0) return;
     nt_node_set_str(nt, cr, "name", cname);
+    if (ci >= 0) nt_node_set_int(nt, cr, "made_class", ci + 1);
     comp_grow_node_arrays(c);
     c->nscope[cr] = c->nscope[root];
     nt_node_set_ref(nt, root, "receiver", cr);
@@ -13810,6 +14111,7 @@ static void subtree_self_to_const(Compiler *c, int root, const char *cname, int 
       int cr = nt_new_node(nt, "ConstantReadNode");
       if (cr < 0) return;
       nt_node_set_str(nt, cr, "name", cname);
+      if (ci >= 0) nt_node_set_int(nt, cr, "made_class", ci + 1);
       comp_grow_node_arrays(c);
       c->nscope[cr] = c->nscope[root];
       nd = &nt->nodes[root];        /* nt_new_node may realloc nt->nodes */
@@ -13825,6 +14127,7 @@ static void subtree_self_to_const(Compiler *c, int root, const char *cname, int 
         int cr = nt_new_node(nt, "ConstantReadNode");
         if (cr < 0) return;
         nt_node_set_str(nt, cr, "name", cname);
+        if (ci >= 0) nt_node_set_int(nt, cr, "made_class", ci + 1);
         comp_grow_node_arrays(c);
         c->nscope[cr] = c->nscope[root];
         nd = &nt->nodes[root];
@@ -14602,7 +14905,7 @@ int widen_shared_cmp_params(Compiler *c) {
     if (m->nparams < 1) continue;
     int users = 0;
     for (int k = 0; k < c->nclasses && users < 2; k++)
-      if (comp_method_in_chain(c, k, "<=>", NULL) == mi) users++;
+      if (call_target(c, -1, k, "<=>", CT_METHODS | CT_SHARED, NULL) == mi) users++;
     if (users < 2) continue;
     int api = arm_arg_param(c, m);   /* the operand's parameter, as the dispatch binds it */
     LocalVar *p = api >= 0 ? scope_local(m, m->pnames[api]) : NULL;
@@ -14652,7 +14955,7 @@ static void key_cmps_build(Compiler *c, KeyCmps *K) {
    a builtin value hands the program's classes nothing. A boxed value the class
    facts show can hold no object of the program, itself or in a container it may
    be (ClsSet: no class, and not bv), is a builtin value too. */
-static int widen_key_cmp_operands(Compiler *c, KeyCmps *K, TyKind kt, int node) {
+static int widen_key_cmp_operands(Compiler *c, KeyCmps *K, int call, TyKind kt, int node) {
   int changed = 0;
   if (!ty_is_object(kt)) {
     if (kt != TY_POLY) return 0;   /* a builtin value, or a type not settled yet */
@@ -14662,7 +14965,8 @@ static int widen_key_cmp_operands(Compiler *c, KeyCmps *K, TyKind kt, int node) 
   if (!K->built) key_cmps_build(c, K);
   for (int j = 0; j < K->n; j++) {
     int mi = K->v[j];
-    if (ty_is_object(kt) && comp_method_in_chain(c, ty_object_class(kt), "<=>", NULL) != mi) continue;
+    if (ty_is_object(kt) &&
+        cplan_implied_target(c, call, node, ty_object_class(kt), "<=>", CIT_TABLE, NULL) != mi) continue;
     LocalVar *p = scope_local(&c->scopes[mi], c->scopes[mi].pnames[K->op[j]]);
     if (!p || p->rbs_seeded) continue;
     if (!ty_is_object(kt)) {
@@ -14677,19 +14981,19 @@ static int widen_key_cmp_operands(Compiler *c, KeyCmps *K, TyKind kt, int node) 
 /* The keys a block's answer `node` makes: an Array literal's elements are keys
    of their own (the sort compares them one by one), each typed alone, so that
    a tuple of builtin values widens nothing; any other answer is one key. */
-static int widen_answer_cmp_operands(Compiler *c, KeyCmps *K, int node, int depth) {
+static int widen_answer_cmp_operands(Compiler *c, KeyCmps *K, int call, int node, int depth) {
   const NodeTable *nt = c->nt;
   if (node < 0) return 0;
   if (nt_kind(nt, node) == NK_ArrayNode && depth < 4) {
     int n = 0, changed = 0;
     const int *el = nt_arr(nt, node, "elements", &n);
-    for (int i = 0; i < n; i++) changed |= widen_answer_cmp_operands(c, K, el[i], depth + 1);
+    for (int i = 0; i < n; i++) changed |= widen_answer_cmp_operands(c, K, call, el[i], depth + 1);
     return changed;
   }
   TyKind kt = nt_kind(nt, node) == NK_SplatNode ? TY_POLY : infer_type(c, node);
   /* an Array key compares element by element: its elements are the keys */
   for (int d = 0; d < 4 && ty_is_array(kt); d++) kt = ty_array_elem(kt);
-  return widen_key_cmp_operands(c, K, kt, node);
+  return widen_key_cmp_operands(c, K, call, kt, node);
 }
 
 /* A user `<=>` that a builtin calls on the values a block answers (sort_by
@@ -14715,12 +15019,12 @@ int widen_block_key_cmp_params(Compiler *c) {
     int blk = nt_ref(nt, id, "block");
     if (!nm || blk < 0 || !builtin_orders_block_keys(nm)) continue;
     if (nt_kind(nt, blk) == NK_BlockNode) {
-      changed |= widen_answer_cmp_operands(c, &K, ic_block_value(nt, blk), 0);
+      changed |= widen_answer_cmp_operands(c, &K, id, ic_block_value(nt, blk), 0);
     }
     else if (nt_kind(nt, blk) == NK_BlockArgumentNode) {
       int ex = nt_ref(nt, blk, "expression");
       if (ex >= 0 && nt_kind(nt, ex) == NK_SymbolNode) continue;   /* an operator symbol */
-      changed |= widen_key_cmp_operands(c, &K, TY_POLY, -1);
+      changed |= widen_key_cmp_operands(c, &K, id, TY_POLY, -1);
     }
   }
   free(K.v); free(K.op);
@@ -15020,14 +15324,7 @@ int desugar_dir_surface(Compiler *c) {
       if (dnm && drecv >= 0 && dir_enumerable_name(dnm) &&
           infer_type(c, drecv) == TY_DIR) {
         int base = nt->count;
-        int ent = nt_new_node(nt, "CallNode");
-        if (ent >= 0) {
-          nt_node_set_ref(nt, ent, "receiver", drecv);
-          nt_node_set_str(nt, ent, "name", "entries");
-          nt_node_set_ref(nt, ent, "arguments", -1);
-          nt_node_set_ref(nt, ent, "block", -1);
-          nt_node_set_ref(nt, id, "receiver", ent);
-          comp_grow_node_arrays(c);
+        if (an_interpose_recv_call(c, id, "entries", -1) >= 0) {
           int encl = c->nscope[id];
           for (int j = base; j < nt->count; j++) c->nscope[j] = encl;
           changed = 1;
@@ -15082,16 +15379,9 @@ int desugar_dir_surface(Compiler *c) {
     if (nm && recv >= 0 && sp_streq(nm, "lazy") && nt_ref(nt, id, "block") < 0) {
       TyKind hrt = infer_type(c, recv);
       if (ty_is_hash(hrt)) {
-        int toa2 = nt_new_node(nt, "CallNode");
+        int toa2 = an_interpose_recv_call(c, id, "to_a", -1);
         if (toa2 >= 0) {
-          nt_node_set_str(nt, toa2, "name", "to_a");
           nt_node_set_int(nt, toa2, "made_to_a", 1);
-          nt_node_set_ref(nt, toa2, "receiver", recv);
-          nt_node_set_ref(nt, toa2, "arguments", -1);
-          nt_node_set_ref(nt, toa2, "block", -1);
-          comp_grow_node_arrays(c);
-          c->nscope[toa2] = c->nscope[id];
-          nt_node_set_ref(nt, id, "receiver", toa2);
           changed = 1;
           continue;
         }
@@ -17160,8 +17450,9 @@ static int new_block_initialize(Compiler *c, int id, int *several) {
   for (int e = 0; e < n; e++) {
     int k = cls >= 0 ? (e == 0 ? cls : ds[e - 1]) : e;
     if (cls < 0 && !dynamic_new_may_reach(c, id, k)) continue;
-    if (comp_cmethod_in_chain(c, k, "new", NULL) >= 0) continue;
-    int mi = comp_method_in_chain(c, k, "initialize", NULL);
+    /* (`self.new` in a class method builds the class or one below it: no one point, the table's) */
+    if (cplan_user_new(c, cls >= 0 ? -1 : id, k) >= 0) continue;
+    int mi = cls >= 0 ? cplan_hook_target(c, -1, k, "initialize", NULL) : cplan_new_arm_initialize(c, id, k);
     if (mi < 0 || c->scopes[mi].is_cmethod || mi == found) continue;
     Scope *m = &c->scopes[mi];
     if (!m->yields && !(m->blk_param && m->blk_param[0]) && forwarding_yield_target(c, mi, 0) < 0)
@@ -18240,6 +18531,7 @@ static int infer_block_params_enum_arms(Compiler *c, const NodeTable *nt, int id
     int rargc = 0;
     const int *rargv = rargs >= 0 ? nt_arr(nt, rargs, "arguments", &rargc) : NULL;
     TyKind acc_t = (rargc > 0 && rargv) ? infer_type(c, rargv[0]) : et2;
+    int acc_wait = 0;
     /* An empty `[]` / `{}` seed the block only hands to a callable has no
        fill to type it from; the element type of the RECEIVER is not what it
        holds, so answer the general boxed container (#3657). */
@@ -18250,6 +18542,14 @@ static int infer_block_params_enum_arms(Compiler *c, const NodeTable *nt, int id
           (nt_arr(nt, rargv[0], "elements", &sn0), sn0 == 0) &&
           ewo_memo_passed_to_callable_at(c, id, 0))
         acc_t = TY_POLY_ARRAY;
+      /* one the block only pushes Integers or Floats into is that Array
+         (reduce_empty_seed_kind); while a pushed value is not typed yet the
+         accumulator waits */
+      else if (s0_k == NK_ArrayNode && sn0 == 0) {
+        TyKind sk = reduce_empty_seed_kind(c, id);
+        if (sk == TY_UNKNOWN) acc_wait = 1;
+        else if (sk != TY_POLY_ARRAY) acc_t = sk;
+      }
       else if (s0_k == NK_HashNode &&
                (nt_arr(nt, rargv[0], "elements", &sn0), sn0 == 0))
         acc_t = TY_POLY_POLY_HASH;
@@ -18267,7 +18567,7 @@ static int infer_block_params_enum_arms(Compiler *c, const NodeTable *nt, int id
       if (bt3 == TY_POLY || ty_is_object(bt3) || bt3 == TY_RATIONAL ||
           bt3 == TY_COMPLEX || bt3 == TY_BIGINT) acc_t = TY_POLY;
     }
-    if (bp_widen(rs, p0, acc_t)) changed = 1;
+    if (!acc_wait && bp_widen(rs, p0, acc_t)) changed = 1;
     const char *rp1 = block_param_name(c, block, 1);
     if (rp1) {
       if (bp_widen(rs, rp1, et2)) changed = 1;
@@ -18300,8 +18600,7 @@ static int infer_block_params_enum_arms(Compiler *c, const NodeTable *nt, int id
 static int infer_block_params_call_arms(Compiler *c, const NodeTable *nt, int id, int block, const char *name, int recv) {
   int changed = 0;
   /* ENV's missing-key block receives the String key, as fetch's does. */
-  if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      is_env_const(key_name(c, recv)) && !comp_const(c, "ENV") &&
+  if (env_value_recv(c, recv, infer_type(c, recv)) &&
       bop_share_named(BOP_ENV, name) == BSH_FETCH) {
     const char *p0 = block_param_name(c, block, 0);
     if (p0) changed |= bp_widen(comp_scope_of(c, block), p0, TY_STRING);
@@ -18335,7 +18634,7 @@ static int infer_block_params_call_arms(Compiler *c, const NodeTable *nt, int id
       else if (sp_streq(name, "new") && (nt_kind(nt, recv) == NK_ConstantReadNode ||
                                          nt_kind(nt, recv) == NK_ConstantPathNode)) {
         int cid = nt_str(nt, recv, "name") ? const_node_class_index(c, recv) : -1;
-        if (cid >= 0) ymi = cplan_new_initialize(c, id, cid, NULL);
+        if (cid >= 0) ymi = cplan_hook_target(c, id, cid, "initialize", NULL);
       }
       else if (ty_is_object(infer_type(c, recv))) ymi = call_target(c, id, ty_object_class(infer_type(c, recv)), name, 0, NULL);
       else ymi = const_recv_cmethod_mi(c, id, recv, name);
@@ -18504,7 +18803,7 @@ static int infer_block_params_call_arms(Compiler *c, const NodeTable *nt, int id
       if (mi < 0 && sp_streq(name, "new") && recv_is_const) {
         const char *cname = nt_str(nt, recv, "name");
         int cid = const_node_class_index(c, recv);
-        if (cid >= 0) mi = cplan_new_initialize(c, id, cid, NULL);
+        if (cid >= 0) mi = cplan_hook_target(c, id, cid, "initialize", NULL);
       }
       /* Class.method { ... }: look up the class method. This is where the
          block's parameters get their types from what the method YIELDS, so
@@ -18939,7 +19238,10 @@ int infer_block_params(Compiler *c) {
      only the param is typed here, not implicit-self calls) -- without this a
      `list.tap { |x| .. }` left x UNKNOWN, so a push of x into a typed array
      could not widen the array's element type (#3144). */
+  MtabMark mt_pass = mtab_mark(c);
   NT_FOREACH_KIND(nt, NK_CallNode, id) {
+    mtab_pop(c, mt_pass);
+    mtab_push_in(c, id);   /* (the call's own trampoline question) */
     const char *cname = nt_str(nt, id, "name");
     if (!cname) continue;
     int recv = nt_ref(nt, id, "receiver");
@@ -19007,7 +19309,10 @@ int infer_block_params(Compiler *c) {
   /* recv.instance_exec(args) { |params| } : the block binds the call's
      arguments as a yield of them does (emit_block_binds), so the binding
      plan types its parameters (block_site_types). */
+  mtab_pop(c, mt_pass);
   NT_FOREACH_KIND(nt, NK_CallNode, id) {
+    mtab_pop(c, mt_pass);
+    mtab_push_in(c, id);
     const char *cname = nt_str(nt, id, "name");
     if (!cname) continue;
     int xrecv = nt_ref(nt, id, "receiver");
@@ -19054,6 +19359,7 @@ int infer_block_params(Compiler *c) {
 
   /* Fiber.new { |first| ... }: the block param receives the resume value,
      which is always a poly (boxed) value at the runtime ABI boundary. */
+  mtab_pop(c, mt_pass);
   NT_FOREACH_KIND(nt, NK_CallNode, id) {
     const char *cname = nt_str(nt, id, "name");
     if (!cname || !sp_streq(cname, "new")) continue;
@@ -19155,7 +19461,7 @@ int infer_block_params(Compiler *c) {
            method's argument, as a call would */
         if (ty_is_object(wt)) {
           TyKind st = infer_type(c, pred);
-          int mi = comp_method_in_chain(c, ty_object_class(wt), "===", NULL);
+          int mi = cplan_implied_target(c, whens[k], wconds[j], ty_object_class(wt), "===", CIT_TABLE, NULL);
           Scope *ms = mi >= 0 ? &c->scopes[mi] : NULL;
           /* the one shape the case emitter calls (emit_when_user_eq) */
           LocalVar *plv = ms && ms->nparams == 1 && ms->rest_idx < 0 && ms->kwrest_idx < 0 && !ms->blk_param
@@ -20019,7 +20325,9 @@ static TyKind sg_override_ret(Compiler *c, const Scope *sc, TyKind r) {
   if (sc->class_id < 0 || sc->is_cmethod || !sc->name) return r;
   const ClassInfo *k = &c->classes[sc->class_id];
   if (!k->is_singleton_of || k->is_value_type || k->parent < 0) return r;
-  int pm = comp_method_in_chain(c, k->parent, sc->name, NULL);
+  /* (the method the override's super reaches: the parent link's, as the table holds it; the delegate answers a call that
+     runs after any later redefinition, so no point of the load is its own) */
+  int pm = call_target(c, -1, k->parent, sc->name, CT_METHODS | CT_SHARED, NULL);
   if (pm < 0 || pm >= c->nscopes || &c->scopes[pm] == sc) return r;
   const Scope *ps = &c->scopes[pm];
   if (ps->nparams != sc->nparams) return r;
@@ -20953,14 +21261,66 @@ static void cr_collect_versions(Compiler *c, const NodeTable *nt, int id, char *
   if (ct_version_marked(c, "initialize")) {
     int init[CPT_MAX], ni = is_new_name(key_name(c, id)) ? cplan_entries(c, id, init, CPT_MAX) : 0;
     if (ni == 0 && (init[0] = cplan_raise_initialize(c, id)) >= 0) ni = 1;
-    for (int i = 0; i < ni && is_initialize_name(c->scopes[init[i]].name); i++) {
+    for (int i = 0; i < ni; i++) {
       char mark[24];
+      /* (a program `new` the site may reach lists its own method ahead of the initializes) */
+      if (!is_initialize_name(c->scopes[init[i]].name)) continue;
       snprintf(mark, sizeof mark, "\x01%d", init[i]);
+      cr_add_name(out, n, cap, mark);
+    }
+    /* a `new` on a class value: the arm of each class it may reach runs the
+       initialize the plan answers it (cplan_new_arm_initialize), as does the
+       arm of each exception class of a `raise` of a class value */
+    int rv = ni == 0 && cplan_raise_class_value(c, id);
+    for (int k = 0; (ni == CPT_UNKNOWN || rv) && k < c->nclasses; k++) {
+      int mi = rv ? (class_is_exc_subclass(c, k) ? cplan_new_arm_initialize(c, id, k) : -1)
+                  : cplan_as_new(c, id, k) && dynamic_new_may_reach(c, id, k) ? cplan_new_arm_initialize(c, id, k) : -1;
+      char mark[24];
+      if (mi < 0 || !is_initialize_name(c->scopes[mi].name)) continue;
+      snprintf(mark, sizeof mark, "\x01%d", mi);
+      cr_add_name(out, n, cap, mark);
+    }
+  }
+  /* a dup or clone of an object: the initialize_copy its typed arm calls
+     (cplan_hook_target), on the class of the receiver and, for a
+     singleton's dup, the class it shows */
+  const char *kn = nt_kind(nt, id) == NK_CallNode ? key_name(c, id) : NULL;
+  if (kn && is_copy_alias(kn) && ct_version_marked(c, "initialize_copy")) {
+    int recv = nt_ref(nt, id, "receiver");
+    TyKind rt = recv >= 0 ? infer_type(c, recv) : TY_UNKNOWN;
+    int cid = ty_is_object(rt) ? ty_object_class(rt) : -1;
+    int cls[2] = { cid, cid >= 0 && c->classes[cid].is_singleton_of ? singleton_visible_ci(c, cid) : cid };
+    for (int i = 0; cid >= 0 && i < (cls[1] != cid ? 2 : 1); i++) {
+      int mi = cplan_hook_target(c, id, cls[i], "initialize_copy", NULL);
+      char mark[24];
+      if (mi < 0) continue;
+      snprintf(mark, sizeof mark, "\x01%d", mi);
       cr_add_name(out, n, cap, mark);
     }
   }
   for (int i = 0, nn = call_node_names(c, id, names); i < nn; i++)
     if (ct_version_marked(c, names[i])) ct_version_classes(c, id, names[i], cr_mark_version, &m);
+  /* the arms of a class-valued dispatch (a class method called on a Class value): the plan's one
+     answer of them, which the emitter writes, so each replaced version an arm names is kept and
+     none a direct call or a left-out arm does not */
+  const char *nm0 = nt_kind(nt, id) == NK_CallNode ? nt_str(nt, id, "name") : NULL;
+  if (nm0 && !is_new_name(nm0) && ct_version_marked(c, nm0)) {
+    int *ak = NULL, *am = NULL, argc0 = 0;
+    (void)call_args(nt, id, &argc0);
+    unsigned low0 = 0;
+    int nar = cplan_cls_value_arms(c, id, nm0, argc0, &ak, &am, &low0);
+    /* (the arms the switch is written from: not where a candidate vetoes it. The proc-form dispatch
+       is taken on a boxed receiver, which the types of a pass this early do not settle, so the arms
+       are marked whatever the proc-form bit says: everything the emitter may still write) */
+    if (!(low0 & CLS_LOWER_SWITCH)) nar = 0;
+    for (int i = 0; i < nar; i++) {
+      char mark[24];
+      if (!c->scopes[am[i]].replaced) continue;
+      snprintf(mark, sizeof mark, "\x01%d", am[i]);
+      cr_add_name(out, n, cap, mark);
+    }
+    free(ak); free(am);
+  }
   ct_implied_classes(c, id, ct_version_marked, cr_mark_version, &m);
 }
 
@@ -21011,7 +21371,7 @@ static void cr_collect_implied(Compiler *c, const NodeTable *nt, int id, char **
       ic_record(c, "*", cause);
     }
     for (int i = 0; i < nn; i++)
-      if (!is_definition_hook_name(names[i].name) && !is_hook_protocol_name(names[i].name))
+      if ((names[i].roles & BCR_HANDED) && !is_definition_hook_name(names[i].name) && !is_hook_protocol_name(names[i].name))
         cr_mark_implied(c, out, n, cap, names[i].name, 0, g_dump_implicit ? cause : NULL);
     return;
   }
@@ -21251,9 +21611,10 @@ void cr_collect_calls(Compiler *c, const NodeTable *nt, int id,
     NodeKind rk = r >= 0 ? nt_kind(nt, r) : NK_NONE;
     const char *cn = (rk == NK_ConstantReadNode || rk == NK_ConstantPathNode) ? key_name(c, r) : NULL;
     int k = cn ? const_node_class_index(c, r) : -1;
-    int mi = k >= 0 ? call_target(c, id, k, nm, CT_CMETHOD, NULL) : -1;
-    /* (a call the plan compiles to the accessor's slot reaches nothing) */
-    if (cplan_sg_slot_call(c, id, k, nm, mi)) names[0] = NULL;
+    MethodLookup ml = { .def_class = -1 };
+    int mi = k >= 0 ? call_target(c, id, k, nm, CT_CMETHOD, &ml) : -1;
+    /* (a call the plan compiles to the accessor's slot reaches nothing, nor does the builtin's own method of the name) */
+    if (cplan_sg_slot_call(c, id, k, nm, mi) || (mi < 0 && ml.kind == ML_BUILTIN)) names[0] = NULL;
     else if (mi >= 0) { snprintf(resolved, sizeof resolved, "\x01%d", mi); names[0] = resolved; }
   }
   /* a call on main that finds main's own method reaches that one, not an
@@ -21343,8 +21704,17 @@ void cr_collect_calls(Compiler *c, const NodeTable *nt, int id,
   /* An entry's arm call is pinned to the method it runs, which the entry
      reaches by scope (ver_entry_targets, above), or to the builtin: by name
      it reached every other method of the name, a class method's entry the
-     instance methods too */
-  if (k0 == NK_CallNode && cplan_pinned(c, id)) names[0] = NULL;
+     instance methods too. A call pinned outside an entry (a Kernel guard's,
+     to its holder's helper, ver_kern_help) reaches its method by scope. */
+  if (k0 == NK_CallNode && cplan_pinned(c, id)) {
+    int pin = cplan_pin_scope(c, id);
+    if (pin >= 0) {
+      char mark[24];
+      snprintf(mark, sizeof mark, "\x01%d", pin);
+      cr_add_name(out, n, cap, mark);
+    }
+    names[0] = NULL;
+  }
   /* Once the types are settled, a plain name, or one on a known instance,
      reaches the scopes of that name that can take the call's argument count
      (cr_count_name, compute_reachable). A 0-argument `r.attribute` kept a

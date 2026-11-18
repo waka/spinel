@@ -192,12 +192,15 @@ static inline int sp_str_has_hdr(const char *s) {
   unsigned char m = ((const unsigned char *)s)[-1];
   return m == 0xfe || m == 0xfc || m == 0xfd || m == 0xf1 || m == 0xfb || m == 0xfa || m == 0xf8;
 }
-/* "Every byte of this string is below 0x80", verified once and remembered.
-   A 7-bit string indexes at fixed width, so #length is its byte length and
-   `s[i]` is the byte at i -- no walk, and no probe of the pointer-keyed length
-   cache either, which is what the walk had already been folded into. The bit
-   is a HINT: set only after a scan proved it, cleared whenever the bytes may
-   change, and every reader falls back to the cache when it is off. It says
+/* "This string indexes at fixed width", verified once and remembered: every
+   byte is below 0x80, or the length walk counted it as bytes, which an
+   invalid byte makes it do (sp_str_length). Then #length is its byte length
+   and `s[i]` is the byte at i -- no walk, and no probe of the pointer-keyed
+   length cache either, which is what the walk had already been folded into.
+   The bit is a HINT: set only after a scan proved it, cleared when the bytes
+   change unless the change cannot alter how any other byte decodes (setbyte
+   of an ASCII byte on a 7-bit string, sp_String_splice_in with ASCII on both
+   sides), and every reader falls back to the cache when it is off. It says
    nothing about the string's encoding -- US-ASCII and UTF-8 are compatible and
    spinel does not distinguish them (docs/limitations.md). */
 #define SP_STR_SIZE_ASCII7 0x40000000u
@@ -720,6 +723,7 @@ void *sp_pl_realloc(void *p, size_t newn);   /* lib/sp_slab.c: a slab block know
                                            generator in an Array or a poly slot
                                            keeps its identity; it read as nil */
 /* SP_BUILTIN_ARGF (-51) is in sp_gc.h: the collector must not trace it */
+/* SP_BUILTIN_ENV (-54) too */
 #define SP_BUILTIN_TIME_RANGE    (-52)  /* a Range of Times (sp_TimeRange *) */
 #define SP_BUILTIN_OBJ_RANGE     (-53)  /* a Range of the program's objects (sp_ObjRange *) */
 #define SP_BUILTIN_YIELDER       (-49)  /* Enumerator::Yielder: the generator's

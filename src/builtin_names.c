@@ -256,10 +256,6 @@ int is_name_error_class(const char *n) {
 int is_no_method_error_class(const char *n) {
   return n && sp_streq(n, "NoMethodError");
 }
-/* ...NameError itself, which a variable-like call that finds no method raises */
-int is_name_error_root_class(const char *n) {
-  return n && sp_streq(n, "NameError");
-}
 
 int is_set_op(const char *n) {
   return sp_streq(n, "&") || sp_streq(n, "intersection") || sp_streq(n, "|") || sp_streq(n, "union") ||
@@ -329,14 +325,37 @@ int is_int_step(const char *n) {
   return sp_streq(n, "times") || sp_streq(n, "upto") || sp_streq(n, "downto");
 }
 
-/* The builtin protocol's next method when the receiver has no override. */
+/* The builtin protocol's next method when the receiver has no override, and
+   what CRuby answers before it calls that method (BuiltinCut): the same object
+   answers true for Comparable#== and Kernel#===, `!=` negates the `==` it
+   calls so the same object answers false once that `==` goes on to `<=>` (a
+   `==` that is itself undefined raises: `when` names the one delegate the
+   shortcut is defined for), and clamp checks its bounds first. */
+static const struct { const char *name, *delegate; int cut; const char *cut_when_gone; } k_operator_rows[] = {
+  { "!=",       "==",  BCUT_SAME_FALSE, "<=>" },
+  { "===",      "==",  BCUT_SAME_TRUE,  NULL },
+  { "==",       "<=>", BCUT_SAME_TRUE,  NULL },
+  { "<",        "<=>", BCUT_NONE,       NULL },
+  { "<=",       "<=>", BCUT_NONE,       NULL },
+  { ">",        "<=>", BCUT_NONE,       NULL },
+  { ">=",       "<=>", BCUT_NONE,       NULL },
+  { "between?", "<=>", BCUT_NONE,       NULL },
+  { "clamp",    "<=>", BCUT_CLAMP,      NULL },
+};
 const char *builtin_operator_delegate(const char *name) {
-  if (sp_streq(name, "!=") || sp_streq(name, "===")) return "==";
-  if (sp_streq(name, "==") || sp_streq(name, "<") || sp_streq(name, "<=") ||
-      sp_streq(name, ">") || sp_streq(name, ">=") || sp_streq(name, "between?") ||
-      sp_streq(name, "clamp")) return "<=>";
+  for (size_t i = 0; i < sizeof k_operator_rows / sizeof k_operator_rows[0]; i++)
+    if (sp_streq(name, k_operator_rows[i].name)) return k_operator_rows[i].delegate;
   return NULL;
 }
+int builtin_operator_cut(const char *name, const char *gone) {
+  if (sp_streq(name, gone)) return BCUT_NONE;   /* the operator itself is undefined: no shortcut runs */
+  for (size_t i = 0; i < sizeof k_operator_rows / sizeof k_operator_rows[0]; i++)
+    if (sp_streq(name, k_operator_rows[i].name))
+      return !k_operator_rows[i].cut_when_gone || sp_streq(gone, k_operator_rows[i].cut_when_gone) ? k_operator_rows[i].cut : BCUT_NONE;
+  return BCUT_NONE;
+}
+
+int is_rindex_name(const char *n) { return n && sp_streq(n, "rindex"); }
 
 int is_equality_name(const char *n) {
   return sp_streq(n, "equal?") || sp_streq(n, "eql?") || sp_streq(n, "==");
@@ -447,6 +466,13 @@ int is_load_path_write(const char *n) {
   return is_array_push_family(n) || is_concat_name(n);
 }
 
+/* The names whose call on a boxed receiver is written as Object's own
+   builtin (the receiver's identity, hash key or instance variables)
+   rather than as a dispatch over the classes that define the name
+   (emit_call_identity_arms, emit_poly_ivar_list). */
+int is_poly_object_surface_name(const char *n) {
+  return sp_streq(n, "hash") || sp_streq(n, "object_id") || sp_streq(n, "__id__") || sp_streq(n, "instance_variables");
+}
 /* A call whose answer tells an object from a copy of it: its identity, or
    whether it is frozen (a copy of a String later frozen is not). */
 int is_identity_query(const char *n) {
@@ -593,7 +619,11 @@ int is_lambda_constructor(const char *n) {
    forces a Lazy at all, for the record's reading of where a chain runs, is
    is_lazy_forcing_name's question; these are a subset of its names. */
 int is_lazy_force(const char *n) {
-  return sp_streq(n, "to_a") || sp_streq(n, "force");
+  return n && (sp_streq(n, "to_a") || sp_streq(n, "force"));
+}
+/* first: the terminal of a lazy chain that takes a count (bare, the element) */
+int is_lazy_first(const char *n) {
+  return n && sp_streq(n, "first");
 }
 
 int is_with_object_alias(const char *n) {
@@ -867,6 +897,7 @@ int definition_form_hooks(const char *form, int sg, const char **out) {
 }
 
 const char METHOD_MISSING_NAME[] = "method_missing";
+int is_method_missing_method(const char *n) { return n && sp_streq(n, METHOD_MISSING_NAME); }
 const char RESPOND_TO_MISSING_NAME[] = "respond_to_missing?";
 int is_method_missing_name(const char *n) {
   return n && (sp_streq(n, METHOD_MISSING_NAME) || sp_streq(n, RESPOND_TO_MISSING_NAME));
@@ -1355,12 +1386,15 @@ int is_check_funcall_name(const char *n) {
 /* The methods CRuby makes private wherever they are defined:
    initialize, its copy forms, and respond_to_missing? */
 int is_implicitly_private_name(const char *n) {
-  return n && (is_initialize_family(n) || sp_streq(n, "initialize_clone") || sp_streq(n, "initialize_dup") ||
-               sp_streq(n, "respond_to_missing?"));
+  return n && (is_initialize_hook_name(n) || sp_streq(n, "respond_to_missing?"));
 }
 
+int is_initialize_copy_name(const char *n) { return sp_streq(n, "initialize_copy"); }
 int is_initialize_family(const char *n) {
-  return sp_streq(n, "initialize_copy") || sp_streq(n, "initialize");
+  return is_initialize_copy_name(n) || is_initialize_name(n);
+}
+int is_initialize_hook_name(const char *n) {
+  return is_initialize_family(n) || sp_streq(n, "initialize_clone") || sp_streq(n, "initialize_dup");
 }
 
 int is_intersection_alias(const char *n) {
@@ -1783,14 +1817,29 @@ int builtin_numeric_owns(const char *cls, const char *m) {
   return is_numeric_class_name(cls) && builtin_name_in(m, num);
 }
 
-int is_gated_exception_accessor(const char *n) {
-  static const char *const names[] = {
-    "key", "receiver", "args", "private_call?", "reason", "exit_value", "tag",
-    "value", "status", "success?", "signo", "signm", "name", "errno", "error_code", "result", NULL };
-  if (!n) return 0;
-  for (int i = 0; names[i]; i++) if (sp_streq(n, names[i])) return 1;
-  return 0;
+/* The builtin exception classes that define each class-gated accessor, one
+   row per name (receiver has three owners). is_gated_exception_accessor and
+   gated_exception_accessor_owners read this one table; the runtime's own
+   gate (sp_exc_has_acc in lib/sp_exc.c) restates it, and
+   test/exception_respond_to_gated_accessor*.rb compare every name against
+   CRuby for every class, which is what keeps the two in step. */
+static const struct { const char *name; const char *owners[4]; } gated_exc_acc[] = {
+  {"key", {"KeyError"}}, {"receiver", {"NameError", "KeyError", "FrozenError"}},
+  {"args", {"NoMethodError"}}, {"private_call?", {"NoMethodError"}},
+  {"reason", {"LocalJumpError"}}, {"exit_value", {"LocalJumpError"}},
+  {"tag", {"UncaughtThrowError"}}, {"value", {"UncaughtThrowError"}},
+  {"status", {"SystemExit"}}, {"success?", {"SystemExit"}},
+  {"signo", {"SignalException"}}, {"signm", {"SignalException"}},
+  {"name", {"NameError"}}, {"errno", {"SystemCallError"}},
+  {"error_code", {"Socket::ResolutionError"}}, {"result", {"StopIteration"}},
+};
+const char *const *gated_exception_accessor_owners(const char *n) {
+  if (!n) return NULL;
+  for (size_t i = 0; i < sizeof gated_exc_acc / sizeof gated_exc_acc[0]; i++)
+    if (sp_streq(n, gated_exc_acc[i].name)) return gated_exc_acc[i].owners;
+  return NULL;
 }
+int is_gated_exception_accessor(const char *n) { return gated_exception_accessor_owners(n) != NULL; }
 
 int is_symbol_exception_accessor(const char *n) {
   return sp_streq(n, "reason") || sp_streq(n, "tag") || sp_streq(n, "key") || sp_streq(n, "name");
@@ -1937,6 +1986,8 @@ int is_array_constructor(const char *recv, const char *meth) {
 int is_pow_name(const char *n) { return sp_streq(n, "pow"); }
 /* `new`: a class's constructor (a native binding's "new" names them) */
 int is_new_name(const char *n) { return n && sp_streq(n, "new"); }
+/* `capacity:`: Hash.new's and String.new's keyword, converted as an Integer is (#to_int) */
+int is_capacity_keyword(const char *n) { return n && sp_streq(n, "capacity"); }
 /* `native_share`: a package's declaration of what a native binding does
    with the String its object keeps (--share-strings) */
 int is_native_share_decl(const char *n) { return n && sp_streq(n, "native_share"); }
@@ -1999,6 +2050,14 @@ int is_dir_blockless_iter(const char *n) {
 }
 
 int is_kernel_module_name(const char *n) { return n && sp_streq(n, "Kernel"); }
+
+/* Kernel functions that read the calling frame (the method's name, the block, the locals, the stack): the bare call
+   answers the frame it is made in, which a super lowered into a method's body is not CRuby's. */
+int is_frame_reading_function(const char *n) {
+  static const char *const NAMES[] = { "__method__", "__callee__", "__dir__", "binding", "block_given?", "caller",
+                                       "caller_locations", "local_variables", NULL };
+  return n && builtin_name_in(n, NAMES);
+}
 
 /* Kernel's module functions, by name. A whitelist rather than "anything with
    the Kernel receiver": Kernel is also a VALUE, so `Kernel === 5` asks whether
@@ -2089,6 +2148,17 @@ const char *builtin_function_owner(const char *m) {
    with include_all any */
 const char RESPOND_TO_NAME[] = "respond_to?";
 int is_respond_to_name(const char *n) { return n && sp_streq(n, RESPOND_TO_NAME); }
+/* The names a Struct's instance answers from Struct itself. Data answers none of them: its own are the members and
+   `with`, beside the names both have. */
+const char *const struct_names[] = {
+    "to_a", "values", "values_at", "dig", "each", "each_pair", "size",
+    "length", "[]", "[]=", NULL };
+const char *const struct_core_names[] = { "members", "to_h", "deconstruct", "deconstruct_keys", "with", NULL };
+int is_struct_core_name(const char *n, int kind) {
+  if (!n || !kind) return 0;
+  if (sp_streq(n, "with")) return kind == 2;
+  return builtin_name_in(n, struct_core_names) || (kind == 1 && builtin_name_in(n, struct_names));
+}
 /* A question whether a receiver has a method: of one by name (1), or a
    list of its methods: one that answers the whole program (2), or one a
    receiver's own chain decides (3) */
@@ -2399,6 +2469,40 @@ int builtin_answers_ahead_of(const char *cls, const char *m, const char *root) {
   for (int i = 0; !below && i < t->nanc; i++) below = !strcmp(t->ancestors[i], root);
   return below && bmt_ancestors_have(t, m, 0, must, 0, root, NULL) != 0;
 }
+/* The class or module of CRuby's tables whose instance method m a `super` reaches from a program class under
+   builtin class root: the first ancestor of root's table with m (any visibility, in a library the program has),
+   by its table name; NULL for none, and where an ancestor with no table of its own lies ahead (StringIO's
+   IO::generic_writable: what it answers is not known, nor what is behind it) or one that undefines m does. after_root:
+   the super's own place is root's (a reopening's method, or a module included into it), so root's own methods are
+   ahead of it. Names only: where the program's classes and includes put the super is the caller's
+   (comp_super_bowner). */
+const char *builtin_super_owner(const char *root, const char *m, int after_root) {
+  const BuiltinMethodTable *t = bmt_find(root);
+  unsigned must = bmt_loaded();
+  if (!t || !m || !(t->flags & must)) return NULL;
+  for (int i = after_root ? 1 : 0; i < t->nanc; i++) {
+    if (!(t->aflags[i] & must)) continue;   /* (a library the program has not required) */
+    const BuiltinMethodTable *a = bmt_find(t->ancestors[i]);
+    if (!a) return NULL;
+    if (!(a->flags & must)) continue;
+    if (bmt_has(a->inst, a->iflags, a->ninst, m, must, 0)) return a->name;
+    if (bmt_undefines(a, m, 0)) return NULL;
+  }
+  return NULL;
+}
+/* See builtin_names.h. */
+BownKind builtin_owner_kind(const char *owner) {
+  if (!owner) return BOWN_NONE;
+  if (is_kernel_module_name(owner)) return BOWN_KERNEL;
+  int slot = builtin_core_class_slot(owner);
+  if (slot == CORE_STRUCT || slot == CORE_DATA) return BOWN_STRUCT;
+  return BOWN_OTHER;
+}
+/* Does CRuby's method tables hold class or module name, in a library the program has? */
+int builtin_table_known(const char *name) {
+  const BuiltinMethodTable *t = bmt_find(name);
+  return t && (t->flags & bmt_loaded());
+}
 /* The i-th ancestor of builtin class or module cls in CRuby's lookup order (0: cls itself), counting only those a
    library the program has defines; NULL past the last, and for a name with no table. The walk of a mixin's `super`
    steps through these, asking each for the name it looks up (builtin_owns_instance_method). */
@@ -2693,8 +2797,16 @@ int is_ffi_decl_name(const char *n) {
 }
 /* Module#method_defined? and its visibility kin */
 int is_method_defined_query(const char *n) {
-  return n && (sp_streq(n, "method_defined?") || sp_streq(n, "public_method_defined?") ||
-               sp_streq(n, "private_method_defined?") || sp_streq(n, "protected_method_defined?"));
+  return method_defined_vis_mask(n) != 0;
+}
+/* The visibilities a *method_defined? query counts (bit 1 public, 2 protected, 4 private), 0 for any other name:
+   method_defined? is public and protected, each prefixed form its own */
+int method_defined_vis_mask(const char *n) {
+  if (!n) return 0;
+  if (sp_streq(n, "method_defined?")) return 1 | 2;
+  if (sp_streq(n, "public_method_defined?")) return 1;
+  if (sp_streq(n, "protected_method_defined?")) return 2;
+  return sp_streq(n, "private_method_defined?") ? 4 : 0;
 }
 int is_undef_method_name(const char *n) { return n && sp_streq(n, "undef_method"); }
 int is_remove_method_name(const char *n) { return n && sp_streq(n, "remove_method"); }
@@ -2977,6 +3089,26 @@ int builtin_singleton_at_boot(int slot) {
   const BuiltinClass *r = builtin_class_at(slot);
   return r && (r->flags & BC_SG_BOOT);
 }
+int builtin_empty_new(const char *name) {
+  const BuiltinClass *r = builtin_class_at(builtin_core_class_slot(name));
+  return r && (r->flags & BC_EMPTY_NEW);
+}
+int builtin_new_keywords(const char *name) {
+  const BuiltinClass *r = builtin_class_at(builtin_core_class_slot(name));
+  return r && (r->flags & BC_NEW_KEYWORDS);
+}
+int builtin_init_no_keywords(const char *name) {
+  const BuiltinClass *r = builtin_class_at(builtin_core_class_slot(name));
+  return r && (r->flags & BC_INIT_NO_KEYWORDS);
+}
+int builtin_keywords_new_own(const char *name) {
+  const BuiltinClass *r = builtin_class_at(builtin_core_class_slot(name));
+  return r && (r->flags & BC_KEYWORDS_NEW_OWN);
+}
+int builtin_boxed_by_tag(int slot) {
+  const BuiltinClass *r = builtin_class_at(slot);
+  return r && (r->flags & BC_TAGGED);
+}
 /* Is a yielding method a program's reopening of builtin class `core`
    (CORE_*) defines called through its proc form, with the call's block as a
    proc, since it has no function of its own? (The Array, Hash, NilClass,
@@ -3105,6 +3237,9 @@ int is_method_naming_call(const char *n) {
 }
 /* The attribute declarations (`attribute`/`attributes` are Spinel's own
    compile-time class-body declarations, accessors as attr_accessor's) */
+int is_attr_name(const char *n) {
+  return n && (sp_streq(n, "attr") || is_attr_reader_family(n) || is_attr_writer_family(n));
+}
 int is_attr_decl_reader(const char *n) {
   return n && (sp_streq(n, "attr") || is_attr_reader_family(n) || sp_streq(n, "attribute") || sp_streq(n, "attributes"));
 }

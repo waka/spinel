@@ -27,6 +27,10 @@ and it is also the source of the collector's most persistent bug family (see
 GCC/clang's `cleanup` attribute to pop it when the declaring scope ends. There
 is no manual unroot, and no way to leak a root by taking an early return.
 
+A generated adapter that captures an existing object in a Proc roots that
+object across Proc allocation. The Hash default-Proc adapter does this for
+its source Hash; the Proc owns that reference only after allocation finishes.
+
 The low two bits of the stored address are a tag:
 
 | Tag | Macro               | Marked through                                    |
@@ -55,6 +59,11 @@ Roots the pass leaves in place (a root nested inside a loop body, a temporary
 whose address is taken, the runtime's own C) keep the per-root macro; the two
 forms coexist. `--no-root-frame` keeps every root in the per-root form, for
 bisecting.
+
+Comparing Struct or Data members can allocate boxes for by-value fields
+(such as Complex). The comparison retains each new box while boxing the
+other member and until the comparison returns. Rooting the containing
+Struct or Data alone does not retain those separate boxes.
 
 Beyond the root array the mark walk consults three hook groups, in this order:
 

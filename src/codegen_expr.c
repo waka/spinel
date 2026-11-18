@@ -547,14 +547,17 @@ static void interp_plan(Compiler *c, int id, InterpPlan *pl) {
         EMIT_IV();
         buf_printf(&conv, "); _t%d ? sp_strbuf_read(_t%d) : sp_str_empty; })", to, to);
       }
-      else if (ty_is_object(t) && obj_str_cname(c, ty_object_class(t), 0)) {
-        const char *cn = obj_str_cname(c, ty_object_class(t), 0);
+      else if (ty_is_object(t) && obj_str_undef(c, expr, ty_object_class(t), 0)) {
+        emit_nomethod_raise_unless_nil(c, expr, "to_s", "(const char *)\"\"", "sp_str_empty", &conv);   /* (to_s undefined where the record places it: CRuby raises, for nil's own to_s is the empty String) */
+      }
+      else if (ty_is_object(t) && obj_str_cname(c, expr, ty_object_class(t), 0)) {
+        const char *cn = obj_str_cname(c, expr, ty_object_class(t), 0);
         /* a poly-returning to_s (String unioned with e.g. nil) yields a boxed
            sp_RbVal -- render it through sp_poly_to_s so it's a const char *
            in the interpolation (#3266). */
-        int ret_poly = obj_str_ret_poly(c, ty_object_class(t), 0);
+        int ret_poly = obj_str_ret_poly(c, expr, ty_object_class(t), 0);
         /* one answering a String subclass instance reads its bytes */
-        const char *ss_open = !ret_poly && obj_str_ret_strsub(c, ty_object_class(t), 0) ? "sp_str_or_empty(sp_strbuf_read((sp_String *)(" : "";
+        const char *ss_open = !ret_poly && obj_str_ret_strsub(c, expr, ty_object_class(t), 0) ? "sp_str_or_empty(sp_strbuf_read((sp_String *)(" : "";
         const char *ss_close = *ss_open ? ")))" : "";
         if (ret_poly) buf_puts(&conv, "sp_poly_to_s(");
         /* a part that may be nil (the nil fact, #7444) reads as nil's to_s,
@@ -563,11 +566,11 @@ static void interp_plan(Compiler *c, int id, InterpPlan *pl) {
         /* a value-type object (single-ivar) has a by-VALUE to_s signature;
            casting its receiver to a pointer is a C type error (#2357) */
         if (!part_nil && (comp_ty_value_obj(c, t) || (!vexpr[0] && !iv_pre && expr_is_held_ref(c, expr)))) {
-          const char *tsf = obj_str_fn(c, ty_object_class(t), 0);
+          const char *tsf = obj_str_fn(c, expr, ty_object_class(t), 0);
           buf_puts(&conv, ss_open);
           if (comp_ty_value_obj(c, t)) buf_printf(&conv, "%s(", tsf);
           else buf_printf(&conv, "%s((sp_%s *)", tsf, cn);
-          EMIT_IV(); buf_printf(&conv, "%s)%s", obj_str_blockarg(c, ty_object_class(t), 0), ss_close);
+          EMIT_IV(); buf_printf(&conv, "%s)%s", obj_str_blockarg(c, expr, ty_object_class(t), 0), ss_close);
         }
         else {
           /* rooted: the part may be a fresh object (`"#{C.new}"`) held
@@ -577,8 +580,8 @@ static void interp_plan(Compiler *c, int id, InterpPlan *pl) {
           EMIT_IV();
           buf_printf(&conv, "); SP_GC_ROOT(_t%d); ", to);
           if (part_nil) buf_printf(&conv, "_t%d ? ", to);
-          buf_printf(&conv, "%s%s(_t%d%s)%s%s; })", ss_open, obj_str_fn(c, ty_object_class(t), 0), to,
-                     obj_str_blockarg(c, ty_object_class(t), 0), ss_close, part_nil ? " : sp_str_empty" : "");
+          buf_printf(&conv, "%s%s(_t%d%s)%s%s; })", ss_open, obj_str_fn(c, expr, ty_object_class(t), 0), to,
+                     obj_str_blockarg(c, expr, ty_object_class(t), 0), ss_close, part_nil ? " : sp_str_empty" : "");
         }
         if (ret_poly) buf_puts(&conv, ")");
       }
@@ -1029,6 +1032,9 @@ void emit_int_divisor(Compiler *c, int node, Buf *b) {
     buf_puts(b, "sp_poly_arg_int_chk("); emit_expr(c, node, b); buf_puts(b, ")");
     return;
   }
+  /* a divisor that may be nil raises the coercion TypeError, as the other
+     operators' right operand does, not a plain argument's conversion one */
+  if (emit_int_opnd_maybe_nil(c, node, 0, b)) return;
   emit_expr(c, node, b);
 }
 
@@ -1739,7 +1745,7 @@ int emit_call_or_write_via_methods(Compiler *c, int id, int is_or, Buf *b) {
   /* No reader at all -- no method, no attribute, no method_missing to
      answer it -- is the reader call's NoMethodError, raised before the
      value runs. The field-store way below has no ivar to store into. */
-  if (rmi < 0 && rml.kind != ML_ATTR && comp_method_in_chain(c, cid, "method_missing", NULL) < 0) {
+  if (rmi < 0 && rml.kind != ML_ATTR && call_target(c, id, cid, METHOD_MISSING_NAME, CT_REACH, NULL) < 0) {
     TyKind want = repr_of(c, id).as_ty;
     if (want == TY_UNKNOWN || want == TY_VOID) want = TY_POLY;
     int trv = ++g_tmp; char rv[32]; snprintf(rv, sizeof rv, "_t%d", trv);
@@ -3604,11 +3610,12 @@ static int emit_constant_value(Compiler *c, int id, Buf *b, Buf *checks, const N
     if (nm && sp_streq(nm, "RUBY_COPYRIGHT"))   { emit_engine_const_str(c, "sp_str_ruby_copyright", "\"ruby - Copyright (C) 1993-2026 Yukihiro Matsumoto\"", b); return 1; }
     if (nm && sp_streq(nm, "ARGV")) { buf_puts(b, "sp_get_ARGV()"); return 1; }
     if (nm && sp_streq(nm, "ARGF")) { buf_puts(b, "(&sp_argf_obj)"); return 1; }
+    if (nm && is_env_const(nm) && comp_ntype(c, id) == TY_ENV) { buf_puts(b, "(&sp_env_obj)"); return 1; }
     if (nm && sp_streq(nm, "STDOUT")) { buf_puts(b, "sp_io_stdout()"); return 1; }
     if (nm && sp_streq(nm, "STDERR")) { buf_puts(b, "sp_io_stderr()"); return 1; }
     if (nm && sp_streq(nm, "STDIN"))  { buf_puts(b, "sp_io_stdin()"); return 1; }
     if (nm) {
-      int _cidx = comp_class_index(c, nm);
+      int _cidx = const_node_class_index(c, id);
       emit_const_read_open(c, id, NULL, b);
       if (_cidx >= 0) {
         buf_printf(b, "((sp_Class){%d})", _cidx);  /* user class as value: TY_CLASS unboxed */
@@ -3847,6 +3854,7 @@ static int emit_constant_value(Compiler *c, int id, Buf *b, Buf *checks, const N
     if (cpcv && cpcv->type != TY_UNKNOWN) { emit_const_slot_read(c, id, cpcv, nm, slot, 1, b); return 1; }
     if (nm && sp_streq(nm, "ARGV")) { buf_puts(b, "sp_get_ARGV()"); return 1; }
     if (nm && sp_streq(nm, "ARGF")) { buf_puts(b, "(&sp_argf_obj)"); return 1; }
+    if (nm && is_env_const(nm) && comp_ntype(c, id) == TY_ENV) { buf_puts(b, "(&sp_env_obj)"); return 1; }
     /* well-known module constants */
     if (par_nmc && sp_streq(par_nmc, "Float") && nm) {
       if (sp_streq(nm, "MAX"))      { buf_puts(b, "DBL_MAX"); return 1; }
@@ -4182,10 +4190,11 @@ static int defined_super_reaches(Compiler *c, int sup) {
   int setter = setter_base_name(u, base, sizeof base);
   /* an ancestor that undefs the name ahead of any definition: the super
      reaches nothing (`undef :test` in the superclass) */
-  if (p >= 0 && comp_is_undeffed_in_chain(c, p, u)) return 0;
-  if (mi >= 0 || (p >= 0 && (comp_reader_in_chain(c, p, u, NULL) || (setter && comp_writer_in_chain(c, p, base, NULL)))))
+  if (p >= 0 && cplan_undefined(c, p, 0, u)) return 0;
+  if (mi >= 0 || (p >= 0 && (call_attr_target(c, -1, p, u, CT_ATTR, NULL) ||
+                             (setter && call_attr_target(c, -1, p, base, CT_ATTR | CT_WRITER, NULL)))))
     return 1;
-  int v = refl_builtin_vis(c, s->class_id, u, 2, NULL);
+  int v = refl_builtin_vis(c, s->class_id, u, 2, 1, NULL);
   return v < 0 ? -1 : v > 0;
 }
 
@@ -4833,7 +4842,7 @@ static int emit_array_hash_literal_expr(Compiler *c, int id, Buf *b, const NodeT
                through sp_splat_to_array for their pairs, members or items, and
                so does a program object when a class defines #to_a. */
             buf_printf(g_pre, "{ sp_RbVal _sv = %s; if (_sv.tag == SP_TAG_OBJ && (sp_poly_is_hash_kind(_sv.cls_id) || _sv.cls_id == SP_BUILTIN_RANGE || _sv.cls_id == SP_BUILTIN_STR_RANGE || _sv.cls_id == SP_BUILTIN_ENUMERATOR || _sv.cls_id == SP_BUILTIN_MATCHDATA%s || ((_sv.cls_id == SP_BUILTIN_OBJECT || _sv.cls_id == SP_BUILTIN_BASIC_OBJECT) && _sv.v.p && ((sp_Object *)_sv.v.p)->singleton_to_a))) _sv = sp_splat_to_array(_sv); if (!sp_poly_nil_p(_sv)) sp_PolyArray_flatten_into_n(_t%d, _sv, 1); }\n",
-                       ep, obj_to_a_any(c) ? " || _sv.cls_id >= 0" : "", t);
+                       ep, obj_to_a_any(c, els[j], inner) ? " || _sv.cls_id >= 0" : "", t);
           /* (not pushed whole: `*md` is md.to_a, its match and its groups) */
           else if (it == TY_MATCHDATA) {
             Buf bx; memset(&bx, 0, sizeof bx); emit_boxed(c, inner, &bx);
@@ -4885,7 +4894,11 @@ static int emit_array_hash_literal_expr(Compiler *c, int id, Buf *b, const NodeT
     if (!k) unsupported(c, id, "array literal (element type)");
     int t = ++g_tmp;
     emit_indent(g_pre, g_indent);
-    buf_printf(g_pre, "sp_%sArray *_t%d = sp_%sArray_new();\n", k, t, k);
+    /* a literal of n elements and no splat takes its buffer at n */
+    int lit_n = array_has_new_cap(k) ? n : 0;
+    for (int j = 0; j < n && lit_n; j++) if (nt_kind(nt, els[j]) == NK_SplatNode) lit_n = 0;
+    if (lit_n) buf_printf(g_pre, "sp_%sArray *_t%d = sp_%sArray_new_cap(%d);\n", k, t, k, lit_n);
+    else buf_printf(g_pre, "sp_%sArray *_t%d = sp_%sArray_new();\n", k, t, k);
     emit_indent(g_pre, g_indent);
     buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", t);
     if (sp_streq(k, "Str") && str_lit_reads_late(c, els, n)) {
@@ -4913,8 +4926,9 @@ static int emit_array_hash_literal_expr(Compiler *c, int id, Buf *b, const NodeT
             int rhi2 = nt_ref(nt, rn2, "right");
             Buf lo2; memset(&lo2, 0, sizeof lo2); emit_expr(c, rlo2, &lo2);
             Buf hi2; memset(&hi2, 0, sizeof hi2); emit_expr(c, rhi2, &hi2);
-            buf_printf(g_pre, "{ sp_StrArray *_sa = sp_StrArray_from_string_range(%s, %s, %d); if (_sa) for (sp_int _si = 0; _si < _sa->len; _si++) sp_%sArray_push(_t%d, %s); }\n",
-                       lo2.p ? lo2.p : "NULL", hi2.p ? hi2.p : "NULL", rexcl2, k, t, ONE_SA_ELEM);
+            buf_printf(g_pre, "{ sp_StrArray *_sa = sp_StrArray_from_string_range(%s, %s, %d); if (_sa) for (sp_int _si = 0; _si < _sa->len; _si++) ",
+                       lo2.p ? lo2.p : "NULL", hi2.p ? hi2.p : "NULL", rexcl2);
+            emit_array_entry(g_pre, "Str", "push"); buf_printf(g_pre, "(_t%d, _sa->data[_si]); }\n", t);
             free(lo2.p); free(hi2.p);
           }
           else {
@@ -4925,7 +4939,8 @@ static int emit_array_hash_literal_expr(Compiler *c, int id, Buf *b, const NodeT
           /* not the slot itself: a nil lives in the bitmap, and the slot alone reads 0 */
           buf_printf(g_pre, "{ sp_IntArray *_sa = %s; if (_sa) for (sp_int _si = 0; _si < _sa->len; _si++) sp_%sArray_push_o(_t%d, sp_IntArray_oget(_sa, _si)); }\n", ep, k, t);
         else if (ir.elem == TY_STRING && sp_streq(k, "Str"))
-          buf_printf(g_pre, "{ sp_StrArray *_sa = %s; if (_sa) for (sp_int _si = 0; _si < _sa->len; _si++) sp_%sArray_push(_t%d, %s); }\n", ep, k, t, ONE_SA_ELEM);
+        { buf_printf(g_pre, "{ sp_StrArray *_sa = %s; if (_sa) for (sp_int _si = 0; _si < _sa->len; _si++) ", ep);
+          emit_array_entry(g_pre, "Str", "push"); buf_printf(g_pre, "(_t%d, _sa->data[_si]); }\n", t); }
         else if (ir.elem == TY_FLOAT && sp_streq(k, "Float"))
           buf_printf(g_pre, "{ sp_FloatArray *_sa = %s; if (_sa) for (sp_int _si = 0; _si < _sa->len; _si++) sp_FloatArray_push_o(_t%d, sp_FloatArray_oget(_sa, _si)); }\n", ep, t);
         else if (it == TY_NIL)
@@ -4942,7 +4957,9 @@ static int emit_array_hash_literal_expr(Compiler *c, int id, Buf *b, const NodeT
         }
         else {
           /* Mismatched or unknown element type: emit_expr fallback */
-          buf_printf(g_pre, "sp_%sArray_push%s(_t%d, %s);\n", k, nil_store_sfx(c, k, inner), t, ep);
+          const char *ns = nil_store_sfx(c, k, inner);
+          if (ns[0]) { emit_elem_entry(g_pre, 0, array_kind_ty(k), k, "push", ns); buf_printf(g_pre, "(_t%d, %s);\n", t, ep); }
+          else { emit_kind_push(c, g_pre, k, t, ep); buf_puts(g_pre, ";\n"); }
         }
         free(el.p);
       }
@@ -4992,7 +5009,11 @@ else {
     const int *els = nt_arr(nt, id, "elements", &n);
     int t = ++g_tmp;
     emit_indent(g_pre, g_indent);
-    buf_printf(g_pre, "sp_%sHash *_t%d = sp_%sHash_new();\n", hn, t, hn);
+    /* a literal of n pairs and no `**` takes its tables at n (sp_hash_cap_for) */
+    int lit_n = n;
+    for (int j = 0; j < n && lit_n; j++) if (nt_kind(nt, els[j]) == NK_AssocSplatNode) lit_n = 0;
+    if (lit_n) buf_printf(g_pre, "sp_%sHash *_t%d = sp_%sHash_new_cap(%d);\n", hn, t, hn, lit_n);
+    else buf_printf(g_pre, "sp_%sHash *_t%d = sp_%sHash_new();\n", hn, t, hn);
     emit_indent(g_pre, g_indent);
     buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", t);
     int sym_poly = (repr_hash_is(hr, TY_SYMBOL, TY_POLY) || repr_hash_is(hr, TY_STRING, TY_POLY));
@@ -5060,6 +5081,36 @@ else {
       if (poly_poly) emit_boxed(c, key, &kb);
       else if (ty_is_hash(ht)) emit_coerce(c, key, ty_hash_key(ht), CO_HOLD, "a Hash literal's key", &kb);
       else emit_expr(c, key, &kb);
+      /* A pair's key and value are the set's sibling arguments, as a store's
+         are: a key that can allocate goes into a rooted temp ahead of the
+         value's build, as the store arm's does. So does a key whose
+         variable the value assigns (`{x => (x = 5)}`, `{x => [x = 2]}`):
+         CRuby reads the key first, so the temp goes ahead of what the
+         value's build puts in the prelude too. Its block closes after the
+         set. */
+      int tk = -1;
+      int krb = ty_is_hash(ht) && read_rebound_by(c, key, val);
+      /* (a key that is a shared String slot's read is held as its handle:
+         the value may change that String in place before it rebinds the
+         variable, and the set takes the String as it is then) */
+      if (krb && ty_hash_key(ht) == TY_STRING && strbuf_read_copies(c, key)) {
+        int th = ++g_tmp;
+        emit_indent(g_pre, g_indent);
+        buf_printf(g_pre, "sp_String *_t%d = ", th);
+        emit_strbuf_handle_of(c, nt_paren_single(c->nt, key), g_pre);
+        buf_printf(g_pre, "; SP_GC_ROOT(_t%d);\n", th);
+        free(kb.p); memset(&kb, 0, sizeof kb);
+        buf_printf(&kb, "SP_STR_B(sp_strbuf_read_pub(_t%d))", th);
+        krb = 0;
+      }
+      if (ty_is_hash(ht) && (subtree_may_allocate(c, key) || krb)) {
+        TyKind kt = ty_hash_key(ht);
+        tk = ++g_tmp;
+        emit_indent(g_pre, g_indent);
+        buf_printf(g_pre, "{ %s _t%d = %s; ", c_type_name(kt), tk, kb.p ? kb.p : "");
+        if (needs_root(kt)) { emit_gc_root_tmp(c, kt, tk, g_pre); buf_puts(g_pre, " "); }
+        buf_puts(g_pre, "\n");
+      }
       Buf vb; memset(&vb, 0, sizeof vb);
       if (sym_poly || poly_poly) {
         /* (a published String before a pair that can change it is boxed as
@@ -5083,16 +5134,6 @@ else {
       else emit_expr(c, val, &vb);
       int vheld = typed_elem_held(ht) == TY_STRBUF;
       emit_indent(g_pre, g_indent);
-      /* A pair's key and value are the set's sibling arguments, as a store's
-         are: a key that can allocate goes into a rooted temp ahead of the
-         value's build, as the store arm's does. */
-      int tk = -1;
-      if (ty_is_hash(ht) && subtree_may_allocate(nt, key)) {
-        TyKind kt = ty_hash_key(ht);
-        tk = ++g_tmp;
-        buf_printf(g_pre, "{ %s _t%d = %s; ", c_type_name(kt), tk, kb.p ? kb.p : "");
-        if (needs_root(kt)) { emit_gc_root_tmp(c, kt, tk, g_pre); buf_puts(g_pre, " "); }
-      }
       /* a key that is a shared String slot's read is a fresh copy: beside
          a value that allocates, the value is built first, into a rooted
          temp, and the key read last, in the set itself */
@@ -5566,7 +5607,9 @@ static int emit_and_or_begin_expr(Compiler *c, int id, Buf *b, const NodeTable *
       free(lb.p); free(tc2.p);
       return 1;
     }
-    if (lt == TY_BOOL && comp_ntype(c, right) == TY_BOOL) {
+    /* (both operands Booleans at this site and the chain's own type is a Boolean too: another site's block
+       value, which the cached type unifies, makes it boxed, and the flat C `&&` answers an int) */
+    if (lt == TY_BOOL && repr_of(c, right).as_ty == TY_BOOL && res == TY_BOOL) {
       /* Capture the right operand's prelude: an object subexpression there
          (`a && b.c == x`) hoists a GC-rooted temp that must run inside the
          short-circuit, not above the whole chain (issue #1773). No prelude ->
@@ -5834,9 +5877,10 @@ static int emit_and_or_begin_expr(Compiler *c, int id, Buf *b, const NodeTable *
     /* expression arm -- assign result to temp (skip diverging exprs like raise) */
     Repr er = repr_of(c, e);
     TyKind et = er.as_ty;
-    /* An empty container's type reads UNKNOWN for want of an element type; it
-       still produces a value, so it must be assigned rather than emitted for
-       effect and discarded (#3495). */
+    /* An empty container's type reads UNKNOWN for want of an element type (a
+       `Hash.new(default)` too, an_empty_container_kind); it still produces a
+       value, so it must be assigned rather than emitted for effect and
+       discarded (#3495). */
     int one, e_yields = 0, e_nil = 0, e_val = e;
     switch (vp_one(nt, e, VPS_NONE | VP_PARENS_ONLY, &one)) {
     case VP1_NODE:
@@ -5848,7 +5892,7 @@ static int emit_and_or_begin_expr(Compiler *c, int id, Buf *b, const NodeTable *
     case VP1_MANY: break;
     }
     int e_diverges = (er.untyped || et == TY_VOID || (et == TY_NIL && rt != TY_POLY && e_yields)) &&
-                     !node_is_empty_container(c, e);
+                     !an_empty_container_kind(c, e);
     /* --share-strings: under a handle demand (strbuf_route_begin) the
        result slot is the handle, and each value is taken as one */
     int hdem = rt == TY_STRBUF && repr_of(c, id).demand;
@@ -6530,6 +6574,25 @@ static void emit_forwarded_block_value(Compiler *c, int id, Buf *b) {
   if (optional) buf_puts(b, ")");
 }
 
+/* `a[i] ||= v` / `a[i] &&= v` on a String Array: the slot is read as the handle the Array
+   holds, a write takes the value's handle (the row's hold) and stores that one, and the
+   expression answers its bytes: the String the Array holds, so a consumer that takes the
+   bytes face reaches the stored String, as the Hash's form below does */
+static void emit_index_or_str_array(Compiler *c, int id, int ir, int idx, int iv, TyKind irt, int is_or, int ta, int tb, int tc, Buf *b) {
+  buf_printf(b, "({ sp_StrArray *_t%d = ", ta); emit_expr(c, ir, b); buf_puts(b, "; ");
+  { int ops[2] = { idx, iv }; emit_index_recv_root(c, irt, id, ir, ops, 2, ta, 1, b); }
+  buf_printf(b, "sp_int _t%d = ", tb); emit_int_expr(c, idx, b);
+  buf_printf(b, "; sp_String *_t%d = sp_StrArray_get_e(_t%d, _t%d);", tc, ta, tb);
+  buf_printf(b, " if (%s_t%d) { ", is_or ? "!" : "", tc);
+  Buf rvb; memset(&rvb, 0, sizeof rvb);
+  Buf *svp = g_pre; g_pre = b;
+  emit_expr(c, iv, &rvb);
+  g_pre = svp;
+  buf_printf(b, "_t%d = ", tc);
+  emit_typed_elem_hold(c, iv, irt, rvb.p ? rvb.p : "NULL", b);
+  free(rvb.p);
+  buf_puts(b, "; "); emit_array_entry(b, "Str", "set"); buf_printf(b, "(_t%d, _t%d, _t%d); } SP_STR_B(_t%d); })", ta, tb, tc, tc);
+}
 static void emit_expr_node(Compiler *c, int id, Buf *b) {
   const NodeTable *nt = c->nt;
   const char *ty = nt_type(nt, id);
@@ -6791,8 +6854,9 @@ static void emit_expr_node(Compiler *c, int id, Buf *b) {
     TyKind irt = irr.as_ty;
     int ta2 = ++g_tmp, tb2 = ++g_tmp, tc2 = ++g_tmp;
     if (irr.elem == TY_POLY) {
-      buf_printf(b, "({ sp_PolyArray *_t%d = ", ta2); emit_expr(c, ir, b);
-      buf_printf(b, "; sp_int _t%d = ", tb2); emit_int_expr(c, iav[0], b);
+      buf_printf(b, "({ sp_PolyArray *_t%d = ", ta2); emit_expr(c, ir, b); buf_puts(b, "; ");
+      { int ops[2] = { iav[0], iv }; emit_index_recv_root(c, irt, id, ir, ops, 2, ta2, 1, b); }
+      buf_printf(b, "sp_int _t%d = ", tb2); emit_int_expr(c, iav[0], b);
       buf_printf(b, "; sp_RbVal _t%d = sp_PolyArray_get(_t%d, _t%d);", tc2, ta2, tb2);
       buf_printf(b, " if (%ssp_poly_truthy(_t%d)) { ", is_or2 ? "!" : "", tc2);
       emit_guarded_poly_slot_assign(c, iv, tc2, b);
@@ -6804,33 +6868,23 @@ static void emit_expr_node(Compiler *c, int id, Buf *b) {
          the element's plain scalar */
       const char *k = irr.elem == TY_INT ? "Int" : "Float";
       TyKind et = irr.elem;
-      buf_printf(b, "({ sp_%sArray *_t%d = ", k, ta2); emit_expr(c, ir, b);
-      buf_printf(b, "; sp_int _t%d = ", tb2); emit_int_expr(c, iav[0], b);
+      buf_printf(b, "({ sp_%sArray *_t%d = ", k, ta2); emit_expr(c, ir, b); buf_puts(b, "; ");
+      { int ops[2] = { iav[0], iv }; emit_index_recv_root(c, irt, id, ir, ops, 2, ta2, 1, b); }
+      buf_printf(b, "sp_int _t%d = ", tb2); emit_int_expr(c, iav[0], b);
       buf_printf(b, "; %s _t%d = sp_%sArray_oget(_t%d, _t%d);", oint_ctype(et), tc2, k, ta2, tb2);
       buf_printf(b, " if (%s_t%d.nil) { ", is_or2 ? "" : "!", tc2);
       emit_guarded_oint_slot_assign(c, iv, et, tc2, b);
       buf_printf(b, "; sp_%sArray_oset(_t%d, _t%d, _t%d); } _t%d%s; })", k, ta2, tb2, tc2, tc2, node_is_oint(c, id) ? "" : ".v");
     }
-    else if (irr.elem == TY_STRING) {
-      buf_printf(b, "({ sp_StrArray *_t%d = ", ta2); emit_expr(c, ir, b);
-      buf_printf(b, "; sp_int _t%d = ", tb2); emit_int_expr(c, iav[0], b);
-      buf_printf(b, "; const char *_t%d = SP_STR_B(sp_StrArray_get_e(_t%d, _t%d));", tc2, ta2, tb2);
-      buf_printf(b, " if (%s_t%d) { ", is_or2 ? "!" : "", tc2);
-      emit_guarded_slot_assign(c, iv, tc2, b);
-      buf_printf(b, "; sp_StrArray_set(_t%d, _t%d, _t%d); } _t%d; })", ta2, tb2, tc2, tc2);
-    }
+    else if (irr.elem == TY_STRING) emit_index_or_str_array(c, id, ir, iav[0], iv, irt, is_or2, ta2, tb2, tc2, b);
     else if (ty_is_hash(irt)) {
       const char *hn = ty_hash_cname(irt);
       TyKind kt = ty_hash_key(irt);
       TyKind vt = ty_hash_val(irt);
       if (!hn) { unsupported(c, id, "index-or/and-write (expr, unknown hash)"); return; }
-      /* The receiver's temp is the hash's only holder once the key or the
-         value drops it, and a key that can allocate has no holder at all:
-         root the receiver when either can -- a call, a write -- and the key
-         when it can allocate, as the statement form does. */
-      int drops = subtree_has_side_effect(c, iav[0]) || subtree_has_side_effect(c, iv);
+      /* (the key, when it can allocate, is rooted below, as the statement form does) */
       buf_printf(b, "({ %s _t%d = ", c_type_name(irt), ta2); emit_expr(c, ir, b); buf_puts(b, "; ");
-      if (subtree_may_allocate(c->nt, ir) || drops) { emit_gc_root_tmp(c, irt, ta2, b); buf_puts(b, " "); }
+      { int ops[2] = { iav[0], iv }; emit_index_recv_root(c, irt, id, ir, ops, 2, ta2, 0, b); }
       /* a key that may be nil or of another class: held boxed, the read
          misses on it and the store converts it (hash_opw_okey) */
       int ok = hash_opw_okey(c, iav[0], irt);

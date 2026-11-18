@@ -248,6 +248,10 @@ static int node_is_oint_asked(Compiler *c, int node) {
     }
     /* `x.tap { ... }` answers its receiver, in the receiver's form */
     if (kernel && is_tap_name(nm) && blk >= 0 && nt_kind(nt, blk) == NK_BlockNode && r >= 0 && oint_kind(rt)) return node_is_oint(c, r);
+    /* so do `x.itself` (a desugar wraps a splat call's arms in one) and
+       freeze / dup / clone, which answer an Integer or a Float and nil
+       alike as themselves */
+    if (kernel && is_self_copy(nm) && an2 == 0 && blk < 0 && r >= 0 && oint_kind(rt)) return node_is_oint(c, r);
     /* unary `+` hands an Integer / Float its operand: the operand's form */
     if (sp_streq(nm, "+@") && an2 == 0 && r >= 0 && oint_kind(rt)) return node_is_oint(c, r);
     /* a proc's result comes back boxed and is unboxed with its nil */
@@ -494,6 +498,8 @@ static int node_is_oint_asked(Compiler *c, int node) {
     if (r >= 0 && (nt_kind(nt, r) == NK_ConstantReadNode || nt_kind(nt, r) == NK_ConstantPathNode) &&
         !oint_kind(rt) && rt != TY_COMPLEX && rt != TY_RATIONAL && rt != TY_BIGINT &&
         !ty_is_array(rt) && !ty_is_hash(rt) && rt != TY_RANGE && rt != TY_STRING &&   /* a constant holding a number or a container (Float::INFINITY, FREE = []) is a value */
+        !(ty_is_obj_array(rt) && an2 == 1 && (sp_streq(nm, "index") || sp_streq(nm, "find_index"))) &&   /* PAIRS.index(x) on an object array: nil when missing */
+        !(rt == TY_STR_RANGE && an2 == 1 && blk < 0 && sp_streq(nm, "find_index")) &&   /* R.find_index(s) on a String Range: likewise */
         !sp_streq(nm, "world_readable?") && !sp_streq(nm, "world_writable?"))   /* File.world_readable?(f): nil when it is not */
       return 0;
     /* the runtime functions that answer an sp_oint (RUNTIME-API.md) */
@@ -524,6 +530,7 @@ static int node_is_oint_asked(Compiler *c, int node) {
         (sp_streq(nm, "index") || sp_streq(nm, "rindex") || sp_streq(nm, "find_index") || sp_streq(nm, "delete_at") || sp_streq(nm, "delete") ||
          ((sp_streq(nm, "pop") || sp_streq(nm, "shift")) && an2 == 0))) return 1;
     if (r >= 0 && ty_is_hash(rt) && (sp_streq(nm, "delete") || sp_streq(nm, "find_index"))) return 1;
+    if (r >= 0 && ty_is_obj_array(rt) && (sp_streq(nm, "index") || sp_streq(nm, "find_index")) && an2 == 1) return 1;
     if (r >= 0 && rt == TY_MATCHDATA && (sp_streq(nm, "bytebegin") || sp_streq(nm, "byteend"))) return 1;
     if (is_range_bound_reader(nm) && r >= 0 &&
         (rt == TY_MATCHDATA || rt == TY_RANGE || rt == TY_FLOAT_RANGE)) return 1;
@@ -542,6 +549,15 @@ static int node_is_oint_asked(Compiler *c, int node) {
     }
     if (r >= 0 && (rt == TY_RANGE || rt == TY_FLOAT_RANGE) && an2 == 0 && blk < 0 &&
         (sp_streq(nm, "min") || sp_streq(nm, "max"))) return 1;
+    /* a typed Array's sum(seed) with a seed that may be nil answers it over
+       no elements (emit_poly_sum_seed, unboxed into the oint) */
+    if (r >= 0 && (rt == TY_INT_ARRAY || rt == TY_FLOAT_ARRAY) && an2 == 1 && blk < 0 && sp_streq(nm, "sum")) {
+      int sa = nt_ref(nt, node, "arguments"), sn = 0;
+      const int *sav = nt_arr(nt, sa, "arguments", &sn);
+      if (sav && sn == 1 && oint_kind(comp_ntype(c, sav[0])) && nullable_int_value(c, sav[0])) return 1;
+    }
+    /* a String Range's find_index(v) row answers the position, nil on a miss */
+    if (r >= 0 && rt == TY_STR_RANGE && an2 == 1 && blk < 0 && sp_streq(nm, "find_index")) return 1;
     /* `s.unpack1("q")` past the input's end is nil */
     if (r >= 0 && sp_streq(nm, "unpack1")) return 1;
     /* a String range has no size (nil); an Enumerator's find_index / index
@@ -828,7 +844,7 @@ static int repr_boxed_native_handle(Compiler *c, int v) {
     /* (a class with no arm and no method_missing raises NoMethodError,
        which answers no String: strbuf_poly_user_boxes) */
     if (arm < 0) {
-      if (ks[j] < 0 || ks[j] >= c->nclasses || comp_method_in_chain(c, ks[j], "method_missing", NULL) >= 0 ||
+      if (ks[j] < 0 || ks[j] >= c->nclasses || call_target(c, v, ks[j], METHOD_MISSING_NAME, CT_METHODS, NULL) >= 0 ||
           call_answers(c, -1, ks[j], nm, 0, NULL))
         return 0;
       continue;
@@ -928,8 +944,7 @@ int repr_call_returns_handle(Compiler *c, int v) {
   /* A missing ENV key answers the default handle; a present one clears
      the return channel before making its own String. delete's
      missing-key block answers its value the same way. */
-  if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      is_env_const(key_name(c, recv)) && !comp_const(c, "ENV") &&
+  if (env_value_recv(c, recv, comp_ntype(c, recv)) &&
       bop_share_named(BOP_ENV, nm) == BSH_FETCH) {
     int argc = 0; const int *argv = call_args(nt, v, &argc);
     int tail = env_delete_block_value(c, v);
@@ -970,13 +985,13 @@ int repr_call_returns_handle(Compiler *c, int v) {
     if (!ks || n <= 0 || n > CPT_MAX) return 0;
     for (int i = 0; i < n; i++) {
       /* (ret_nil_pickup is decided with ret_handle) */
-      int mi = comp_method_in_chain(c, ks[i], "to_str", NULL);
+      int mi = cplan_implied_target(c, v, av[0], ks[i], "to_str", CIT_TABLE, NULL);
       if (mi >= 0 && (scope_ret_handle(c, mi), c->scopes[mi].ret_nil_pickup)) {
-        int fallback = comp_method_in_chain(c, ks[i], "to_s", NULL);
+        int fallback = cplan_implied_target(c, v, av[0], ks[i], "to_s", CIT_TABLE, NULL);
         if (fallback < 0 || !scope_ret_handle(c, fallback) || c->scopes[fallback].ret_nil_pickup) return 0;
       }
       if (mi < 0) {
-        mi = comp_method_in_chain(c, ks[i], "to_s", NULL);
+        mi = cplan_implied_target(c, v, av[0], ks[i], "to_s", CIT_TABLE, NULL);
         if (mi >= 0 && (scope_ret_handle(c, mi), c->scopes[mi].ret_nil_pickup)) return 0;
       }
       if (mi < 0) return 0;
@@ -1062,6 +1077,12 @@ int repr_self_handle(const Compiler *c, int scope) {
   return scope_self_is_string(c, scope);
 }
 
+int repr_self_string_object(const Compiler *c, int scope) {
+  if (scope < 0 || scope >= c->nscopes) return 0;
+  const Scope *s = &c->scopes[scope];
+  return !s->is_cmethod && s->class_id >= 0 && comp_ary_is_str((Compiler *)c, s->class_id);
+}
+
 /* Is self of instance method `scope` a boxed value (sp_RbVal)? It is in a
    reopening of Object, Numeric, Array or Hash: any value of the builtin, or
    an instance of a program class below it, is the receiver. */
@@ -1120,8 +1141,8 @@ int repr_env_store_operand(Compiler *c, int v) {
   if (v < 0 || nt_kind(nt, v) != NK_CallNode) return -1;
   int r = nt_ref(nt, v, "receiver"), argc = 0;
   const int *argv = call_args(nt, v, &argc);
-  return r >= 0 && nt_kind(nt, r) == NK_ConstantReadNode && is_env_const(key_name(c, r)) &&
-         !comp_const(c, "ENV") && argc == 2 && bop_share_named(BOP_ENV, nt_str(nt, v, "name")) == BSH_LAST &&
+  return r >= 0 && env_value_recv(c, r, comp_ntype(c, r)) &&
+         argc == 2 && bop_share_named(BOP_ENV, nt_str(nt, v, "name")) == BSH_LAST &&
          (repr_of(c, argv[1]).kind != RK_BOXED || share_value_unobserved(c, argv[1])) &&
          (repr_of(c, argv[0]).handle || share_value_fresh(c, argv[0], 0) || !subtree_has_side_effect(c, argv[1]))
          ? argv[1] : -1;
@@ -1789,6 +1810,14 @@ ReprKind repr_slot_kind(const Compiler *c, const LocalVar *lv) {
   if (slot_is_oint(lv)) return RK_OPT;
   return repr_kind_of_type(c, lv->type);
 }
+/* Does node v's value come out as an Integer Range held by value (an
+   sp_Range), not boxed? A call that takes the Range as one argument
+   emits it as that C struct. */
+int repr_range_value(const Compiler *c, int v) {
+  Repr r = repr_of(c, v);
+  return r.as_ty == TY_RANGE && r.kind != RK_BOXED;
+}
+
 Repr repr_of_slot(const Compiler *c, const LocalVar *lv) {
   Repr r;
   memset(&r, 0, sizeof r);

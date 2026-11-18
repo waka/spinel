@@ -95,8 +95,8 @@ int emit_poly_isa_test(Compiler *c, const char *cn, const char *v, int exact, Bu
 void emit_pre_root(Compiler *c, TyKind t, int tmp);
 int emit_scalar_class_test(Compiler *c, int node, TyKind t, const char *cn, int exact, Buf *b);
 int hoist_boxed_rooted(Compiler *c, int node);
-TyKind user_cmp_invalid_ret(Compiler *c, int cid);
-int user_cmp_needs_check(Compiler *c, int cid);
+TyKind user_cmp_invalid_ret(Compiler *c, int id, int op, int cid);
+int user_cmp_needs_check(Compiler *c, int id, int op, int cid);
 void emit_ie_param_default(Compiler *c, TyKind t, Buf *b);
 int emit_ie_poly(Compiler *c, int id, Buf *b);
 int emit_ie_proc(Compiler *c, int id, int recv, int self_cls, int blk, int tramp, Buf *b);
@@ -123,28 +123,34 @@ int obj_cmp_by_identity(TyKind t);
 int object_defines_cmp(Compiler *c);
 int any_class_defines(Compiler *c, const char *qm);
 int any_class_responds(Compiler *c, const char *qm);
-int class_implicit_responds(Compiler *c, int cid, const char *qm);
 int class_struct_kind(Compiler *c, int cid);
-int class_value_responds(Compiler *c, int tv, const char *qm, Buf *b);
+int class_value_responds(Compiler *c, int id, int tv, const char *qm, Buf *b);
 void class_value_responds_runtime(int tv, Buf *b);
 void emit_class_value_responds_helper(Compiler *c, const char *const *texts, int ntexts, Buf *protos, Buf *defs);
 extern const char *const comparable_names[];
 int const_name_is_wrong(const char *s);
 int emit_io_pick(Compiler *c, int id, int tv, const char *name, int public_only, Buf *b);
 void emit_io_pick_public(Compiler *c, int id, const char *qm, const char *pick, Buf *b);
-void emit_io_reopen_responds(Compiler *c, int tv, const char *qm, int include_all, Buf *b);
+void emit_io_reopen_responds(Compiler *c, int id, int tv, const char *qm, int include_all, Buf *b);
 void emit_poly_dispatch_key(Compiler *c, int tv, int cls0_cand, int prim_cand, int exc_cand, Buf *b);
+/* The key the switch of call id's named dispatch of `name` reads off the
+   boxed value in _t<tv>, in the plan's key form (PolyPlan.flags, PPF_KEY_*):
+   the value takes the arm whose key it equals. A dispatch's switch and the test
+   of a send split that leads into it (emit_send_blind) both read it, so the
+   split's arm takes exactly the values the arms do. */
+void emit_poly_plan_key(Compiler *c, int id, unsigned form, int tv, const char *name, Buf *b);
 void emit_responds_name(Compiler *c, int k, const char *nm, Buf *pub, Buf *priv);
 extern const char *const enumerable_names[];
 extern int g_rto_nil_obj;
 extern int g_rto_by_cls;
-int emit_respond_to_by_cls(Compiler *c, int recv, const char *qm, int argc, const int *argv, Buf *b);
+int emit_respond_to_by_cls(Compiler *c, int id, int recv, const char *qm, int argc, const int *argv, Buf *b);
 extern int g_rto_exc;
 extern int g_rto_force_ia;
 int emit_respond_to_exc_cls(Compiler *c, int recv, const char *qm, int argc, const int *argv, Buf *b);
 int method_hidden_from_reflection(Compiler *c, int cid, const char *m);
 int refl_member_of_struct_superclass(Compiler *c, int ci, const char *m);
 int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const char *qm, int argc, const int *argv);
+int is_enum_cursor_name(const char *n);
 /* nil's static answer to respond_to?(qm, ...); *prog: by a method of the program's */
 int nil_responds_static(Compiler *c, int id, const char *qm, int argc, const int *argv, int *prog);
 /* respond_to? call id (its argc arguments argv, asking qm) of a class's own
@@ -153,10 +159,12 @@ int nil_responds_static(Compiler *c, int id, const char *qm, int argc, const int
    written to b. 0, writing nothing, for a call the plan does not answer
    so; with b NULL, only asked. */
 int emit_respond_to_cells(Compiler *c, int id, const char *qm, int argc, const int *argv, Buf *b);
-/* The writes visibility word `id` makes to its visibility cells as its own
-   call runs (cplan_vis_cell_after), as an expression with no value of its
-   own, `gv_<cell> = <v>, ...`, written to b. 0, writing nothing, for a
-   word that writes none. */
+/* The writes visibility word or include call `id` makes to its cells as its
+   own call runs (cplan_vis_cell_after: the visibility cells, and the Kernel
+   cells of the classes an include brings Kernel into), as an expression with
+   no value of its own, `gv_<cell> = <v>, ...` (one of several classes' cells
+   `_sp_cls.cls_id == <class> ? (void)(gv_<cell> = 1) : (void)0`), written to
+   b. 0, writing nothing, for a call that writes none. */
 int emit_vis_cell_write(Compiler *c, int id, Buf *b);
 int respond_to_user_defined(Compiler *c, int id, int recv);
 extern const char *const respond_universal[];
@@ -164,13 +172,16 @@ extern const char *const respond_universal_all[]; /* public and private */
 int object_private_method_name(const char *qm);
 const char *const *object_private_method_names(void); /* NULL-terminated */
 int respond_to_runtime_reaches(Compiler *c, TyKind rt);
-int root_reopen_defines(Compiler *c, const char *qm);
+int root_reopen_defines(Compiler *c, int id, const char *qm);
+/* ...and the ask with no site: do the tables of an Object, Kernel or BasicObject reopening hold or undefine qm at all
+   (root_reopen_defines is 0 for every call where they do not) */
+int root_reopen_holds(Compiler *c, const char *qm);
 /* 1 when the program's reopen of the builtin class or module `cls` (its
    chain) defines `name`, as call_target answers call id (-1: no call asks) */
 int reopened_owns(Compiler *c, int id, const char *cls, const char *name);
-int bool_side_responds(Compiler *c, const char *qm, int include_all, int foldable, int *ta, int *fa);
-int root_reopen_defines_own(Compiler *c, int k, const char *qm);   /* a root reopening k defines qm itself (def, attr_reader, attr_writer) */
-int root_reopen_method_vis(Compiler *c, int cid, const char *qm);   /* an Object, Kernel or BasicObject reopening's method qm: its visibility, or -1 */
+PresenceKind presence_at(Compiler *c, int id, int cls, unsigned side, const char *qm, CplanPresence *pr);   /* what class cls holds of qm where call id runs (the call plan: cplan_presence; the final tables alone for a super or no id) */
+int bool_side_responds(Compiler *c, int id, const char *qm, int include_all, int foldable, int *ta, int *fa);
+int root_reopen_method_vis(Compiler *c, int id, int cid, const char *qm);   /* an Object, Kernel or BasicObject reopening's method qm: its visibility, or -1 */
 int private_answer_overridden(Compiler *c, const char *qm, TyKind rt);
 int refl_md_dynamic_used(Compiler *c);
 void emit_scope_parameters_pushes(Compiler *c, int mi, int tr4, Buf *b);
@@ -178,8 +189,6 @@ int refl_im_params_used(Compiler *c);
 int emit_refl_im_params_call(Compiler *c, int id, Buf *b);
 void emit_refl_im_params(Compiler *c, Buf *b);
 void emit_refl_method_defined(Compiler *c, Buf *b);
-int rt_probe_answer(Compiler *c, int id, int *yes);
-extern const char *const struct_names[];
 void emit_call_body(Compiler *c, int id, Buf *b);
 void emit_ffi_callback_arg(Compiler *c, int cbidx, int argnode, Buf *out);
 void emit_ffi_num_arg(Compiler *c, int arg, TyKind at, const char *spec, int dbl, Buf *b);
@@ -238,7 +247,7 @@ void emit_class_id_is(Compiler *c, int cname, const char *expr, Buf *b);
 int emit_reopen_arm_test(Compiler *c, int kmi, const char *name, const char *cls, const char *raise, Buf *b);
 /* The ArgumentError text of Module#name / to_s / inspect given these
    arguments; 0 when there are none or only the run time knows the count */
-int class_name_reader_arity_msg(Compiler *c, const char *nm, int argc, const int *argv, char *am, size_t n);
+int class_name_reader_arity_msg(Compiler *c, int id, const char *nm, int argc, const int *argv, char *am, size_t n);
 extern int g_cls_value_recv;
 int hoist_dispatch_args(Compiler *c, int argsN, int **sv, int **vw);
 /* A boxed Integer or Float at a call no target answers: the arms that
@@ -255,6 +264,7 @@ void refl_module_own_methods(Compiler *c, int m, int pub, int prot, int priv, Re
 void refl_emit_sym_array(Compiler *c, int cid, ReflNames *r, Buf *b);
 void refl_at(ReflNames *r, int id, int cls, unsigned side);
 void refl_free(ReflNames *r);
+int refl_note(ReflNames *r, const char *m, int show);   /* r holds m once (1 when it was new) */
 void refl_own_instance_methods(Compiler *c, int ci, int pub, int prot, int priv, int with_modules, ReflNames *r);
 void unhoist_dispatch_args(Compiler *c, int n, int *sv, int *vw);
 int emit_ctor_new_with_proc(Compiler *c, int id, int ci, Buf *b);
@@ -296,7 +306,7 @@ void emit_time_in_zone(Compiler *c, int ts, int zone, Buf *b);
 void emit_utime_arg_ns(Compiler *c, int node, const char *sv, const char *nv, Buf *b);
 int emit_clock_id(Compiler *c, int node, Buf *b);
 void emit_math_arg(Compiler *c, int node, Buf *out);
-int json_to_json_is_builtin(Compiler *c, int recv);
+int json_to_json_is_builtin(Compiler *c, int id, int recv);
 int node_is_stringio(Compiler *c, int node);
 void emit_exc_exception(Compiler *c, int recv, int arg, Buf *b);
 int emit_name_error_new_kw(Compiler *c, const char *cn, int argc, const int *argv, int recv_v, Buf *b);
@@ -306,19 +316,20 @@ const char *exc_gated_acc_fn(const char *name);
 int hoist_exc_recv(Compiler *c, int recv);
 int ctor_init_takes_block(Compiler *c, int initm);
 void emit_exc_reopen_construct(Compiler *c, int ci, int initm, int args, int msg_node, Buf *b);
-void emit_raise_class_value(Compiler *c, int kn, int mn, Buf *b);
-int exc_reopen_initialize(Compiler *c, int ci);
+int exc_builtin_reopen_initialize(Compiler *c, int id, const char *cn, int argc, const int *argv);
+void emit_exc_reopen_construct_as(Compiler *c, const char *cname, int initm, int args, int msg_node, int call_id, Buf *b);
+void emit_raise_class_value(Compiler *c, int id, int kn, int mn, Buf *b);
+int exc_reopen_initialize(Compiler *c, int id, int ci);
 void emit_exc_new_no_init(Compiler *c, int id, int ci, int argc, const int *argv, Buf *b);
 int raise_plain_arg(const NodeTable *nt, int node);
 void emit_kconv_call(Compiler *c, int id, const int *av, int ac, int raise, Buf *b);
 void emit_pre_format_args(Compiler *c, const int *av, int ac, int ta);
 void emit_fiber_storage_key(Compiler *c, int key, Buf *b);
 int poly_binop_recv_temp(Compiler *c, int recv, int arg, Buf *b, int *stmt_expr);
-int attr_writer_named(Compiler *c, int cls, const char *name);
+int attr_writer_named(Compiler *c, int id, int cls, const char *name);
 int boxed_desc_control_arity(const char *name, int argc);
 int boxed_printf_list_ok(Compiler *c, const int *argv, int argc);
 int boxed_write_takes_list(Compiler *c, int id, const int *argv, int argc);
-int class_method_named(Compiler *c, const char *name);
 const char *io_line_reader(const char *name, int has_limit);
 void emit_io_line_read(Compiler *c, const char *name, const char *r, const int *argv, int argc, Buf *b);
 void emit_io_wait(Compiler *c, const char *name, int argc, const int *argv, const char *r, Buf *b);
@@ -355,7 +366,7 @@ int builtin_method_arity(const char *cls, const char *m, int *out);
 const char *builtin_method_params(const char *owner, const char *m, int *in_c);
 int builtin_method_known(const char *cls, const char *m);
 int core_method_vis(const char *cls, const char *m, int inherit, const char **owner);   /* codegen_call_class.c */
-int refl_builtin_vis(Compiler *c, int ci, const char *m, int inherit, const char **owner);   /* codegen_call_class.c */
+int refl_builtin_vis(Compiler *c, int ci, const char *m, int inherit, int own, const char **owner);   /* codegen_call_class.c */
 const char *core_class_ancestors(const char *cls);   /* codegen_call_class.c */
 const char *core_ancestor_step(const char *p, size_t *len);   /* codegen_call_class.c */
 void core_own_methods_each(const char *cls, size_t cl, void (*f)(void *, const char *, int), void *ud);

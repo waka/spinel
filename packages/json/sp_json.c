@@ -49,7 +49,19 @@ typedef struct {
      written out rather than refused */
   int dump, dump_limit;
   int stk;      /* p is the caller's stack array: grown by a copy, never freed */
+  /* the walk is laying out a user #to_json's own document again (the pretty
+     printer's re-read), whose text CRuby writes as it is: its Strings are
+     not checked as UTF-8 */
+  int raw;
+  /* JSON.generate's and pretty_generate's options, zero without them:
+     ascii_only and script_safe as JB_ESC_* bits (jb_strn_esc), allow_nan,
+     and a max_nesting of the caller's (limit_set; 0 for none) in place of
+     the 100 levels */
+  int esc, allow_nan, limit_set;
+  long limit;
 } jbuf;
+#define JB_ESC_ASCII  1   /* ascii_only: every character past ASCII as \uXXXX */
+#define JB_ESC_SCRIPT 2   /* script_safe: "/", U+2028 and U+2029 escaped too */
 #define JB_STACK_N 512
 #define JB_ON_STACK(b, arr) do { memset(&(b), 0, sizeof (b)); (b).p = (arr); (b).cap = sizeof (arr); (b).stk = 1; } while (0)
 /* what a walk that ends early, or the end of one, gives back: a malloc'd
@@ -155,12 +167,57 @@ static const char jb_esc[256] = {
   0, 0, '"', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
   ['\\'] = '\\',
 };
+/* The length of the well-formed UTF-8 character at P, whose first byte is
+   0x80 or above, or 0 when the bytes there are not one: a stray continuation
+   byte, a sequence cut short, an overlong form, a surrogate half, or a code
+   point past U+10FFFF (RFC 3629, as String#valid_encoding? reads it). Each
+   of those is told by the lead byte and the range of the byte after it
+   (RFC 3629's table), so no code point is put together. */
+static inline size_t jb_utf8_len(const unsigned char *p, const unsigned char *end) {
+  unsigned c = p[0];
+  size_t left = (size_t)(end - p);
+  if (c < 0xC2) return 0;                       /* a continuation byte, or C0/C1 (overlong) */
+  if (c < 0xE0) return left >= 2 && (p[1] & 0xC0) == 0x80 ? 2 : 0;
+  if (c < 0xF0) {
+    if (left < 3) return 0;
+    unsigned lo = c == 0xE0 ? 0xA0 : 0x80;      /* E0 80..9F is overlong */
+    unsigned hi = c == 0xED ? 0x9F : 0xBF;      /* ED A0..BF is a surrogate half */
+    return p[1] >= lo && p[1] <= hi && (p[2] & 0xC0) == 0x80 ? 3 : 0;
+  }
+  if (c < 0xF5) {
+    if (left < 4) return 0;
+    unsigned lo = c == 0xF0 ? 0x90 : 0x80;      /* F0 80..8F is overlong */
+    unsigned hi = c == 0xF4 ? 0x8F : 0xBF;      /* F4 90.. is past U+10FFFF */
+    return p[1] >= lo && p[1] <= hi && (p[2] & 0xC0) == 0x80 && (p[3] & 0xC0) == 0x80 ? 4 : 0;
+  }
+  return 0;                                     /* F5..FF start nothing */
+}
+/* CRuby's json refuses a String that is not valid UTF-8 rather than write
+   bytes no JSON parser reads back. A text String gets the generator's own
+   message. A binary one is taken when its bytes happen to be UTF-8 (CRuby
+   warns that json 3.x will raise there; Spinel prints nothing), and otherwise
+   fails converting to UTF-8, which names its first byte past ASCII, as
+   ASCII-8BIT gives no such byte a character in UTF-8. */
+SP_COLD static SP_NOINLINE SP_NORETURN void jb_bad_utf8(jbuf *b, const char *s, size_t n) {
+  jb_release(b);
+  if (sp_str_is_binary(s)) {
+    unsigned char c = 0;
+    for (size_t i = 0; i < n; i++)
+      if ((unsigned char)s[i] >= 0x80) { c = (unsigned char)s[i]; break; }
+    sp_raise_cls("JSON::GeneratorError", sp_sprintf("\"\\x%02X\" from ASCII-8BIT to UTF-8", c));
+  }
+  sp_raise_cls("JSON::GeneratorError", "source sequence is illegal/malformed utf-8");
+}
 /* A String quoted and escaped straight into the buffer, the bytes between two
    escapes copied as one run. S is read while the buffer grows, and a moved
    buffer's growth can collect: every caller's S is held by the document the
    walk has rooted (a value, a key, a Symbol's name) or is not on the GC heap,
-   and the collector moves nothing, so it is still there to read. */
+   and the collector moves nothing, so it is still there to read. A byte past
+   ASCII has to start a well-formed UTF-8 character, which is copied with its
+   run; anything else raises (jb_bad_utf8). */
+static void jb_strn_esc(jbuf *b, const char *s, size_t n);
 static void jb_strn(jbuf *b, const char *s, size_t n) {
+  if (b->esc) { jb_strn_esc(b, s, n); return; }
   jb_c(b, '"');
   if (s) {
     const char *run = s, *p = s, *end = s + n;
@@ -168,7 +225,24 @@ static void jb_strn(jbuf *b, const char *s, size_t n) {
     while (p < end) {
       c = (unsigned char)*p;
       char e = jb_esc[c];
-      if (!e) { p++; continue; }
+      if (!e) {
+        if (c < 0x80) { p++; continue; }
+        /* a byte past ASCII: the characters from here to the next ASCII
+           byte stay in the run, each checked as UTF-8 */
+        const unsigned char *q = (const unsigned char *)p, *qe = (const unsigned char *)end;
+        do {
+          unsigned lead = *q;
+          /* the common three-byte lead first: E1..EC and EE..EF take any
+             continuation bytes */
+          if (lead - 0xE1u < 0x0Fu && lead != 0xEDu && qe - q >= 3 &&
+              ((q[1] & 0xC0u) | ((q[2] & 0xC0u) >> 2)) == 0xA0u) { q += 3; continue; }
+          size_t k = jb_utf8_len(q, qe);
+          if (!k) { if (!b->raw) jb_bad_utf8(b, s, n); k = 1; }
+          q += k;
+        } while (q < qe && *q >= 0x80);
+        p = (const char *)q;
+        continue;
+      }
       if (p > run) jb_add(b, run, (size_t)(p - run));
       if (e == 'u') {
         char u[6] = { '\\', 'u', '0', '0', "0123456789abcdef"[c >> 4], "0123456789abcdef"[c & 15] };
@@ -181,12 +255,67 @@ static void jb_strn(jbuf *b, const char *s, size_t n) {
   }
   jb_c(b, '"');
 }
-/* A C string with no header to read a length from: a Symbol's name, a bare
-   literal. It ends at its NUL. */
+/* jb_strn under ascii_only or script_safe, out of the common path. A
+   character past ASCII is checked as UTF-8 as there, then written as
+   \uXXXX under ascii_only (a surrogate pair past U+FFFF), and U+2028 and
+   U+2029 as theirs under script_safe, which writes "/" as "\/" too, as
+   CRuby's json does. */
+static void jb_u16(jbuf *b, unsigned u) {
+  char t[6] = { '\\', 'u', "0123456789abcdef"[(u >> 12) & 15], "0123456789abcdef"[(u >> 8) & 15],
+                "0123456789abcdef"[(u >> 4) & 15], "0123456789abcdef"[u & 15] };
+  jb_add(b, t, 6);
+}
+static SP_NOINLINE void jb_strn_esc(jbuf *b, const char *s, size_t n) {
+  jb_c(b, '"');
+  const unsigned char *p = (const unsigned char *)s, *end = p + (s ? n : 0);
+  while (p < end) {
+    unsigned c = *p;
+    if (c < 0x80) {
+      char e = jb_esc[c];
+      if (!e && c == '/' && (b->esc & JB_ESC_SCRIPT)) e = '/';
+      if (!e) jb_c(b, (char)c);
+      else if (e == 'u') jb_u16(b, c);
+      else { char t[2] = { '\\', e }; jb_add(b, t, 2); }
+      p++;
+      continue;
+    }
+    size_t k = jb_utf8_len(p, end);
+    if (!k) {
+      if (!b->raw) jb_bad_utf8(b, s, n);
+      jb_c(b, (char)c);   /* a re-read user document's byte, as it is */
+      p++;
+      continue;
+    }
+    unsigned cp = k == 2 ? (c & 0x1Fu) : k == 3 ? (c & 0x0Fu) : (c & 0x07u);
+    for (size_t i = 1; i < k; i++) cp = (cp << 6) | (p[i] & 0x3Fu);
+    if (b->esc & JB_ESC_ASCII) {
+      if (cp >= 0x10000) { cp -= 0x10000; jb_u16(b, 0xD800 + (cp >> 10)); jb_u16(b, 0xDC00 + (cp & 0x3FF)); }
+      else jb_u16(b, cp);
+    }
+    else if (cp == 0x2028 || cp == 0x2029) jb_u16(b, cp);
+    else jb_add(b, (const char *)p, k);
+    p += k;
+  }
+  jb_c(b, '"');
+}
+/* A C string with no header to read a length from: a bare literal, an
+   Integer's digits. It ends at its NUL. */
 static void jb_str(jbuf *b, const char *s) { jb_strn(b, s, s ? strlen(s) : 0); }
 /* A Spinel String, which may hold a NUL: its bytes run to its own length, and
    a NUL among them is written as \u0000, as CRuby's json writes it. */
 static void jb_rstr(jbuf *b, const char *s) { jb_strn(b, s, sp_str_byte_len(s)); }
+/* A Symbol's name. The symbol table's entries carry their length (see
+   sp_sym_to_s), so a name may hold a NUL as a String does: `:"s\0t"` is
+   written "s\u0000t", where strlen ended it at "s". */
+static void jb_sym(jbuf *b, sp_sym id) {
+  if (sp_sym_name_fn) jb_rstr(b, sp_sym_name_fn(id));
+  else jb_strn(b, "", 0);
+}
+static const char *sp_json_sym(sp_sym id) {
+  char stk[JB_STACK_N]; jbuf b; JB_ON_STACK(b, stk);
+  jb_sym(&b, id);
+  return jb_finish(&b);
+}
 const char *sp_json_str(const char *s) {
   char stk[JB_STACK_N]; jbuf b; JB_ON_STACK(b, stk);
   jb_str(&b, s);
@@ -206,16 +335,6 @@ static void jb_int(jbuf *b, sp_int n) {
   jb_add(b, t, len);
 }
 
-static const char *sp_json_key(sp_RbVal k) {
-  k = sp_rbval_str(k);
-  if (k.tag == SP_TAG_STR)  return sp_json_rstr(k.v.s);
-  if (k.tag == SP_TAG_SYM)  return sp_json_str(sp_sym_name_fn ? sp_sym_name_fn((sp_sym)k.v.i) : "");
-  if (k.tag == SP_TAG_INT)  return sp_json_str(sp_int_to_s(k.v.i));
-  if (k.tag == SP_TAG_BOOL) return sp_json_str(k.v.b ? "true" : "false");
-  /* any other key is its #to_s, as CRuby's json generates it: a Float, nil,
-     an Array, an object of the program's own */
-  return sp_poly_to_s_fn ? sp_json_rstr(sp_poly_to_s_fn(k)) : sp_json_str("");
-}
 /* A key that is an object may run a #to_s of the program's own, which may
    raise, throw, or return past the walk: the buffer moves to the heap first,
    as before any user code. */
@@ -224,13 +343,19 @@ static void sp_json_key_b(jbuf *b, sp_RbVal k) {
   sp_RbVal ks = sp_rbval_str(k);
   switch (ks.tag) {
     case SP_TAG_STR: jb_rstr(b, ks.v.s); return;
-    case SP_TAG_SYM: jb_str(b, sp_sym_name_fn ? sp_sym_name_fn((sp_sym)ks.v.i) : ""); return;
+    case SP_TAG_SYM: jb_sym(b, (sp_sym)ks.v.i); return;
     case SP_TAG_INT: jb_c(b, '"'); jb_int(b, ks.v.i); jb_c(b, '"'); return;
     default: break;
   }
+  if (ks.tag == SP_TAG_BOOL) { jb_str(b, ks.v.b ? "true" : "false"); return; }
+  /* any other key is its #to_s, as CRuby's json generates it: a Float, nil,
+     an Array, an object of the program's own. It is written through this
+     buffer, so the walk's options escape it too, and rooted while the buffer
+     grows. */
   if (k.tag == SP_TAG_OBJ) jb_to_heap(b);
-  const char *jk = sp_json_key(k);
-  jb_gcs(b, jk, (size_t)sp_str_byte_len(jk));
+  const char *kt = sp_poly_to_s_fn ? sp_poly_to_s_fn(k) : "";
+  SP_GC_ROOT_STR(kt);
+  jb_rstr(b, kt);
 }
 
 /* A String held as its handle (SP_BUILTIN_STRBUF): a String the program
@@ -254,9 +379,10 @@ static sp_RbVal sp_json_user_view(sp_RbVal v) {
    its handle is a JSON string of its bytes, as a String literal is (CRuby's
    json reads a String subclass instance's bytes, not its #to_s); any other
    object is its #to_s, as Object#to_json is. */
-static const char *sp_json_obj_text(sp_RbVal v) {
-  if (sp_json_is_strbuf(v)) return sp_json_rstr(sp_poly_to_s(v));
-  return sp_json_rstr(sp_json_obj_to_s(v));
+static void sp_json_obj_text_b(jbuf *b, sp_RbVal v) {
+  const char *t = sp_json_is_strbuf(v) ? sp_poly_to_s(v) : sp_json_obj_to_s(v);
+  SP_GC_ROOT_STR(t);
+  jb_rstr(b, t);
 }
 
 /* CRuby's json refuses to serialize past 100 levels of nesting, which is how
@@ -265,21 +391,31 @@ static const char *sp_json_obj_text(sp_RbVal v) {
    identity -- 100 levels of distinct arrays serialize and the 101st raises,
    whether or not anything repeats. */
 #define SP_JSON_MAX_NESTING 100
+/* For a dump with no limit (and a generate with max_nesting 0), a guard on
+   the C stack, past which CRuby's own recursion overflows too (see
+   sp_json_max_depth). */
+#define SP_JSON_DUMP_GUARD 10000
 SP_COLD static SP_NOINLINE SP_NORETURN void sp_json_too_deep(jbuf *b) {
   /* The walk's own raise, so the walk can hand it the buffer to release (#4355).
      One it has already moved onto the GC heap needs nothing: the collector
      takes that with the root the landing frame drops. */
   jb_release(b);
   if (b->dump && b->dump_limit > 0) sp_raise_cls("ArgumentError", "exceed depth limit");
-  if (b->dump) sp_raise_cls("SystemStackError", "stack level too deep");
+  if (b->dump || (b->limit_set && (b->limit == 0 || b->limit > SP_JSON_DUMP_GUARD)))
+    sp_raise_cls("SystemStackError", "stack level too deep");
+  /* a max_nesting of N is passed by the container N levels down, and a
+     negative one by the first, which CRuby counts as 0 */
+  long lim = !b->limit_set ? SP_JSON_MAX_NESTING : b->limit < 0 ? 0 : b->limit;
   sp_raise_cls("JSON::NestingError",
-               "nesting of 100 is too deep. Did you try to serialize objects with circular references?");
+               sp_sprintf("nesting of %ld is too deep. Did you try to serialize objects with circular references?", lim));
 }
 /* The deepest container a walk enters: generate's 100, a JSON.dump limit,
    or for a dump with none a guard on the C stack, past which CRuby's own
    recursion overflows too. Parsing with max_nesting disabled shares it. */
-#define SP_JSON_DUMP_GUARD 10000
 static int sp_json_max_depth(const jbuf *b) {
+  if (b->limit_set)   /* a max_nesting of 0 is none, as dump's 0 */
+    return b->limit == 0 ? SP_JSON_DUMP_GUARD : b->limit > SP_JSON_DUMP_GUARD ? SP_JSON_DUMP_GUARD :
+           b->limit < 0 ? 0 : (int)b->limit;
   if (!b->dump) return SP_JSON_MAX_NESTING;
   return b->dump_limit > 0 ? b->dump_limit : SP_JSON_DUMP_GUARD;
 }
@@ -355,7 +491,7 @@ static const char *sp_json_scalar_o(sp_RbVal v, int allow_nan) {
     case SP_TAG_BOOL: return v.v.b ? JSPL("true") : JSPL("false");
     case SP_TAG_NIL:  return JSPL("null");
     case SP_TAG_STR:  return sp_json_rstr(v.v.s);
-    case SP_TAG_SYM:  return sp_json_str(sp_sym_name_fn ? sp_sym_name_fn((sp_sym)v.v.i) : "");
+    case SP_TAG_SYM:  return sp_json_sym((sp_sym)v.v.i);
     default: return JSPL("null");
   }
 }
@@ -401,14 +537,17 @@ static void sp_json_leaf_b(jbuf *b, sp_RbVal v) {
     case SP_TAG_INT: jb_int(b, v.v.i); return;
     case SP_TAG_FLT:
       if (isfinite(v.v.f)) { char out[64]; jb_add(b, out, (size_t)sp_json_float_fmt(v.v.f, out)); return; }
+      /* NaN and the Infinities raise below unless this is dump's walk: the
+         walk's buffer is released first, as for its other raises */
+      if (!b->dump && !b->allow_nan) jb_release(b);
       break;
     case SP_TAG_STR: jb_rstr(b, v.v.s); return;
-    case SP_TAG_SYM: jb_str(b, sp_sym_name_fn ? sp_sym_name_fn((sp_sym)v.v.i) : ""); return;
+    case SP_TAG_SYM: jb_sym(b, (sp_sym)v.v.i); return;
     case SP_TAG_BOOL: if (v.v.b) jb_add(b, "true", 4); else jb_add(b, "false", 5); return;
     case SP_TAG_NIL: jb_add(b, "null", 4); return;
     default: break;
   }
-  const char *sc = sp_json_scalar_o(v, b->dump);
+  const char *sc = sp_json_scalar_o(v, b->dump || b->allow_nan);
   jb_gcs(b, sc, strlen(sc));
 }
 /* `depth` counts the containers already entered, so a container reached at
@@ -474,8 +613,7 @@ static void sp_json_val_b(jbuf *b, sp_RbVal v, int depth) {
     if (uj) { jb_gcs(b, uj, (size_t)sp_str_byte_len(uj)); return; }
   }
   { jb_to_heap(b);   /* the class's own #to_s can raise or allocate */
-    const char *js = sp_json_obj_text(v);
-    jb_gcs(b, js, (size_t)sp_str_byte_len(js)); }
+    sp_json_obj_text_b(b, v); }
 }
 
 /* ---------- JSON.pretty_generate ----------
@@ -488,10 +626,16 @@ static void sp_json_indent(jbuf *b, int depth) {
 }
 
 static void sp_json_pretty_val(jbuf *b, sp_RbVal v, int depth) {
+  if (b->raw) {
+    /* a String of a re-read document (held as its handle or not) straight
+       into this buffer, unchecked */
+    sp_RbVal sv = sp_rbval_str(v);
+    if (sv.tag == SP_TAG_STR) { jb_rstr(b, sv.v.s); return; }
+  }
   if (v.tag == SP_TAG_OBJ) {
     int kind = sp_json_kind_fn ? sp_json_kind_fn(v) : 0;
     if (kind == 1) {  /* array */
-      if (depth >= SP_JSON_MAX_NESTING) sp_json_too_deep(b);
+      if (depth >= sp_json_max_depth(b)) sp_json_too_deep(b);
       sp_int n = sp_json_len_fn(v);
       if (n == 0) { jb_add(b, "[]", 2); return; }
       jb_c(b, '[');
@@ -507,7 +651,7 @@ static void sp_json_pretty_val(jbuf *b, sp_RbVal v, int depth) {
       return;
     }
     if (kind == 2) {  /* hash */
-      if (depth >= SP_JSON_MAX_NESTING) sp_json_too_deep(b);
+      if (depth >= sp_json_max_depth(b)) sp_json_too_deep(b);
       sp_int n = sp_json_len_fn(v);
       if (n == 0) { jb_add(b, "{}", 2); return; }
       jb_c(b, '{');
@@ -538,7 +682,14 @@ static void sp_json_pretty_val(jbuf *b, sp_RbVal v, int depth) {
         /* the re-parsed document is this walk's only reference to it */
         sp_RbVal d = sp_json_parse(uj);
         SP_GC_ROOT_RBVAL(d);
+        /* written as the user's text has it: neither checked as UTF-8 nor
+           escaped for ascii_only or script_safe */
+        int raw = b->raw, esc = b->esc;
+        b->raw = 1;
+        b->esc = 0;
         sp_json_pretty_val(b, d, depth);
+        b->raw = raw;
+        b->esc = esc;
         return;
       }
     }
@@ -546,11 +697,12 @@ static void sp_json_pretty_val(jbuf *b, sp_RbVal v, int depth) {
        JSON string has no interior structure for the pretty printer to lay out,
        so it renders identically either way. */
     { jb_to_heap(b);
-      const char *js = sp_json_obj_text(v);
-      jb_gcs(b, js, (size_t)sp_str_byte_len(js)); }
+      sp_json_obj_text_b(b, v); }
     return;
   }
-  { const char *sc = sp_json_val(v); jb_gcs(b, sc, strlen(sc)); }
+  /* a leaf into this buffer, as the compact walk writes it, so a String
+     that is not UTF-8 or a NaN raises with this walk's buffer released */
+  sp_json_leaf_b(b, v);
 }
 
 /* The document is rooted for the walk, for the reason sp_json_parse roots its
@@ -565,6 +717,23 @@ const char *sp_json_pretty(sp_RbVal v) {
   char stk[JB_STACK_N]; jbuf b; JB_ON_STACK(b, stk);
   SP_GC_ROOT_STR(b.heap);
   sp_json_pretty_val(&b, v, 0);
+  return jb_finish(&b);
+}
+/* JSON.generate(obj, opts) and JSON.pretty_generate(obj, opts), once the
+   generated program has read the options (sp_json_generate_options in
+   spinel_rt.h): ESC is JB_ESC_* bits, and LIMIT_SET says MAX_NESTING was
+   given (0 for none). A leaf goes through the buffer too, so the options
+   reach a document that is a single String. */
+const char *sp_json_generate_with(sp_RbVal v, int esc, int allow_nan, int limit_set, sp_int max_nesting, int pretty) {
+  SP_GC_ROOT_RBVAL(v);
+  char stk[JB_STACK_N]; jbuf b; JB_ON_STACK(b, stk);
+  b.esc = esc;
+  b.allow_nan = allow_nan;
+  b.limit_set = limit_set;
+  b.limit = (long)max_nesting;
+  SP_GC_ROOT_STR(b.heap);
+  if (pretty) sp_json_pretty_val(&b, v, 0);
+  else sp_json_val_b(&b, v, 0);
   return jb_finish(&b);
 }
 
@@ -590,6 +759,8 @@ const char *sp_json_pretty(sp_RbVal v) {
 typedef struct { const char *key; size_t len; } jkey;
 typedef struct {
   const char *p, *end;
+  const char *start;
+  int allow_duplicate_key;
   sp_int max_nesting;           /* zero disables the nesting check */
   int in_array;                 /* arrays open around the read */
   int nkeys; jkey keys[JP_KEYS];   /* by length, then bytes */
@@ -598,6 +769,16 @@ typedef struct {
 
 static SP_NORETURN void jp_err(const char *msg) {
   sp_raise_cls("JSON::ParserError", msg);
+}
+static const char *jp_position(jrd *j, const char *at) {
+  int line = 1, column = 1;
+  for (const char *p = j->start; p < at; p++) {
+    if (*p == '\n') { line++; column = 1; }
+    else column++;
+  }
+  /* json 2.18.0's backward scan omits the nearest newline from the line count. */
+  if (line > 1) line--;
+  return sp_sprintf(" at line %d column %d", line, column);
 }
 static void jp_ws(jrd *j) {
   while (j->p < j->end) {
@@ -849,10 +1030,17 @@ static sp_RbVal jp_array(jrd *j, int depth) {
   }
   return box;
 }
+static void jp_duplicate(jrd *j, const char *at, const char *key) {
+  const char *name = sp_poly_inspect_fn(sp_box_str(key)); SP_GC_ROOT_STR(name);
+  const char *position = jp_position(j, at); SP_GC_ROOT_STR(position);
+  jp_err(sp_sprintf("duplicate key %s%s", name, position));
+}
 static sp_RbVal jp_object(jrd *j, int depth) {
+  const char *start = j->p;
   j->p++;  /* '{' */
   sp_RbVal box = sp_json_mk_hash_fn();
   SP_GC_ROOT_RBVAL(box);
+  const char *duplicate = NULL; SP_GC_ROOT_STR(duplicate);
   jp_ws(j);
   if (j->p < j->end && *j->p == '}') { j->p++; return box; }
   jp_check_nesting(j, depth);
@@ -864,13 +1052,16 @@ static sp_RbVal jp_object(jrd *j, int depth) {
     if (j->p >= j->end || *j->p != ':') jp_err("expected ':' in object");
     j->p++;
     sp_RbVal v = jp_value(j, depth + 1);
+    sp_int before = sp_json_len_fn(box);
     sp_json_hash_set_fn(box, key, v);
+    if (!j->allow_duplicate_key && !duplicate && before == sp_json_len_fn(box)) duplicate = key;
     jp_ws(j);
     if (j->p >= j->end) jp_err("unterminated object");
     if (*j->p == ',') { j->p++; continue; }
     if (*j->p == '}') { j->p++; break; }
     jp_err("expected ',' or '}' in object");
   }
+  if (duplicate) jp_duplicate(j, start, duplicate);
   return box;
 }
 static sp_RbVal jp_value(jrd *j, int depth) {
@@ -879,7 +1070,7 @@ static sp_RbVal jp_value(jrd *j, int depth) {
   char c = *j->p;
   if (c == '{') return jp_object(j, depth);
   if (c == '[') return jp_array(j, depth);
-  if (c == '"') return sp_box_str(jp_string(j));
+  if (c == '"') return sp_box_str_new(jp_string(j));
   if (c == 't') { if (j->end - j->p >= 4 && !memcmp(j->p, "true", 4))  { j->p += 4; return sp_box_bool(1); } jp_err("expected 'true'"); }
   if (c == 'f') { if (j->end - j->p >= 5 && !memcmp(j->p, "false", 5)) { j->p += 5; return sp_box_bool(0); } jp_err("expected 'false'"); }
   if (c == 'n') { if (j->end - j->p >= 4 && !memcmp(j->p, "null", 4))  { j->p += 4; return sp_box_nil(); } jp_err("expected 'null'"); }
@@ -887,7 +1078,7 @@ static sp_RbVal jp_value(jrd *j, int depth) {
   jp_err("unexpected character");
 }
 
-sp_RbVal sp_json_parse_limit(const char *s, sp_int max_nesting) {
+sp_RbVal sp_json_parse_duplicates(const char *s, sp_int max_nesting, int allow_duplicate_key) {
   /* The reader walks `s` in place while the parse allocates every container
      and string it builds, so the input has to stay rooted for the whole walk:
      a caller passing it straight in (`JSON.parse File.read path`) holds it in
@@ -899,13 +1090,18 @@ sp_RbVal sp_json_parse_limit(const char *s, sp_int max_nesting) {
   SP_GC_ROOT_RBVAL(held);
   jrd j;
   j.max_nesting = max_nesting;
+  j.allow_duplicate_key = allow_duplicate_key;
   j.in_array = 0; j.nkeys = 0; j.held = &held;
   j.p = s ? s : "";
+  j.start = j.p;
   j.end = j.p + (s ? sp_str_byte_len(s) : 0);
   sp_RbVal v = jp_value(&j, 0);
   jp_ws(&j);
   if (j.p != j.end) jp_err("unexpected trailing characters");
   return v;
+}
+sp_RbVal sp_json_parse_limit(const char *s, sp_int max_nesting) {
+  return sp_json_parse_duplicates(s, max_nesting, 1);
 }
 
 sp_RbVal sp_json_parse(const char *s) { return sp_json_parse_limit(s, SP_JSON_MAX_NESTING); }

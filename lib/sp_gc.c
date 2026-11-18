@@ -65,7 +65,7 @@ size_t sp_gc_old_bytes = 0;
 int sp_gc_cycle = 0;
 void (*sp_gc_mark_suspended_fibers_hook)(void) = NULL;
 void (*sp_gc_mark_globals_hook)(void) = NULL;
-void (*sp_gc_mark_io_timeouts_hook)(void) = NULL;
+void (*sp_gc_mark_static_streams_hook)(void) = NULL;
 #ifdef SP_CEXT
 void (*sp_gc_mark_cext_hook)(void) = NULL;
 void (*sp_gc_sweep_cext_hook)(int full) = NULL;
@@ -193,6 +193,24 @@ int sp_gc_rem_peak = 0;
 /* Issue #755: bail out cleanly on OOM rather than returning NULL into a
    caller that would deref it next. */
 void sp_oom_die(void){fputs("unhandled exception: out of memory\n",stderr);exit(1);}
+
+/* The objects the heap holds, for GC.stat's heap_live_slots: the young
+   lists (per worker in the threaded runtime), the old list and the slab's
+   objects of either generation. Right after a collection it is the live
+   set; between collections it counts the garbage not swept yet too, as
+   CRuby's does. An O(n) walk, asked only by GC.stat. */
+static void sp_gc_count_obj_cb(void *hdr, void *arg){ (void)hdr; (*(long long *)arg)++; }
+long long sp_gc_live_objects(void){
+  long long n=0;
+#ifdef SP_THREADS
+  { int nw=sp_active_workers; if(nw<1)nw=1; if(nw>SP_MAX_WORKERS)nw=SP_MAX_WORKERS; for(int i=0;i<nw;i++)for(sp_gc_hdr*p=sp_gc_wslot[i].young;p;p=p->next)n++; }
+#else
+  for(sp_gc_hdr*p=sp_gc_heap;p;p=p->next)n++;
+#endif
+  for(sp_gc_hdr*p=sp_gc_old_heap;p;p=p->next)n++;
+  sp_slab_each_object(1,1,sp_gc_count_obj_cb,&n);
+  return n;
+}
 
 /* ---- GC verify (SPINEL_GC_VERIFY=1): a sorted snapshot of every
  * registered header, so the scan-time membership test is O(log n). ---- */
@@ -623,8 +641,8 @@ else{void*obj=*e;if(obj)sp_gc_mark(obj);}}
   sp_gc_root_phase=0;
   SP_GC_MK_PH(sp_gc_ph_mk_fibers);
   if(vd)sp_gc_dbg_phase="globals";if(sp_gc_mark_globals_hook)sp_gc_mark_globals_hook();
-  void (*mark_io_timeouts)(void) = SP_ATOMIC_LOAD(&sp_gc_mark_io_timeouts_hook, __ATOMIC_ACQUIRE);
-  if(mark_io_timeouts)mark_io_timeouts();
+  void (*mark_static_streams)(void) = SP_ATOMIC_LOAD(&sp_gc_mark_static_streams_hook, __ATOMIC_ACQUIRE);
+  if(mark_static_streams)mark_static_streams();
   sp_slab_mark_pinned();   /* frozen heap Strings outside the slab, which no bitmap pins */
 #ifdef SP_CEXT
   if(sp_gc_mark_cext_hook)sp_gc_mark_cext_hook();
@@ -1515,6 +1533,9 @@ void sp_gc_collect(void){
      a slab object promoted this cycle would go unrecorded: aging is off then. */
   if(sp_gc_age_on&&sp_slab_on>0)sp_gc_age_on=0;
   int full=(sp_gc_cycle%sp_gc_full_interval==0);sp_gc_cycle++;
+  /* GC.start asks for a full collection, as CRuby's does: an object promoted
+     while it was live, then dropped, is old, and a minor cycle keeps it */
+  if(sp_gc_full_next){ full=1; sp_gc_full_next=0; }
   /* Forced by growth rather than by the schedule: the old generation has
      outgrown what the last full found live in it. */
   int forced_full=0;

@@ -52,7 +52,7 @@ RBS_SRC      = $(wildcard $(RBS_DIR)/src/*.c) $(wildcard $(RBS_DIR)/src/util/*.c
 RBS_OBJ      = $(patsubst $(RBS_DIR)/src/%.c,build/rbs/%.o,$(RBS_SRC))
 RBS_LIB      = build/librbs.a
 
-.PHONY: ty-setter-check imemo-shadow-test imemo-shadow-corpus int-min-test all hooks share-strings-test line-map-check unit-stability-test incremental-test incremental-bench gate-tool-test regexp wasm-rt wasm-test rbs_extract rbs-test rbs-seed-test inline-rbs-test rbs-seed-extractor cident plan-check-test method-table-check timing-test shadow-check signal-default-test source-marker-test magic-comment-test repr-check-test run-scale-test gate-costs arm-check-test traits-check-test poly-cold-test bop-arity-check-test bop-callbacks-test bop-share-check-test share-spec-check bop-callbacks-check arity-spec-check runtime-gvar-check builtin-method-tables-check builtin-method-tables-regen value-edges-check value-edges-regen implied-calls-check implied-calls-regen implied-calls-test lower-rows-check node-kinds-check node-kinds-regen package-facts-check package-facts-regen value-pos-test re-lit-test reject-test cli-opts-test link-names-test reach-test defer-refusals-test check-stores-test backtrace-test gc-minor-test thread-puts-test ext-test ext-cruby-test alloc-report-test no-bigint-test no-alloc-report-test rubyspec rubyspec-gate spin-check \ repr-diff c-costs alloc-diff \
+.PHONY: entry-names-check ty-setter-check imemo-shadow-test imemo-shadow-corpus int-min-test all hooks share-strings-test line-map-check unit-stability-test incremental-test incremental-bench gate-tool-test regexp wasm-rt wasm-test rbs_extract rbs-test rbs-seed-test inline-rbs-test rbs-seed-extractor cident plan-check-test method-table-check timing-test shadow-check signal-default-test source-marker-test magic-comment-test repr-check-test run-scale-test gate-costs arm-check-test traits-check-test poly-cold-test bop-arity-check-test bop-callbacks-test bop-share-check-test share-spec-check bop-callbacks-check arity-spec-check runtime-gvar-check builtin-method-tables-check builtin-method-tables-regen value-edges-check value-edges-regen implied-calls-check implied-calls-regen implied-calls-test lower-rows-check node-kinds-check node-kinds-regen package-facts-check package-facts-regen value-pos-test re-lit-test reject-test cli-opts-test link-names-test reach-test defer-refusals-test check-stores-test backtrace-test gc-minor-test thread-puts-test ext-test ext-cruby-test alloc-report-test no-bigint-test no-alloc-report-test rubyspec rubyspec-gate spin-check \ repr-diff c-costs alloc-diff \
         test test-run clean-test-results regen-rbs-expected \
         regen-expected regen-expected-err bench optcarrot gate gate-full check gate-legs gate-test gate-bench gc-phases-test gc-stress-test threaded-render-test gc-locality-test test-corpus test-corpus-summary \
         gate-optcarrot rubyboy gate-rubyboy scale-test clean install uninstall deps tools
@@ -187,6 +187,9 @@ endif
 ifeq ($(FFI_AVAILABLE),yes)
 BUNDLED_NATIVE_OBJS += packages/ffi/sp_ffi.o
 endif
+# A package the target has no such facility for (pty on Windows, as CRuby
+# builds no ext/pty there): PLATFORM_NO_PKG_OBJS, set by win32.mk.
+BUNDLED_NATIVE_OBJS := $(filter-out $(PLATFORM_NO_PKG_OBJS),$(BUNDLED_NATIVE_OBJS))
 # Threaded variant of every bundled package object. A program that uses threads
 # compiles its TU (and links the runtime archive) with -DSP_THREADS, which makes
 # the runtime's per-worker globals thread-local; a package object built without
@@ -663,10 +666,10 @@ build/%.o: lib/%.c $(RT_HDRS)
 # spinel/runtime.h ABI (-Ilib) plus its own package headers. BUNDLED_NATIVE_OBJS
 # is defined near the top (before `all`, whose prereqs expand at parse time).
 packages/json/sp_json.o: packages/json/sp_json.c packages/json/sp_json.h \
-                         lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+                         lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) -Ilib -Ipackages/json packages/json/sp_json.c -o $@
 packages/json/sp_json_mt.o: packages/json/sp_json.c packages/json/sp_json.h \
-                            lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+                            lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) -Ilib -Ipackages/json packages/json/sp_json.c -o $@
 
 # openssl is glue over the SYSTEM libssl, so unlike the other package C it is
@@ -675,82 +678,82 @@ packages/json/sp_json_mt.o: packages/json/sp_json.c packages/json/sp_json.h \
 # missing, leaving `require "openssl"` an unsatisfiable require rather than a
 # link error. -lssl/-lcrypto reach the link line through openssl.rb's ffi_lib,
 # which is parsed only when a program requires it.
-packages/openssl/sp_openssl.o: packages/openssl/sp_openssl.c \
-                               lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+packages/openssl/sp_openssl.o: packages/openssl/sp_openssl.c packages/openssl/sp_asn1.h \
+                               lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(OPENSSL_CPPFLAGS) -Ilib -Ipackages/openssl packages/openssl/sp_openssl.c -o $@
-packages/openssl/sp_openssl_mt.o: packages/openssl/sp_openssl.c \
-                                  lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+packages/openssl/sp_openssl_mt.o: packages/openssl/sp_openssl.c packages/openssl/sp_asn1.h \
+                                  lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) $(OPENSSL_CPPFLAGS) -Ilib -Ipackages/openssl packages/openssl/sp_openssl.c -o $@
 
 packages/ffi/sp_ffi.o: packages/ffi/sp_ffi.c \
-                       lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+                       lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(LIBFFI_CPPFLAGS) -Ilib -Ipackages/ffi packages/ffi/sp_ffi.c -o $@
 packages/ffi/sp_ffi_mt.o: packages/ffi/sp_ffi.c \
-                          lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+                          lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) $(LIBFFI_CPPFLAGS) -Ilib -Ipackages/ffi packages/ffi/sp_ffi.c -o $@
 
 # stringio is a native-bound spin package (Path B typed object): the struct,
 # every method, and the header live in the package; the compiler knows it only
 # through the native_* declarations in stringio.rb.
 packages/stringio/sp_stringio.o: packages/stringio/sp_stringio.c packages/stringio/sp_stringio.h \
-                                 lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+                                 lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) -Ilib -Ipackages/stringio packages/stringio/sp_stringio.c -o $@
 packages/stringio/sp_stringio_mt.o: packages/stringio/sp_stringio.c packages/stringio/sp_stringio.h \
-                                    lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+                                    lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) -Ilib -Ipackages/stringio packages/stringio/sp_stringio.c -o $@
 
 # strscan is likewise a native-bound spin package; its regex matching links
 # against the runtime archive's re_exec (a forward extern in the package C).
 packages/strscan/sp_strscan.o: packages/strscan/sp_strscan.c \
-                               lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+                               lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) -Ilib packages/strscan/sp_strscan.c -o $@
 packages/strscan/sp_strscan_mt.o: packages/strscan/sp_strscan.c \
-                                  lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+                                  lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) -Ilib packages/strscan/sp_strscan.c -o $@
 
 # base64 carries its whole implementation; digest carries none (it binds the
 # runtime's vendored sp_crypto symbols and has no object of its own).
 packages/base64/sp_base64.o: packages/base64/sp_base64.c \
-                             lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+                             lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) -Ilib packages/base64/sp_base64.c -o $@
 packages/base64/sp_base64_mt.o: packages/base64/sp_base64.c \
-                                lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+                                lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) -Ilib packages/base64/sp_base64.c -o $@
 
 # tmpdir: Dir.tmpdir and Dir.mktmpdir, the system temp directory and a
 # unique-directory creator. Pure C, no struct.
 packages/tmpdir/sp_tmpdir.o: packages/tmpdir/sp_tmpdir.c \
-                             lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+                             lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) -Ilib packages/tmpdir/sp_tmpdir.c -o $@
 packages/tmpdir/sp_tmpdir_mt.o: packages/tmpdir/sp_tmpdir.c \
-                                lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+                                lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) -Ilib packages/tmpdir/sp_tmpdir.c -o $@
 
 # etc: the user and group databases, each entry as one string the Ruby
 # splits. Pure C, no struct.
 packages/etc/sp_etc.o: packages/etc/sp_etc.c \
-                       lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+                       lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) -Ilib packages/etc/sp_etc.c -o $@
 packages/etc/sp_etc_mt.o: packages/etc/sp_etc.c \
-                          lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+                          lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) -Ilib packages/etc/sp_etc.c -o $@
 
 # syslog: the four calls of syslog(3) and the LOG_ constants of the
 # platform. Pure C, no struct.
 packages/syslog/sp_syslog.o: packages/syslog/sp_syslog.c \
-                             lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+                             lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) -Ilib packages/syslog/sp_syslog.c -o $@
 packages/syslog/sp_syslog_mt.o: packages/syslog/sp_syslog.c \
-                                lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+                                lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) -Ilib packages/syslog/sp_syslog.c -o $@
 
 # pty: PTY.spawn, a child on a new pseudo-terminal (posix_openpt + fork).
 # Pure C over libc; no wasm32-wasi object, since WASI has no fork.
 packages/pty/sp_pty.o: packages/pty/sp_pty.c \
-                       lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+                       lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) -Ilib packages/pty/sp_pty.c -o $@
 packages/pty/sp_pty_mt.o: packages/pty/sp_pty.c \
-                          lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+                          lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) -Ilib packages/pty/sp_pty.c -o $@
 
 # zlib: DEFLATE, zlib and gzip in the package's own C. No system libz and so
@@ -758,10 +761,10 @@ packages/pty/sp_pty_mt.o: packages/pty/sp_pty.c \
 # box without the -dev package -- would drop the package and give a green
 # `make test` that never ran it. Pure C, no struct.
 packages/zlib/sp_zlib.o: packages/zlib/sp_zlib.c \
-                         lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+                         lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) -Ilib packages/zlib/sp_zlib.c -o $@
 packages/zlib/sp_zlib_mt.o: packages/zlib/sp_zlib.c \
-                            lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+                            lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) -Ilib packages/zlib/sp_zlib.c -o $@
 
 build/sp_cold.o: lib/sp_cold.c $(RT_HDRS)
@@ -910,6 +913,78 @@ $(SP_RT_NOGC_LIB): $(patsubst lib/regexp/%.c,build/nogc/regexp/%.o,$(RE_SRC)) $(
 $(SP_RT_MT_NOGC_LIB): $(patsubst lib/regexp/%.c,build/mt-nogc/regexp/%.o,$(RE_SRC)) $(addprefix build/mt-nogc/,$(addsuffix .o,$(RT_MEMBERS) sp_gc_none)) $(PLATFORM_MT_OBJ)
 	$(AR_DET) ar rcs $@ $^
 
+# ---- Position-independent runtime (-fPIC) ----
+# The same sources, compiled -fPIC, for a library (--ext-init/--ext-entry)
+# a host loads as a shared object: a Python ctypes, Swift or C# host, or a
+# C one through dlopen. The regular archive is built for an executable, and
+# `cc -shared` refuses its relocations ("relocation R_X86_64_PC32 against
+# symbol ... can not be used when making a shared object; recompile with
+# -fPIC"). Opt-in, as the C extension runtime is: `make runtime-pic` builds
+# it and the threaded one below.
+SP_RT_PIC_LIB = lib/libspinel_rt_pic.a
+PIC_DEF = -fPIC
+
+build/pic/regexp/%.o: lib/regexp/%.c $(RE_HDRS)
+	@mkdir -p $(@D)
+	$(CC) -c $(COPT) $(SEC_FLAGS) $(RE_CASE_FLAGS) $(PIC_DEF) -Ilib/regexp -Ilib/regexp/shim $< -o $@
+
+build/pic/%.o: lib/%.c $(RT_HDRS)
+	@mkdir -p $(@D)
+	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PIC_DEF) -Ilib -Ilib/regexp -Ilib/regexp/shim $< -o $@
+
+$(SP_RT_PIC_LIB): $(patsubst lib/regexp/%.c,build/pic/regexp/%.o,$(RE_SRC)) $(addprefix build/pic/,$(addsuffix .o,$(RT_MEMBERS))) $(PLATFORM_OBJ)
+	$(AR_DET) ar rcs $@ $^
+
+.PHONY: runtime-pic
+runtime-pic: $(SP_RT_PIC_LIB)
+
+# The threaded runtime the same way, and a library that uses threads is
+# compiled with -DSP_THREADS -fPIC to link it. Not -ftls-model=initial-exec,
+# as MT_DEF has it: an object a host dlopens gets only the loader's small
+# static TLS surplus for that model, and this runtime's TLS is about 600 KB
+# a thread (sp_gc_roots alone is 512 KB). The general-dynamic model -fPIC
+# implies costs a call to __tls_get_addr per function that reads TLS: an
+# allocating entry ran about 25% more instructions than the same kernel in
+# an executable. TLSDESC (-mtls-dialect=gnu2) ran more still on a module
+# loaded with dlopen, and hidden TLS symbols saved 3%. MT_PIC_TLS passes a
+# dialect of one's own.
+SP_RT_MT_PIC_LIB = lib/libspinel_rt_mt_pic.a
+MT_PIC_TLS ?=
+MT_PIC_DEF = -DSP_THREADS -fPIC $(MT_PIC_TLS)
+
+build/mt-pic/regexp/%.o: lib/regexp/%.c $(RE_HDRS)
+	@mkdir -p $(@D)
+	$(CC) -c $(COPT) $(SEC_FLAGS) $(RE_CASE_FLAGS) $(MT_PIC_DEF) -Ilib/regexp -Ilib/regexp/shim $< -o $@
+
+build/mt-pic/%.o: lib/%.c $(RT_HDRS)
+	@mkdir -p $(@D)
+	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(MT_PIC_DEF) -Ilib -Ilib/regexp -Ilib/regexp/shim $< -o $@
+
+$(SP_RT_MT_PIC_LIB): $(patsubst lib/regexp/%.c,build/mt-pic/regexp/%.o,$(RE_SRC)) $(addprefix build/mt-pic/,$(addsuffix .o,$(RT_MEMBERS))) $(PLATFORM_MT_OBJ)
+	$(AR_DET) ar rcs $@ $^
+
+runtime-pic: $(SP_RT_MT_PIC_LIB)
+
+# The bundled packages' objects the same two ways: a library that requires
+# one names packages/<p>/sp_<p>.o in its C (SPINEL_LINK_OBJ), and a shared
+# object links packages/<p>/sp_<p>_pic.o in its place, or sp_<p>_mt_pic.o
+# when it uses threads. Each is compiled as the package's own rule compiles
+# it (above), with the package's flags from PKG_PIC_FLAGS_<p>.
+PKG_PIC_FLAGS_openssl = $(OPENSSL_CPPFLAGS)
+PKG_PIC_FLAGS_ffi = $(LIBFFI_CPPFLAGS)
+PKG_PIC_HDRS = lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
+define PKG_PIC_RULES
+packages/$(1)/sp_$(1)_pic.o: packages/$(1)/sp_$(1).c $$(wildcard packages/$(1)/*.h) $$(PKG_PIC_HDRS)
+	$$(CC) -c $$(COPT) -Wno-all $$(SEC_FLAGS) $$(PIC_DEF) $$(PKG_PIC_FLAGS_$(1)) -Ilib -Ipackages/$(1) $$< -o $$@
+packages/$(1)/sp_$(1)_mt_pic.o: packages/$(1)/sp_$(1).c $$(wildcard packages/$(1)/*.h) $$(PKG_PIC_HDRS)
+	$$(CC) -c $$(COPT) -Wno-all $$(SEC_FLAGS) $$(MT_PIC_DEF) $$(PKG_PIC_FLAGS_$(1)) -Ilib -Ipackages/$(1) $$< -o $$@
+endef
+$(foreach p,$(patsubst packages/%/,%,$(dir $(BUNDLED_NATIVE_OBJS))),$(eval $(call PKG_PIC_RULES,$(p))))
+BUNDLED_NATIVE_PIC_OBJS = $(BUNDLED_NATIVE_OBJS:.o=_pic.o)
+BUNDLED_NATIVE_MT_PIC_OBJS = $(BUNDLED_NATIVE_OBJS:.o=_mt_pic.o)
+
+runtime-pic: $(BUNDLED_NATIVE_PIC_OBJS) $(BUNDLED_NATIVE_MT_PIC_OBJS)
+
 # ---- ThreadSanitizer build of the threaded runtime (Phase 1 validation) ----
 # The gate links a threaded test against the mt archive, as the driver does,
 # but uninstrumented, so a race shows only when it corrupts the output. This
@@ -1040,7 +1115,7 @@ $(SP_RT_WASI_LIB): $(RE_WASI_OBJ) $(WASI_SHIM_OBJ) $(addprefix build/wasm32-wasi
 	rm -f $@ && $(WASI_AR) rcs $@ $^
 
 BUNDLED_NATIVE_WASI_OBJS = $(patsubst %.o,%_wasi.o,$(filter-out packages/openssl/% packages/ffi/% packages/pty/%,$(BUNDLED_NATIVE_OBJS)))
-packages/%_wasi.o: packages/%.c lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h $(WASI_SHIM_HDRS)
+packages/%_wasi.o: packages/%.c lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h $(WASI_SHIM_HDRS)
 	$(WASI_CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(WASI_CFLAGS) -Ilib -I$(@D) $< -o $@
 
 # --exceptions=abort (#8401): the same archive with no setjmp/longjmp, for a
@@ -1111,7 +1186,7 @@ $(SP_RT_WASI_NOEXC_NOGC_LIB): $(patsubst lib/regexp/%.c,build/wasm32-wasi-noexc-
 	rm -f $@ && $(WASI_AR) rcs $@ $^
 
 BUNDLED_NATIVE_WASI_NOEXC_OBJS = $(patsubst %_wasi.o,%_wasi_noexc.o,$(BUNDLED_NATIVE_WASI_OBJS))
-packages/%_wasi_noexc.o: packages/%.c lib/spinel/runtime.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_setjmp.h $(WASI_SHIM_HDRS)
+packages/%_wasi_noexc.o: packages/%.c lib/spinel/runtime.h lib/sp_string.h lib/sp_dtoa.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_setjmp.h $(WASI_SHIM_HDRS)
 	$(WASI_CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(WASI_NOEXC_CFLAGS) -Ilib -I$(@D) $< -o $@
 
 wasm-rt: $(SP_RT_WASI_LIB) $(BUNDLED_NATIVE_WASI_OBJS) $(SP_RT_WASI_NOEXC_LIB) $(BUNDLED_NATIVE_WASI_NOEXC_OBJS) $(SP_RT_WASI_NOGC_LIB) $(SP_RT_WASI_NOEXC_NOGC_LIB)
@@ -1311,7 +1386,11 @@ endif
 # float_to_r_bounded and rational_string_overflow pin the closest Rational
 # that fits and the RangeError a Rational past the word answers outside
 # promote, where it is a big Rational (promote_rational_bignum).
-RAISE_MODE_PINS := test/float_to_r_bounded.rb test/rational_string_overflow.rb test/int_overflow_raises.rb test/int_overflow_op_assign.rb test/poly_int_overflow_raises.rb test/str_to_i_overflow.rb test/string_to_i_overflow_raises.rb test/bounded_counter_unchecked_add.rb test/float_to_int_out_of_range.rb test/bigrational_to_i_out_of_range.rb test/float_to_int_boundary.rb test/poly_call_legacy_abi_gate.rb test/poly_call_fast_abi_gate.rb test/poly_method_return_kinds.rb test/int_min_overflow_raises.rb test/masgn_boxed_ivar_slot_mismatch.rb test/array_index_sum_overflow.rb
+# literal_array_hash_capacity counts the bytes a three-Integer Array literal
+# keeps alive, as the typed Integer Array it is outside promote; promote boxes
+# its elements, and a boxed Array literal still takes the sixteen-element
+# buffer an empty one does.
+RAISE_MODE_PINS := test/literal_array_hash_capacity.rb test/float_to_r_bounded.rb test/rational_string_overflow.rb test/int_overflow_raises.rb test/int_overflow_op_assign.rb test/poly_int_overflow_raises.rb test/str_to_i_overflow.rb test/string_to_i_overflow_raises.rb test/bounded_counter_unchecked_add.rb test/float_to_int_out_of_range.rb test/bigrational_to_i_out_of_range.rb test/float_to_int_boundary.rb test/poly_call_legacy_abi_gate.rb test/poly_call_fast_abi_gate.rb test/poly_method_return_kinds.rb test/int_min_overflow_raises.rb test/masgn_boxed_ivar_slot_mismatch.rb test/array_index_sum_overflow.rb
 # Tests a promote gap fails, out of the promote lane until it is fixed.
 # step_boxed_float_bound: under promote every Integer local is boxed, so a
 # boxed limit or step is not known to be a Float or Rational, and an
@@ -1749,8 +1828,11 @@ test-corpus-summary: test-corpus-results
 # entries, and a raise caught through the exported try helper -- and a kernel
 # whose entries start and join threads after an init that started some, and
 # one whose at_exit hooks run when the host exits, not as its init returns,
-# and one whose entry calls a Struct's `new` the load redefined.
-ext-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SPINEL_TIMEOUT)
+# and one whose entry calls a Struct's `new` the load redefined, a typed and
+# an untyped entry that `new` one class compile, so do a typed entry and an
+# --ext-class table that `new` one class, and an
+# --ext-entry list longer than 2048 bytes exports every method it names.
+ext-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SP_RT_PIC_LIB) $(SP_RT_MT_PIC_LIB) $(BUNDLED_NATIVE_PIC_OBJS) $(SPINEL_TIMEOUT) $(PLATFORM_OBJ)
 	@tmp=$$(mktemp -d /tmp/spinel-ext.XXXXXX); ok=1; \
 	$(SPINEL) test/ext/kernel.rb -c --no-line-map \
 	  --ext-init Init_ext_kernel \
@@ -1765,7 +1847,7 @@ ext-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SPINEL_TIMEOUT)
 	  grep -q "toplevel ran" "$$tmp/k.c" || { echo "ext-test: FAIL (toplevel missing from init)"; ok=0; }; \
 	fi; \
 	if [ $$ok -eq 1 ]; then \
-	  if $(CC) -O1 -w -Ilib -I"$$tmp" test/ext/host.c "$$tmp/k.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/host" 2>"$$tmp/cc.err"; then \
+	  if $(CC) -O1 -w $(PLATFORM_FLAGS) -Ilib -I"$$tmp" test/ext/host.c "$$tmp/k.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/host" 2>"$$tmp/cc.err"; then \
 	    "$$tmp/host" > "$$tmp/out" 2>&1; rc=$$?; \
 	    cmp -s "$$tmp/out" test/ext/expected && [ $$rc -eq 0 ] || \
 	      { echo "ext-test: FAIL (host output mismatch, or status $$rc)"; diff -u test/ext/expected "$$tmp/out" || true; ok=0; }; \
@@ -1775,7 +1857,7 @@ ext-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SPINEL_TIMEOUT)
 	  if ! $(SPINEL) test/ext/threads.rb -c --no-line-map --ext-init Init_ext_threads \
 	      --ext-entry ExtThreads.par,ExtThreads.bg -o "$$tmp/t.c" >/dev/null 2>&1; then \
 	    echo "ext-test: FAIL (threads emission)"; ok=0; \
-	  elif $(CC) -O1 -w $(MT_DEF) -Ilib -I"$$tmp" test/ext/threads_host.c "$$tmp/t.c" $(SP_RT_MT_LIB) $(LDFLAGS) -lm -lpthread -o "$$tmp/thost" 2>"$$tmp/cc.err"; then \
+	  elif $(CC) -O1 -w $(PLATFORM_FLAGS) $(MT_DEF) -Ilib -I"$$tmp" test/ext/threads_host.c "$$tmp/t.c" $(SP_RT_MT_LIB) $(LDFLAGS) -lm -lpthread -o "$$tmp/thost" 2>"$$tmp/cc.err"; then \
 	    $(TIMEOUT10) "$$tmp/thost" > "$$tmp/out" 2>&1; rc=$$?; \
 	    printf '60\n150\n1\n' | cmp -s - "$$tmp/out" && [ $$rc -eq 0 ] || \
 	      { echo "ext-test: FAIL (threads host output mismatch, or it hung, or status $$rc)"; cat "$$tmp/out"; ok=0; }; \
@@ -1785,27 +1867,92 @@ ext-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SPINEL_TIMEOUT)
 	  if ! $(SPINEL) test/ext/at_exit.rb -c --no-line-map --ext-init Init_ext_at_exit \
 	      --ext-entry ExtAtExit.go -o "$$tmp/a.c" >/dev/null 2>&1; then \
 	    echo "ext-test: FAIL (at_exit emission)"; ok=0; \
-	  elif $(CC) -O1 -w -Ilib -I"$$tmp" test/ext/at_exit_host.c "$$tmp/a.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/ahost" 2>"$$tmp/cc.err"; then \
+	  elif $(CC) -O1 -w $(PLATFORM_FLAGS) -Ilib -I"$$tmp" test/ext/at_exit_host.c "$$tmp/a.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/ahost" 2>"$$tmp/cc.err"; then \
 	    "$$tmp/ahost" > "$$tmp/out" 2>&1; rc=$$?; \
 	    printf 'init returned\nentry 41\n42\nmain returns\nentry hook 41\ntoplevel hook\n' | cmp -s - "$$tmp/out" && [ $$rc -eq 3 ] || \
 	      { echo "ext-test: FAIL (at_exit hooks not run at host exit, or status $$rc is not the host's 3)"; cat "$$tmp/out"; ok=0; }; \
 	  else echo "ext-test: FAIL (at_exit host C did not compile)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
 	fi; \
 	if [ $$ok -eq 1 ]; then \
+	  if ! $(SPINEL) test/ext/pic.rb -c --no-line-map --ext-init Init_ext_pic \
+	      --ext-entry ExtPic.triple,ExtPic.label,ExtPic.must_pos -o "$$tmp/p.c" >/dev/null 2>&1; then \
+	    echo "ext-test: FAIL (pic emission)"; ok=0; \
+	  elif ! $(CC) -fPIC -shared -O1 -w $(PLATFORM_FLAGS) -Ilib -I"$$tmp" "$$tmp/p.c" $(SP_RT_PIC_LIB) $(LDFLAGS) -lm -o "$$tmp/libpic.so" 2>"$$tmp/cc.err"; then \
+	    echo "ext-test: FAIL (the library did not link as a shared object over $(SP_RT_PIC_LIB))"; sed -n 1,6p "$$tmp/cc.err"; ok=0; \
+	  elif $(CC) -O1 -w $(PLATFORM_FLAGS) test/ext/pic_host.c $(PLATFORM_OBJ) $(LDFLAGS) -ldl -o "$$tmp/phost" 2>"$$tmp/cc.err"; then \
+	    "$$tmp/phost" "$$tmp/libpic.so" > "$$tmp/out" 2>&1; rc=$$?; \
+	    printf '42\np0,p1,p2\np0,p1,p2,p3,p4\nraised ArgumentError: not positive: -3\nok 7\n' | cmp -s - "$$tmp/out" && [ $$rc -eq 0 ] || \
+	      { echo "ext-test: FAIL (the shared object's host output mismatch, or status $$rc)"; cat "$$tmp/out"; ok=0; }; \
+	  else echo "ext-test: FAIL (pic host C did not compile)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
+	fi; \
+	if [ $$ok -eq 1 ]; then \
+	  if ! $(SPINEL) test/ext/threads.rb -c --no-line-map --ext-init Init_ext_threads \
+	      --ext-entry ExtThreads.par,ExtThreads.bg -o "$$tmp/tp.c" >/dev/null 2>&1; then \
+	    echo "ext-test: FAIL (threads emission for a shared object)"; ok=0; \
+	  elif ! $(CC) -DSP_THREADS -fPIC -shared -O1 -w $(PLATFORM_FLAGS) -Ilib -I"$$tmp" "$$tmp/tp.c" $(SP_RT_MT_PIC_LIB) $(LDFLAGS) -lm -lpthread -o "$$tmp/libtp.so" 2>"$$tmp/cc.err"; then \
+	    echo "ext-test: FAIL (the threaded library did not link as a shared object over $(SP_RT_MT_PIC_LIB))"; sed -n 1,6p "$$tmp/cc.err"; ok=0; \
+	  elif $(CC) -O1 -w $(PLATFORM_FLAGS) test/ext/threads_pic_host.c $(PLATFORM_OBJ) $(LDFLAGS) -ldl -o "$$tmp/tphost" 2>"$$tmp/cc.err"; then \
+	    $(TIMEOUT10) "$$tmp/tphost" "$$tmp/libtp.so" > "$$tmp/out" 2>&1; rc=$$?; \
+	    printf '60\n150\n1\n' | cmp -s - "$$tmp/out" && [ $$rc -eq 0 ] || \
+	      { echo "ext-test: FAIL (the threaded shared object's host output mismatch, or it hung, or status $$rc)"; cat "$$tmp/out"; ok=0; }; \
+	  else echo "ext-test: FAIL (threads pic host C did not compile)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
+	fi; \
+	if [ $$ok -eq 1 ]; then \
+	  if ! $(SPINEL) test/ext/pic_pkg.rb -c --no-line-map --ext-init Init_ext_pic_pkg \
+	      --ext-entry ExtPicPkg.dump,ExtPicPkg.sum -o "$$tmp/q.c" >/dev/null 2>&1; then \
+	    echo "ext-test: FAIL (pic_pkg emission)"; ok=0; \
+	  else \
+	    objs=$$(sed -n 's|^/\* SPINEL_LINK_OBJ: \(.*\)\.o \*/$$|\1_pic.o|p' "$$tmp/q.c"); \
+	    if [ -z "$$objs" ]; then echo "ext-test: FAIL (pic_pkg's C names no package object)"; ok=0; \
+	    elif ! $(CC) -fPIC -shared -O1 -w $(PLATFORM_FLAGS) -Ilib -I"$$tmp" "$$tmp/q.c" $$objs $(SP_RT_PIC_LIB) $(LDFLAGS) -lm -o "$$tmp/libq.so" 2>"$$tmp/cc.err"; then \
+	      echo "ext-test: FAIL (a library requiring a package did not link as a shared object over $$objs)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; \
+	    elif $(CC) -O1 -w $(PLATFORM_FLAGS) test/ext/pic_pkg_host.c $(PLATFORM_OBJ) $(LDFLAGS) -ldl -o "$$tmp/qhost" 2>"$$tmp/cc.err"; then \
+	      "$$tmp/qhost" "$$tmp/libq.so" > "$$tmp/out" 2>&1; rc=$$?; \
+	      printf '{"n":7,"list":[1,2,3]}\n16\n' | cmp -s - "$$tmp/out" && [ $$rc -eq 0 ] || \
+	        { echo "ext-test: FAIL (the package's shared object host output mismatch, or status $$rc)"; cat "$$tmp/out"; ok=0; }; \
+	    else echo "ext-test: FAIL (pic_pkg host C did not compile)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
+	  fi; \
+	fi; \
+	if [ $$ok -eq 1 ]; then \
 	  if ! $(SPINEL) test/ext/late_new.rb -c --no-line-map --ext-init Init_ext_late_new \
 	      --ext-entry ExtLateNew.e -o "$$tmp/l.c" >/dev/null 2>&1; then \
 	    echo "ext-test: FAIL (late_new emission)"; ok=0; \
-	  elif $(CC) -O1 -w -Ilib -I"$$tmp" test/ext/late_new_host.c "$$tmp/l.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/lhost" 2>"$$tmp/cc.err"; then \
+	  elif $(CC) -O1 -w $(PLATFORM_FLAGS) -Ilib -I"$$tmp" test/ext/late_new_host.c "$$tmp/l.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/lhost" 2>"$$tmp/cc.err"; then \
 	    "$$tmp/lhost" > "$$tmp/out" 2>&1; rc=$$?; \
 	    printf '2\n3\n' | cmp -s - "$$tmp/out" && [ $$rc -eq 0 ] || \
 	      { echo "ext-test: FAIL (late_new host output mismatch, or status $$rc)"; cat "$$tmp/out"; ok=0; }; \
 	  else echo "ext-test: FAIL (late_new host C did not compile)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
 	fi; \
 	if [ $$ok -eq 1 ]; then \
+	  if ! $(SPINEL) test/ext/rbs_object_array.rb -c --no-line-map --ext-init Init_ext_geo \
+	      --ext-entry ExtGeo.pts,ExtGeo.length -o "$$tmp/g.c" >"$$tmp/g.out" 2>&1; then \
+	    echo "ext-test: FAIL (rbs_object_array emission)"; ok=0; \
+	  elif grep -q "not applied" "$$tmp/g.out"; then \
+	    echo "ext-test: FAIL (a signature naming Array[Point] was not applied)"; grep "not applied" "$$tmp/g.out" | head -2; ok=0; \
+	  elif ! grep -Fq 'sp_ExtGeo_s_length(sp_PtrArray * lv_pts)' "$$tmp/g.h" || ! grep -Fq 'sp_ExtGeo_s_pts(sp_int lv_n)' "$$tmp/g.h"; then \
+	    echo "ext-test: FAIL (an entry's Array[Point] parameter is no sp_PtrArray, or its Integer no sp_int)"; grep 'sp_ExtGeo_s_' "$$tmp/g.h"; ok=0; \
+	  elif $(CC) -O1 -w $(PLATFORM_FLAGS) -Ilib -I"$$tmp" test/ext/rbs_object_array_host.c "$$tmp/g.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/ghost" 2>"$$tmp/cc.err"; then \
+	    "$$tmp/ghost" > "$$tmp/out" 2>&1; rc=$$?; \
+	    printf '15.0\n' | cmp -s - "$$tmp/out" && [ $$rc -eq 0 ] || \
+	      { echo "ext-test: FAIL (rbs_object_array host output mismatch, or status $$rc)"; cat "$$tmp/out"; ok=0; }; \
+	  else echo "ext-test: FAIL (rbs_object_array host C did not compile)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
+	fi; \
+	if [ $$ok -eq 1 ]; then \
+	  if ! $(SPINEL) test/ext/field_elems.rb -c --no-line-map --ext-init Init_ext_field_elems \
+	      --ext-entry ExtFieldElems.grid,ExtFieldElems.sum_x,ExtFieldElems.box,ExtFieldElems.count_done \
+	      -o "$$tmp/f.c" >/dev/null 2>&1; then \
+	    echo "ext-test: FAIL (field_elems emission)"; ok=0; \
+	  elif $(CC) -O1 -w $(PLATFORM_FLAGS) -Ilib -I"$$tmp" test/ext/field_elems_host.c "$$tmp/f.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/fhost" 2>"$$tmp/cc.err"; then \
+	    "$$tmp/fhost" > "$$tmp/out" 2>&1; rc=$$?; \
+	    printf '4\n2\n' | cmp -s - "$$tmp/out" && [ $$rc -eq 0 ] || \
+	      { echo "ext-test: FAIL (field_elems host output mismatch, or status $$rc)"; cat "$$tmp/out"; ok=0; }; \
+	  else echo "ext-test: FAIL (field_elems host C did not compile)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
+	fi; \
+	if [ $$ok -eq 1 ]; then \
 	  if ! $(SPINEL) test/ext/methods.rb -c --no-line-map --ext-init Init_ext_methods \
 	      --ext-entry ExtMethods.make,ExtMethods.loud --ext-class all -o "$$tmp/m.c" >/dev/null 2>&1; then \
 	    echo "ext-test: FAIL (--ext-class emission)"; ok=0; \
-	  elif $(CC) -O1 -w -Ilib -I"$$tmp" test/ext/methods_host.c "$$tmp/m.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/mhost" 2>"$$tmp/cc.err"; then \
+	  elif $(CC) -O1 -w $(PLATFORM_FLAGS) -Ilib -I"$$tmp" test/ext/methods_host.c "$$tmp/m.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/mhost" 2>"$$tmp/cc.err"; then \
 	    "$$tmp/mhost" > "$$tmp/out" 2>&1; rc=$$?; \
 	    cmp -s "$$tmp/out" test/ext/expected_methods && [ $$rc -eq 0 ] || { echo "ext-test: FAIL (--ext-class host output mismatch, or status $$rc)"; diff -u test/ext/expected_methods "$$tmp/out" || true; ok=0; }; \
 	  else echo "ext-test: FAIL (--ext-class host C did not compile)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
@@ -1814,19 +1961,72 @@ ext-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SPINEL_TIMEOUT)
 	  if ! $(SPINEL) test/ext/methods_sub.rb -c --no-line-map --ext-init Init_ext_methods_sub \
 	      --ext-entry ExtSub.make --ext-class ExtSub::Sub -o "$$tmp/m.c" >/dev/null 2>&1; then \
 	    echo "ext-test: FAIL (--ext-class subclass emission)"; ok=0; \
-	  elif $(CC) -O1 -w -Ilib -I"$$tmp" test/ext/methods_sub_host.c "$$tmp/m.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/mshost" 2>"$$tmp/cc.err"; then \
+	  elif $(CC) -O1 -w $(PLATFORM_FLAGS) -Ilib -I"$$tmp" test/ext/methods_sub_host.c "$$tmp/m.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/mshost" 2>"$$tmp/cc.err"; then \
 	    "$$tmp/mshost" > "$$tmp/out" 2>&1; rc=$$?; \
 	    cmp -s "$$tmp/out" test/ext/expected_methods_sub && [ $$rc -eq 0 ] || { echo "ext-test: FAIL (--ext-class subclass host output mismatch, or status $$rc)"; diff -u test/ext/expected_methods_sub "$$tmp/out" || true; ok=0; }; \
 	  else echo "ext-test: FAIL (--ext-class subclass host C did not compile)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
 	fi; \
 	if [ $$ok -eq 1 ]; then \
+	  if ! $(SPINEL) test/ext/classes.rb -c --no-line-map --ext-init Init_ext_classes \
+	      --ext-entry ExtClasses.new_list,ExtClasses.add,ExtClasses.pt,ExtClasses.oops -o "$$tmp/c.c" >/dev/null 2>&1; then \
+	    echo "ext-test: FAIL (class-typed entries emission)"; ok=0; \
+	  elif $(CC) -O1 -w $(PLATFORM_FLAGS) -Ilib -I"$$tmp" test/ext/classes_host.c "$$tmp/c.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/chost" 2>"$$tmp/cc.err"; then \
+	    "$$tmp/chost" > "$$tmp/out" 2>&1; rc=$$?; \
+	    printf '2\n3 6\nOops bad\n' | cmp -s - "$$tmp/out" && [ $$rc -eq 0 ] || \
+	      { echo "ext-test: FAIL (class-typed entries host output mismatch, or status $$rc)"; cat "$$tmp/out"; ok=0; }; \
+	  else echo "ext-test: FAIL (class-typed entries host C did not compile against the header alone)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
+	fi; \
+	if [ $$ok -eq 1 ]; then \
 	  if ! $(SPINEL) test/ext/methods_opt.rb -c --no-line-map --ext-init Init_ext_methods_opt \
 	      --ext-entry ExtOpt.make --ext-class ExtOpt::Rel -o "$$tmp/m.c" >/dev/null 2>&1; then \
 	    echo "ext-test: FAIL (--ext-class optional parameter emission)"; ok=0; \
-	  elif $(CC) -O1 -w -Ilib -I"$$tmp" test/ext/methods_opt_host.c "$$tmp/m.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/mohost" 2>"$$tmp/cc.err"; then \
+	  elif $(CC) -O1 -w $(PLATFORM_FLAGS) -Ilib -I"$$tmp" test/ext/methods_opt_host.c "$$tmp/m.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/mohost" 2>"$$tmp/cc.err"; then \
 	    "$$tmp/mohost" > "$$tmp/out" 2>&1; rc=$$?; \
 	    cmp -s "$$tmp/out" test/ext/expected_methods_opt && [ $$rc -eq 0 ] || { echo "ext-test: FAIL (--ext-class optional parameter host output mismatch, or status $$rc)"; diff -u test/ext/expected_methods_opt "$$tmp/out" || true; ok=0; }; \
 	  else echo "ext-test: FAIL (--ext-class optional parameter host C did not compile)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
+	fi; \
+	if [ $$ok -eq 1 ]; then \
+	  if ! $(SPINEL) test/ext/methods_blk.rb -c --no-line-map --ext-init Init_ext_methods_blk \
+	      --ext-entry ExtBlk.make --ext-class ExtBlk::Rel -o "$$tmp/b.c" >/dev/null 2>&1; then \
+	    echo "ext-test: FAIL (--ext-class block emission)"; ok=0; \
+	  elif $(CC) -O1 -w $(PLATFORM_FLAGS) -Ilib -I"$$tmp" test/ext/methods_blk_host.c "$$tmp/b.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/bhost" 2>"$$tmp/cc.err"; then \
+	    "$$tmp/bhost" > "$$tmp/out" 2>&1; rc=$$?; \
+	    cmp -s "$$tmp/out" test/ext/expected_methods_blk && [ $$rc -eq 0 ] || { echo "ext-test: FAIL (--ext-class block host output mismatch, or status $$rc)"; diff -u test/ext/expected_methods_blk "$$tmp/out" || true; ok=0; }; \
+	    SPINEL_GC_STRESS=1 "$$tmp/bhost" > "$$tmp/out" 2>&1; rc=$$?; \
+	    cmp -s "$$tmp/out" test/ext/expected_methods_blk && [ $$rc -eq 0 ] || { echo "ext-test: FAIL (--ext-class block host output mismatch under GC stress, or status $$rc)"; diff -u test/ext/expected_methods_blk "$$tmp/out" || true; ok=0; }; \
+	  else echo "ext-test: FAIL (--ext-class block host C did not compile)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
+	fi; \
+	if [ $$ok -eq 1 ]; then \
+	  if ! $(SPINEL) test/ext/methods_new.rb -c --no-line-map --ext-init Init_ext_methods_new \
+	      --ext-entry ExtNew.sample,ExtNew.lazy,ExtNew.oops \
+	      --ext-class ExtNew::Point,ExtNew::Opt,ExtNew::Bare,ExtNew::Kid,ExtNew::Own,ExtNew::Blk,ExtNew::Lazy,ExtNew::Deep,ExtNew::Oops,ExtNew::Kw,ExtNew::Mixed,ExtNew::Inner::Point,ExtNew::Inner::Kid,ExtNew::Home::Room,ExtNew::Priv,ExtNew::Same,ExtNew::Single,ExtNew::Custom,ExtNew::Under,ExtNew::Meta,ExtNew::Far,ExtNew::Shy,ExtNew::FromRoot \
+	      -o "$$tmp/n.c" >/dev/null 2>&1; then \
+	    echo "ext-test: FAIL (--ext-class new emission)"; ok=0; \
+	  elif $(CC) -O1 -w -Ilib -I"$$tmp" test/ext/methods_new_host.c "$$tmp/n.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/nhost" 2>"$$tmp/cc.err"; then \
+	    "$$tmp/nhost" > "$$tmp/out" 2>&1; rc=$$?; \
+	    cmp -s "$$tmp/out" test/ext/expected_methods_new && [ $$rc -eq 0 ] || { echo "ext-test: FAIL (--ext-class new host output mismatch, or status $$rc)"; diff -u test/ext/expected_methods_new "$$tmp/out" || true; ok=0; }; \
+	    SPINEL_GC_STRESS=1 "$$tmp/nhost" > "$$tmp/out" 2>&1; rc=$$?; \
+	    cmp -s "$$tmp/out" test/ext/expected_methods_new && [ $$rc -eq 0 ] || { echo "ext-test: FAIL (--ext-class new host output mismatch under GC stress, or status $$rc)"; diff -u test/ext/expected_methods_new "$$tmp/out" || true; ok=0; }; \
+	  else echo "ext-test: FAIL (--ext-class new host C did not compile)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
+	fi; \
+	if [ $$ok -eq 1 ]; then \
+	  if ! $(SPINEL) test/ext/unreached_return.rb -c --no-line-map --ext-init Init_ext_unreached \
+	      --ext-entry ExtUnreached.mk,ExtUnreached.add,ExtUnreached.open_ids -o "$$tmp/u.c" >/dev/null 2>&1; then \
+	    echo "ext-test: FAIL (unreached_return emission)"; ok=0; \
+	  elif ! awk '/^struct sp_Store_s \{/,/^\}/' "$$tmp/u.c" | grep -Fq 'sp_PtrArray * iv_items;'; then \
+	    echo "ext-test: FAIL (an --ext-entry whose value joins an Array of one class kept it boxed)"; ok=0; \
+	  fi; \
+	fi; \
+	if [ $$ok -eq 1 ]; then \
+	  if ! $(SPINEL) test/ext/typed_untyped_new.rb -c --no-line-map --ext-init Init_ext_tu \
+	      --ext-entry ExtTU.shape,ExtTU.mk -o "$$tmp/tu.c" >"$$tmp/tu.out" 2>&1; then \
+	    echo "ext-test: FAIL (a typed and an untyped --ext-entry that new one class did not compile)"; sed -n 1,3p "$$tmp/tu.out"; ok=0; \
+	  fi; \
+	  for xc in ExtTC::Shape ExtTC::Maker ExtTC; do \
+	    $(SPINEL) test/ext/typed_ext_class_new.rb -c --no-line-map --ext-init Init_ext_tc \
+	      --ext-entry ExtTC.shape --ext-class $$xc -o "$$tmp/tc.c" >"$$tmp/tc.out" 2>&1 || \
+	      { echo "ext-test: FAIL (a typed --ext-entry and --ext-class $$xc that new one class did not compile)"; sed -n 1,3p "$$tmp/tc.out"; ok=0; }; \
+	  done; \
 	fi; \
 	if [ $$ok -eq 1 ]; then \
 	  if ! $(SPINEL) test/ext/dup_leaf.rb -c --no-line-map --ext-init Init_ext_dup \
@@ -1839,6 +2039,15 @@ ext-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SPINEL_TIMEOUT)
 	      --ext-entry ExtDup.go --ext-class Base -o "$$tmp/d.c" >"$$tmp/d.out" 2>&1; then \
 	    echo "ext-test: FAIL (--ext-class Base named two classes and compiled)"; ok=0; \
 	  else grep -q "names 2 classes" "$$tmp/d.out" || { echo "ext-test: FAIL (--ext-class Base refused without naming both classes)"; sed -n 1,3p "$$tmp/d.out"; ok=0; }; fi; \
+	fi; \
+	if [ $$ok -eq 1 ]; then \
+	  awk 'BEGIN { print "module W"; for (i = 1; i <= 120; i++) printf "  def self.entry_with_a_long_name_%04d(x) = x + %d\n", i, i; print "end" }' > "$$tmp/w.rb"; \
+	  wl=$$(awk 'BEGIN { for (i = 1; i <= 120; i++) printf "%sW.entry_with_a_long_name_%04d", (i > 1 ? "," : ""), i }'); \
+	  if ! $(SPINEL) "$$tmp/w.rb" -c --no-line-map --ext-init Init_ext_wide --ext-entry "$$wl" -o "$$tmp/w.c" >"$$tmp/w.out" 2>&1; then \
+	    echo "ext-test: FAIL (an --ext-entry list past 2048 bytes did not compile)"; sed -n 1,3p "$$tmp/w.out"; ok=0; \
+	  elif [ $$(grep -c 'sp_W_s_entry_with_a_long_name_[0-9]*(' "$$tmp/w.h") -ne 120 ]; then \
+	    echo "ext-test: FAIL (an --ext-entry list past 2048 bytes exported $$(grep -c 'sp_W_s_entry_with_a_long_name_[0-9]*(' "$$tmp/w.h") of its 120 methods)"; ok=0; \
+	  fi; \
 	fi; \
 	rm -rf "$$tmp"; \
 	if [ $$ok -eq 1 ]; then echo "ext-test: pass"; else exit 1; fi
@@ -1900,6 +2109,7 @@ defer-refusals-test: $(SPINEL)
 	@ok=1; tmp=$$(mktemp -d /tmp/spinel-defer.XXXXXX); \
 	for t in $(shell grep -l '^\# spinel: defer-refusals: ' test/defer/*.rb); do \
 	  rest=$$(sed -n 's/^# spinel: defer-refusals: //p' "$$t"); n=$${rest%%:*}; want="$${rest#*:} "; \
+	  msg=$$(sed -n 's/^# spinel: defer-message: //p' "$$t"); msg=$${msg:-ruby2_keywords is not supported}; \
 	  if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/p.c" >"$$tmp/p.out" 2>&1; then \
 	    echo "defer-refusals-test: FAIL ($$t compiled without the flag)"; ok=0; fi; \
 	  if ! $(SPINEL) --defer-refusals "$$t" -o "$$tmp/d" >"$$tmp/d.out" 2>&1; then \
@@ -1909,7 +2119,7 @@ defer-refusals-test: $(SPINEL)
 	    { echo "defer-refusals-test: FAIL ($$t: deferred refusals not counted)"; sed -n 1,5p "$$tmp/d.out"; ok=0; }; \
 	  "$$tmp/d" >"$$tmp/r.out" 2>"$$tmp/r.err"; st=$$?; out=$$(tr '\n' ' ' <"$$tmp/r.out"); \
 	  [ "$$out" = "$$want" ] || { echo "defer-refusals-test: FAIL ($$t ran wrong: $$out)"; ok=0; }; \
-	  [ $$st -ne 0 ] && grep -q "ruby2_keywords is not supported.*(NotImplementedError)" "$$tmp/r.err" || \
+	  [ $$st -ne 0 ] && grep -q "$$msg.*(NotImplementedError)" "$$tmp/r.err" || \
 	    { echo "defer-refusals-test: FAIL ($$t: a refused line did not raise NotImplementedError, exit $$st)"; sed -n 1,3p "$$tmp/r.err"; ok=0; }; \
 	done; \
 	rm -rf "$$tmp"; \
@@ -2184,6 +2394,19 @@ reject-test: string-minus-reject-test $(SPINEL)
 	  echo "reject-test: FAIL (an ffi_source call to an undeclared function built)"; ok=0; \
 	else grep -Eq "(undeclared function|implicit declaration of function) .lfind" "$$tmp/r.out" || \
 	  { echo "reject-test: FAIL (an ffi_source call to an undeclared function refused without saying why)"; head -5 "$$tmp/r.out"; ok=0; }; fi; \
+	t=test/reject/ffi_lib_runtime_name.rb; \
+	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/r.c" >"$$tmp/r.out" 2>&1; then \
+	  echo "reject-test: FAIL (an ffi_lib name that does not fold compiled)"; ok=0; \
+	else grep -q "ffi_lib. expects a compile-time string" "$$tmp/r.out" || \
+	  { echo "reject-test: FAIL (an ffi_lib name that does not fold refused without saying why)"; head -5 "$$tmp/r.out"; ok=0; }; fi; \
+	t=test/reject/ffi_lib_runtime_candidate.rb; \
+	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/r.c" >"$$tmp/r.out" 2>&1; then \
+	  echo "reject-test: FAIL (an ffi_lib Array candidate that does not fold compiled)"; ok=0; \
+	else grep -q "ffi_lib. expects a compile-time string" "$$tmp/r.out" || \
+	  { echo "reject-test: FAIL (an ffi_lib Array candidate that does not fold refused without saying why)"; head -5 "$$tmp/r.out"; ok=0; }; fi; \
+	$(SPINEL) test/ffi-lib/cwd_relative.rb -c --no-line-map -o "$$tmp/fcr.c" >/dev/null 2>&1 || { echo "reject-test: FAIL (ffi-lib/cwd_relative: -c)"; ok=0; }; \
+	grep -Fq "/* SPINEL_LINK: $$(pwd)/libspinel_cwd_probe.so */" "$$tmp/fcr.c" || \
+	  { echo "reject-test: FAIL (a one-argument File.expand_path in ffi_lib did not name the working directory)"; grep 'SPINEL_LINK' "$$tmp/fcr.c"; ok=0; }; \
 	t=test/reject/singleton_on_untraceable_recv.rb; \
 	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/r.c" >"$$tmp/r.out" 2>&1; then \
 	  echo "reject-test: FAIL (a singleton def on an untraceable receiver compiled)"; ok=0; \
@@ -2444,11 +2667,6 @@ reject-test: string-minus-reject-test $(SPINEL)
 	  else grep -q "an Errno constant defined in a subclass of SystemCallError" "$$tmp/sce.out" || \
 	    { echo "reject-test: FAIL ($$t: refused without saying why)"; sed -n 1,5p "$$tmp/sce.out"; ok=0; }; fi; \
 	done; \
-	t=test/reject/systemcallerror_zsuper_keyword.rb; \
-	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/szk.c" >"$$tmp/szk.out" 2>&1; then \
-	  echo "reject-test: FAIL (a bare super forwarding a keyword to SystemCallError#initialize compiled)"; ok=0; \
-	else grep -q "a bare super forwarding a rest, keyword or block parameter to SystemCallError#initialize" "$$tmp/szk.out" || \
-	  { echo "reject-test: FAIL (a bare super forwarding a keyword refused without saying why)"; sed -n 1,5p "$$tmp/szk.out"; ok=0; }; fi; \
 	for t in test/reject/object_receiver_include*.rb; do \
 	  if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/ori.c" >"$$tmp/ori.out" 2>&1; then \
 	    echo "reject-test: FAIL ($$t: an include into Object through an explicit receiver compiled)"; ok=0; \
@@ -4617,7 +4835,10 @@ STR_SLOT_C = sp_String \*
 STR_SLOT_RE = sp_String[[:space:]]*\*
 STR_BYREF_S = sp_String \* lv_s
 STR_BYREF_PLAIN = sp_String \* lv_plain
-infer-test: $(SPINEL) $(SP_RT_LIB)
+# (two recipes: one shell command holds at most 128KB, and the checks outgrew it)
+.PHONY: infer-test-1 infer-test-2
+infer-test: infer-test-1 infer-test-2
+infer-test-1: $(SPINEL) $(SP_RT_LIB)
 	@tmp=$$(mktemp -d /tmp/spinel-infer.XXXXXX); ok=1; \
 	for f in test/infer/*.rb; do \
 	  $(SPINEL) "$$f" -o "$$tmp/ibin" >/dev/null 2>&1 || { echo "infer-test: FAIL ($$f: the emitted C does not compile)"; ok=0; continue; }; \
@@ -4635,6 +4856,10 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	awk '/^struct sp_Left_s \{/,/^\}/' "$$tmp/gbo.c" | grep -Fq 'sp_PolyPolyHash * iv_letters;' && awk '/^struct sp_Right_s \{/,/^\}/' "$$tmp/gbo.c" | grep -Fq 'sp_PolyPolyHash * iv_numbers;' || { echo "infer-test: FAIL (a boxed getter receiver lost a possible owner)"; ok=0; }; \
 	$(SPINEL) test/obj_array_reduce_narrows.rb -c --no-line-map -o "$$tmp/oar.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile obj_array_reduce_narrows)"; exit 1; }; \
 	awk '/^struct sp_Bin_s \{/,/^\}/' "$$tmp/oar.c" | grep -Fq 'sp_PtrArray * iv_cells;' || { echo "infer-test: FAIL (a reduce or an inject over an Array of one class kept it boxed)"; ok=0; }; \
+	$(SPINEL) test/infer/object_array_unnamed_method.rb -c --no-line-map -o "$$tmp/oau.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile object_array_unnamed_method)"; exit 1; }; \
+	awk '/^struct sp_Store_s \{/,/^\}/' "$$tmp/oau.c" | grep -Fq 'sp_PtrArray * iv_items;' || { echo "infer-test: FAIL (a select a method nothing names answers kept an Array of one class boxed)"; ok=0; }; \
+	$(SPINEL) test/infer/object_array_dead_dynamic_read.rb -c --no-line-map -o "$$tmp/oad.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile object_array_dead_dynamic_read)"; ok=0; }; \
+	awk '/^struct sp_Store_s \{/,/^\}/' "$$tmp/oad.c" | grep -Fq 'sp_PtrArray * iv_items;' || { echo "infer-test: FAIL (a reader a method nothing names calls on an untyped receiver kept an Array of one class boxed)"; ok=0; }; \
 	$(SPINEL) test/is_a_user_class_guard_narrows.rb -c --no-line-map -o "$$tmp/iug.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (is_a_user_class_guard_narrows: -c)"; ok=0; }; \
 	grep -q 'sp_Int_tag((sp_Int \*)(sp_Int \*)sp_poly_unbox_cls(lv_x' "$$tmp/iug.c" || { echo "infer-test: FAIL (is_a?(Int) left a guarded call on a user class in boxed dispatch)"; ok=0; }; \
 	$(SPINEL) test/obj_array_zip_narrows.rb -c --no-line-map -o "$$tmp/oaz.c" >/dev/null 2>"$$tmp/oaz.err" || { echo "infer-test: FAIL (compile obj_array_zip_narrows)"; exit 1; }; \
@@ -4644,6 +4869,8 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	grep -q 'static sp_PointValue sp_PointValue_new(' "$$tmp/oir.c" && ! grep -q 'iv_unused;' "$$tmp/oir.c" || { echo "infer-test: FAIL (an Object setter changes unrelated layouts)"; ok=0; }; \
 	$(SPINEL) test/hash_store_boxed_unbounded.rb -c --no-line-map -o "$$tmp/hbu.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (hash_store_boxed_unbounded: -c)"; ok=0; }; \
 	! grep -q 'sp_PolyPolyHash_new' "$$tmp/hbu.c" || { echo "infer-test: FAIL (an unbounded boxed store widened a known Hash)"; ok=0; }; \
+	$(SPINEL) test/hash_key_walk_param_same_name.rb -c --no-line-map -o "$$tmp/hkw.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (hash_key_walk_param_same_name: -c)"; ok=0; }; \
+	grep -Fq 'static inline sp_StrIntHash * sp_A_s_w(' "$$tmp/hkw.c" && grep -Eq '^static inline sp_Str[A-Za-z]*Hash \* sp_TodoApp_s_tag_counts\(' "$$tmp/hkw.c" || { echo "infer-test: FAIL (a walk parameter boxed for a round keyed its empty Hash poly)"; ok=0; }; \
 	$(SPINEL) test/container_alias_untracked_local.rb -c --no-line-map -o "$$tmp/cau.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (container_alias_untracked_local: -c)"; ok=0; }; \
 	awk '/^struct sp_Area_s \{/,/^\}/' "$$tmp/cau.c" | grep -Fq 'sp_StrArray * iv_except;' || { echo "infer-test: FAIL (a local that may hold an untracked container joined an alias group and widened an Array[String])"; ok=0; }; \
 	$(SPINEL) test/ivar_push_unsettled_block_value.rb -c --no-line-map -o "$$tmp/ipu.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (ivar_push_unsettled_block_value: -c)"; ok=0; }; \
@@ -4658,6 +4885,12 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	[ "$$(grep -o 'sp_RbVal lv_r_[a-z_]*' "$$tmp/bso.c" | sort -u | tr '\n' ' ')" = "sp_RbVal lv_r_b sp_RbVal lv_r_strip " ] || { echo "infer-test: FAIL (a program class's own b or strip answering a non-String lost its answer, or its to_str answering a String boxed the call)"; ok=0; }; \
 	$(SPINEL) test/tuple_taken_apart_keeps_table.rb -c --no-line-map -o "$$tmp/tak.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (tuple_taken_apart_keeps_table: -c)"; ok=0; }; \
 	[ "$$(grep -E -o 'sp_PtrArray \*( ?volatile)? *(lv_(tw_a|tw_b|gr_m|pt_a|pt_b|lp_a|en_a)|cst_(COLS|SIZES))\b' "$$tmp/tak.c" | sed 's/.*[ *]//' | LC_ALL=C sort -u | tr '\n' ' ')" = "cst_COLS cst_SIZES lv_en_a lv_gr_m lv_lp_a lv_pt_a lv_pt_b lv_tw_a lv_tw_b " ] && ! grep -E -q 'sp_PtrArray \*( ?volatile)? *lv_(sh_a|sh_b|kp_a|se_a|sp_a|sp_rest|ea_a|ea_c)\b' "$$tmp/tak.c" || { echo "infer-test: FAIL (a table handed out in a tuple taken apart where it lands lost its kind, or one whose tuple goes elsewhere was narrowed)"; ok=0; }; \
+	$(SPINEL) test/tuple_taken_apart_in_branch_or_walk.rb -c --no-line-map -o "$$tmp/tbw.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (tuple_taken_apart_in_branch_or_walk: -c)"; ok=0; }; \
+	[ "$$(grep -E -o 'sp_PtrArray \*( ?volatile)? *lv_[a-z]+_a\b' "$$tmp/tbw.c" | sed 's/.*[ *]//' | LC_ALL=C sort -u | tr '\n' ' ')" = "lv_ar_a lv_wk_a " ] || { echo "infer-test: FAIL (a tuple taken apart in a thrown-away arm or a walk block lost its table, or one whose value is read was narrowed)"; ok=0; }; \
+	$(SPINEL) test/tuple_taken_apart_redefined_walk.rb -c --no-line-map -o "$$tmp/trw.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (tuple_taken_apart_redefined_walk: -c)"; ok=0; }; \
+	! grep -E -q 'sp_PtrArray \*( ?volatile)? *lv_(tm_a|ew_a)\b' "$$tmp/trw.c" || { echo "infer-test: FAIL (a tuple taken apart in the block of a walk the program redefines was narrowed)"; ok=0; }; \
+	$(SPINEL) test/identity_helper_arg_dropped.rb -c --no-line-map -o "$$tmp/iha.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (identity_helper_arg_dropped: -c)"; ok=0; }; \
+	[ "$$(grep -E -o 'sp_PtrArray \*( ?volatile)? *(cst_SH_TBL|lv_(sh_loc|sh_flt|lp_t|cd_t|eb_t|ls_t))\b' "$$tmp/iha.c" | sed 's/.*[ *]//' | LC_ALL=C sort -u | tr '\n' ' ')" = "cst_SH_TBL lv_cd_t lv_eb_t lv_lp_t lv_ls_t lv_sh_flt lv_sh_loc " ] && ! grep -E -q 'sp_PtrArray \*( ?volatile)? *lv_(kp_t|kd_t|an_t|ld_t|yl_t|dm_t|rb_t|ho_t)\b' "$$tmp/iha.c" || { echo "infer-test: FAIL (a table handed to a helper that only answers it back, the answer dropped, stayed boxed, or one the helper keeps was narrowed)"; ok=0; }; \
 	$(SPINEL) test/index_read_unsettled_local.rb -c --no-line-map -o "$$tmp/iru.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (index_read_unsettled_local: -c)"; ok=0; }; \
 	! grep -q 'sp_RbVal lv_line\b' "$$tmp/iru.c" || { echo "infer-test: FAIL (an index read guessed a settling local a Hash and boxed a block parameter)"; ok=0; }; \
 	$(SPINEL) test/table_row_join_keeps_kind.rb -c --no-line-map -o "$$tmp/trj.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (table_row_join_keeps_kind: -c)"; ok=0; }; \
@@ -4969,6 +5202,12 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	esac; \
 	grep -q 'sp_PtrArray \* iv_pts;' "$$tmp/oae.c" || { echo "infer-test: FAIL (an array of one class whose class defines each stayed boxed through a walk)"; ok=0; }; \
 	[ "$$(grep -cE '\(lv_pt__bp[A-Za-z0-9_]+\)->iv_x' "$$tmp/oae.c")" = 3 ] || { echo "infer-test: FAIL (an each, reverse_each or each_with_index walk over an array of one class bound its parameter boxed)"; ok=0; }; \
+	rm -rf "$$tmp"; \
+	if [ $$ok -eq 1 ]; then echo "infer-test: pass (1 of 2)"; else exit 1; fi
+infer-test-2: $(SPINEL) $(SP_RT_LIB)
+	@tmp=$$(mktemp -d /tmp/spinel-infer.XXXXXX); ok=1; \
+	$(SPINEL) test/object_array_map_identity.rb -c --no-line-map -o "$$tmp/oai.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile object_array_map_identity)"; ok=0; }; \
+	awk '/^struct sp_Store_s \{/,/^\}/' "$$tmp/oai.c" | grep -Fq 'sp_PtrArray * iv_items;' || { echo "infer-test: FAIL (a map answering its element kept an Array of one class boxed)"; ok=0; }; \
 	$(SPINEL) test/object_array_push_element_read.rb -c --no-line-map -o "$$tmp/oap.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (object_array_push_element_read: -c)"; ok=0; }; \
 	[ "$$(awk '/^struct sp_(Node|Ring|Bin)_s \{/ { c = $$2 } c && /iv_(links|members|items)/ { print c, $$1; c = "" }' "$$tmp/oap.c" | tr '\n' ' ')" = "sp_Node_s sp_PtrArray sp_Ring_s sp_PtrArray sp_Bin_s sp_PolyArray " ] || { echo "infer-test: FAIL (an element read of an Array of one class stored into another gave it no class, or one of a mixed Array narrowed it)"; ok=0; }; \
 	$(SPINEL) test/object_array_walk_ends_branch.rb -c --no-line-map -o "$$tmp/oaw.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (object_array_walk_ends_branch: -c)"; ok=0; }; \
@@ -5006,6 +5245,8 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	grep -q 'sp_PtrArray \* iv_steps;' "$$tmp/oal.c" && grep -q 'sp_total(sp_PtrArray \* lv_parts' "$$tmp/oal.c" || { echo "infer-test: FAIL (an object Array literal passed as an argument stayed boxed)"; ok=0; }; \
 	$(SPINEL) test/obj_array_removals.rb -c --no-line-map -o "$$tmp/oar.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (obj_array_removals: -c)"; ok=0; }; \
 	grep -q 'sp_PtrArray \* iv_jobs;' "$$tmp/oar.c" && grep -q 'sp_PtrArray_pop(' "$$tmp/oar.c" && grep -q 'sp_PtrArray_shift(' "$$tmp/oar.c" && grep -q 'sp_PtrArray_delete_at(' "$$tmp/oar.c" && grep -q 'sp_PtrArray_clear(' "$$tmp/oar.c" || { echo "infer-test: FAIL (pop, shift, delete_at or clear left an array of one class boxed)"; ok=0; }; \
+	$(SPINEL) test/obj_array_searches.rb -c --no-line-map -o "$$tmp/oas.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (obj_array_searches: -c)"; ok=0; }; \
+	grep -q 'sp_PtrArray \* iv_wires;' "$$tmp/oas.c" && grep -q 'sp_PtrArray \* iv_points;' "$$tmp/oas.c" && grep -q 'sp_PtrArray_delete_obj(' "$$tmp/oas.c" && grep -q 'sp_PtrArray_index_obj(' "$$tmp/oas.c" && grep -q 'sp_PtrArray_count_obj(' "$$tmp/oas.c" || { echo "infer-test: FAIL (delete, include?, index, count, delete_if or keep_if left an array of one class boxed)"; ok=0; }; \
 	$(SPINEL) test/array_new_fill_object_array.rb -c --no-line-map -o "$$tmp/anf.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (array_new_fill_object_array: -c)"; ok=0; }; \
 	grep -q 'sp_PtrArray \* iv_items;' "$$tmp/anf.c" && grep -q 'sp_bump(sp_Foo \* lv_f)' "$$tmp/anf.c" && grep -q 'sp_rb_sum_bytes(sp_IOBuffer \* lv_b' "$$tmp/anf.c" && grep -q 'sp_PtrArray \* sp_mk(' "$$tmp/anf.c" || { echo "infer-test: FAIL (an Array.new(n, obj) fill left an array of one class boxed)"; ok=0; }; \
 	$(SPINEL) test/obj_array_walk_method_tail.rb -c --no-line-map -o "$$tmp/owt.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (obj_array_walk_method_tail: -c)"; ok=0; }; \
@@ -5016,6 +5257,19 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	for v in iv_herd iv_arrows iv_eggs iv_pen lv_babies lv_adults; do \
 	  grep -q "sp_PtrArray \\* $$v\b" "$$tmp/oaf.c" || { echo "infer-test: FAIL (obj_array_filters: a filter left $$v boxed)"; ok=0; }; \
 	done; \
+	$(SPINEL) test/obj_array_self_answering_filters.rb -c --no-line-map -o "$$tmp/osa.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (obj_array_self_answering_filters: -c)"; ok=0; }; \
+	for cls in Shelf Bin Queue2; do \
+	  awk "/^struct sp_$${cls}_s \\{/,/^\\}/" "$$tmp/osa.c" | grep -Fq 'sp_PtrArray * iv_items;' || { echo "infer-test: FAIL (a read of delete_if, keep_if, sort! or sort_by!'s value left $$cls's @items boxed)"; ok=0; }; \
+	done; \
+	$(SPINEL) test/obj_array_pick_narrowed.rb -c --no-line-map -o "$$tmp/opn.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (obj_array_pick_narrowed: -c)"; ok=0; }; \
+	for v in by_max by_min cmp_max cmp_min pool empty one bad shrink grow; do \
+	  grep -q "sp_PtrArray \\* lv_$$v\b" "$$tmp/opn.c" || { echo "infer-test: FAIL (obj_array_pick_narrowed: max_by, min_by, a comparator's max or min, or sample left $$v boxed)"; ok=0; }; \
+	done; \
+	$(SPINEL) test/inject_empty_seed_typed.rb -c --no-line-map -o "$$tmp/ies.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (inject_empty_seed_typed: -c)"; ok=0; }; \
+	for m in evens squares kept nested small; do \
+	  grep -q "^static inline sp_IntArray \\* sp_$$m(" "$$tmp/ies.c" || { echo "infer-test: FAIL (inject_empty_seed_typed: an empty [] seed the block pushes Integers into left $$m boxed)"; ok=0; }; \
+	done; \
+	grep -q "^static inline sp_FloatArray \\* sp_odd_halves(" "$$tmp/ies.c" || { echo "infer-test: FAIL (inject_empty_seed_typed: an empty [] seed the block pushes Floats into left odd_halves boxed)"; ok=0; }; \
 	$(SPINEL) test/obj_array_nested_block.rb -c --no-line-map -o "$$tmp/onb.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (obj_array_nested_block: -c)"; ok=0; }; \
 	for v in arrows pts; do \
 	  grep -q "sp_PtrArray \\* iv_$$v;" "$$tmp/onb.c" || { echo "infer-test: FAIL (obj_array_nested_block: a block in a walk's block left @$$v boxed)"; ok=0; }; \
@@ -5316,8 +5570,10 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	  done; \
 	  grep -Fq 'local LibC.__ffi_call(extend) fns: ptr ty=str_poly_hash' "$$tmp/fi.repr" || { echo "infer-test: FAIL (Fiddle function-table read became boxed)"; ok=0; }; \
 	fi; \
+	$(SPINEL) test/object_array_sort_by.rb -c --no-line-map -o "$$tmp/oas.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile object_array_sort_by)"; ok=0; }; \
+	awk '/^struct sp_Store_s \{/,/^\}/' "$$tmp/oas.c" | grep -Fq 'sp_PtrArray * iv_items;' || { echo "infer-test: FAIL (a sort_by or a sort with a comparator kept an Array of one class boxed)"; ok=0; }; \
 	rm -rf "$$tmp"; \
-	if [ $$ok -eq 1 ]; then echo "infer-test: pass"; else exit 1; fi
+	if [ $$ok -eq 1 ]; then echo "infer-test: pass (2 of 2)"; else exit 1; fi
 
 # SP_COLLECT_ERRORS recovers from an unsupported construct with a longjmp, and
 # has to put back everything the abandoned unit was pointing at. The globals it
@@ -5701,6 +5957,12 @@ imemo-shadow-corpus: $(SPINEL)
 # drops the const is gcc's -Wdiscarded-qualifiers; clang takes that for an
 # unknown option and has the warning under a name of its own.
 TY_GUARD_QUAL := -Werror=discarded-qualifiers $(if $(filter clang,$(CC_KIND)),-Werror=incompatible-pointer-types-discards-qualifiers)
+# A typed container's store and search entry names come from its row (typed_elem_store_sfx): no src/ line
+# formats one by hand or spells a deleted bytes entry, unless tools/entry_names.allow says why it cannot
+# name one for a String kind.
+entry-names-check:
+	@ruby tools/entry_names_check.rb
+
 ty-setter-check: $(SPINEL)
 	@printf '%s\n' $(patsubst build/csrc/%.o,src/%.c,$(SPINEL_OBJ)) | \
 	 xargs -P $(NPROC) -I{} $(CC) $(CFLAGS) -fsyntax-only -DSP_TY_GUARD $(TY_GUARD_QUAL) -Isrc -Ibuild/csrc {} && \

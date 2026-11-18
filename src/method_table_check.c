@@ -4,6 +4,8 @@
 #include "call_plan.h"
 #include "builtin_names.h"
 #include "implied_calls.h"
+#include "implicit_calls.h"
+#include "analyze_internal.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,9 +53,20 @@ void mtab_build_depth(Compiler *c, int by) {
   if (c->mtab) c->mtab->build += by;
 }
 
+int mtab_framed(Compiler *c) {
+  return c->mtab && c->mtab->frame >= 0;
+}
+
 MtabMark mtab_mark(Compiler *c) {
   struct MethodTableCheck *m = c->mtab;
   return m ? (MtabMark){ m->frame, m->depth, m->build } : (MtabMark){ -1, 0, 0 };
+}
+
+void mtab_step_report(Compiler *c, MtabMark was, const char *pass) {
+  struct MethodTableCheck *m = c->mtab;
+  if (m && (m->depth != was.depth || m->build != was.build))
+    fprintf(stderr, "method-table-check: unbalanced bracket in %s\n", pass);
+  mtab_unwind(c, was);
 }
 
 void mtab_unwind(Compiler *c, MtabMark was) {
@@ -61,9 +74,25 @@ void mtab_unwind(Compiler *c, MtabMark was) {
   if (m) { m->frame = was.frame; m->depth = was.depth; m->build = was.build; }
 }
 
-MtabMark mtab_frame_set(Compiler *c, int id) {
+MtabMark mtab_frame_keep(Compiler *c, int id) {
   struct MethodTableCheck *m = c->mtab;
   MtabMark was = mtab_mark(c);
+  if (m && id >= 0) m->frame = id;   /* (no node: the caller's frame stays) */
+  return was;
+}
+
+/* The nearest node above `node` that has an implied call named `name` (a `===` row of a pattern, an `in` or a
+   `when`: the node that holds the row), as the frame of what is asked about `node`. */
+MtabMark mtab_frame_row_owner(Compiler *c, int node, const char *name) {
+  const int *par = comp_parent_map(c);
+  int up = node >= 0 ? par[node] : -1;
+  while (up >= 0 && !ic_node_calls_name(c, up, name, 1)) up = par[up];
+  return mtab_frame_keep(c, up);
+}
+
+MtabMark mtab_frame_set(Compiler *c, int id) {
+  struct MethodTableCheck *m = c->mtab;
+  MtabMark was = mtab_frame_keep(c, id);
   if (m) { m->frame = id; m->depth = 0; m->build = 0; }
   return was;
 }
@@ -184,6 +213,7 @@ static const char *why_name(int why) {
   case MLW_NEVER: return "never";
   case MLW_UNASKED: return "unasked";
   case MLW_ACCESSOR: return "accessor";
+  case MLW_VIS: return "visibility";
   }
   return "?";
 }
@@ -208,7 +238,18 @@ static int super_reads_own_name(Compiler *c, int fn, const char *name) {
    the names it calls (call_node_names) and the predicates of
    builtin_names.c; a call by the names it had when the read was made
    (frame_call_names). A node with no frame is a pass: family "pass", with
-   the name of the pass it ran in in a field of its own. */
+   the name of the pass it ran in in a field of its own.
+
+   A read of another name under a call or a super is `implied` only for one
+   of the node's own implied calls (ic_node_calls_name: its syntax rows and
+   its builtin's callbacks), and `call` otherwise: a question about another
+   call (its receiver's, an argument's) or the call's method_missing, which
+   every call may reach as its lookup's tail. A frame with no names of its
+   own is `implied` for a row of a node it holds directly (ic_held_rows_name),
+   and for an implied call of the call it is an operand of (ic_operand_host);
+   `call` where the name is that host call's own (the Range a `clamp` is
+   given), and `implied` for a row of its direct parent where that is no call
+   (the receiver of `a[i] += 1`: its `[]` and `[]=`); `other` otherwise. */
 static const char *reader_family(Compiler *c, const MtSite *s) {
   const NodeTable *nt = c->nt;
   int fn = s->node;
@@ -225,20 +266,25 @@ static const char *reader_family(Compiler *c, const MtSite *s) {
        are calls of their own, each the frame of what is asked of it
        (emit_dynamic_send_arm). */
     if ((is_send_family(nm) || is_method_object_maker(nm)) && tgt && !own) return "send";
-    if (is_respond_to_name(nm) || is_method_defined_query(nm)) return "presence";
+    /* the presence query's question is the queried name's; a read of its own name (`respond_to?` asked of a class
+       that may define one) is the call's, as any call's is */
+    if (is_respond_to_name(nm) || is_method_defined_query(nm)) return own ? "call" : "presence";
     /* a read under a list's node is the list's own where a builder made it (the window of mtab_build_enter), the
        call's where the plan's resolution of the list's call did */
     if (is_instance_method_list(nm) || is_method_presence_query(nm) >= 2) return s->build ? "lists" : "call";
-    return own || tgt ? "call" : "implied";
+    /* (method_missing alone, not is_method_missing_name: respond_to_missing? is a real implied row of respond_to?) */
+    if (own || tgt || sp_streq(name, METHOD_MISSING_NAME)) return "call";
+    return ic_node_calls_name(c, fn, name, s->side == MTS_CMETH) ? "implied" : "call";
   }
   NodeKind k = nt_kind(nt, fn);
   if (k == NK_SuperNode || k == NK_ForwardingSuperNode) {
     if (super_reads_own_name(c, fn, name)) return "super";
     /* another name's question, asked under the super (D3 a): a respond_to? that supers asks presence, any other the implied call */
-    const Scope *s = comp_scope_of(c, fn);
-    s = s ? comp_super_site(c, s) : NULL;
-    const char *sn = s ? comp_scope_user_name(s) : NULL;
-    return sn && (is_respond_to_name(sn) || is_method_defined_query(sn)) ? "presence" : "implied";
+    const Scope *sc = comp_scope_of(c, fn);
+    sc = sc ? comp_super_site(c, sc) : NULL;
+    const char *sn = sc ? comp_scope_user_name(sc) : NULL;
+    if (sn && (is_respond_to_name(sn) || is_method_defined_query(sn))) return "presence";
+    return !sp_streq(name, METHOD_MISSING_NAME) && ic_node_calls_name(c, fn, name, s->side == MTS_CMETH) ? "implied" : "call";
   }
   if (k == NK_BlockArgumentNode) {   /* &:sym calls the name; any other &obj calls its to_proc */
     int ex = nt_ref(nt, fn, "expression");
@@ -250,7 +296,24 @@ static const char *reader_family(Compiler *c, const MtSite *s) {
   int n = call_node_names(c, fn, own);
   for (int i = 0; i < n; i++)
     if (own[i] && sp_streq(own[i], name)) return "call";
-  return n > 0 || nt_implied_possible(nt, fn) ? "implied" : "other";
+  if (ic_node_calls_name(c, fn, name, s->side == MTS_CMETH) || ic_held_rows_name(c, fn, name)) return "implied";
+  /* an operand's frame (a variable read some emitter converts) is the implied call of the call it is an operand of */
+  int host = n == 0 ? ic_operand_host(c, fn) : fn;
+  if (host != fn && ic_node_calls_name(c, host, name, s->side == MTS_CMETH)) return "implied";
+  /* ...or the call's own, where the name is the host call's (the Range a `clamp` is given: its question of `clamp`) */
+  if (host != fn) {
+    const char *hn[2];
+    int nh = call_node_names(c, host, hn);
+    for (int i = 0; i < nh; i++)
+      if (hn[i] && sp_streq(hn[i], name)) return "call";
+  }
+  /* ...or the implied call of the node it is the operand of, where that node is no call (the receiver of `a[i] += 1`
+     and its `[]` and `[]=`) */
+  if (n == 0) {
+    int up = comp_parent_map(c)[fn];
+    if (up >= 0 && ic_node_calls_name(c, up, name, s->side == MTS_CMETH)) return "implied";
+  }
+  return n > 0 ? "call" : "other";
 }
 
 /* the program's site: file:line, <synthesized> for a node no source line made, - for none */

@@ -156,7 +156,7 @@ static int cmp_elem_read(Compiler *c, int node, TyKind t, int *arr, int *idx) {
    0 when it defines none: such a value takes the program's method through
    the boxed method dispatch, any other the runtime's compare
    (sp_poly_spaceship), which knows only the builtin one. */
-static int poly_cmp_reopen_test(Compiler *c, const char *v, char *out, size_t cap) {
+static int poly_cmp_reopen_test(Compiler *c, int id, int recv, const char *v, char *out, size_t cap) {
   static const struct { int cls; const char *tags; } owners[] = {
     { CORE_INTEGER, "%s.tag == SP_TAG_INT || %s.tag == SP_TAG_BIGINT" },
     { CORE_FLOAT,   "%s.tag == SP_TAG_FLT" },
@@ -169,7 +169,7 @@ static int poly_cmp_reopen_test(Compiler *c, const char *v, char *out, size_t ca
   size_t n = 0; out[0] = '\0';
   for (size_t i = 0; i < sizeof owners / sizeof owners[0]; i++) {
     int k = comp_core_class(c, owners[i].cls);
-    if (k < 0 || comp_method_in_chain(c, k, "<=>", NULL) < 0) continue;
+    if (k < 0 || cplan_implied_target(c, id, recv, k, "<=>", CIT_TABLE, NULL) < 0) continue;
     char one[200];
     snprintf(one, sizeof one, owners[i].tags, v, v, v);
     n += (size_t)snprintf(out + n, n < cap ? cap - n : 0, "%s(%s)", n ? " || " : "", one);
@@ -257,6 +257,7 @@ static int emit_nil_aware_num_eq(Compiler *c, int id, const char *name, int recv
    Integer or Float ==, and the String identity arms (a nullable String's
    NULL, a call's shared String answer) */
 static int emit_compare_lead_arms(Compiler *c, int id, const char *name, int recv, int argc, const int *argv, TyKind rt, Buf *b) {
+  if (emit_delegate_undef_arm(c, id, recv, argc, argv, b)) return 1;
   if (emit_nil_aware_num_eq(c, id, name, recv, argc, argv, rt, b)) return 1;
   /* A nullable String's NULL is nil, whether held as text or a handle.
      The ordinary String arms assume a String even against nil or a box. */
@@ -282,7 +283,8 @@ static int emit_cmp_reopen_arm(Compiler *c, int id, int recv, const int *argv, B
   char rtest[640], rv[32];
   int rt0 = ++g_tmp;
   snprintf(rv, sizeof rv, "_t%d", rt0);
-  if (g_cmp_reopen_id == id || g_n_argov >= MAX_ARG_OVERRIDE || !poly_cmp_reopen_test(c, rv, rtest, sizeof rtest))
+  if (g_cmp_reopen_id == id || g_n_argov >= MAX_ARG_OVERRIDE ||
+      !poly_cmp_reopen_test(c, id, recv, rv, rtest, sizeof rtest))
     return 0;
   int mk = view_bind_temp(recv, rt0);
   int sv = g_cmp_reopen_id; g_cmp_reopen_id = id;
@@ -489,7 +491,7 @@ static int emit_untyped_recv_cmp(Compiler *c, const char *name, int recv, int ar
 void emit_poly_quantifier_walk(Compiler *c, int id, int ta, int tp, int tn, int tcnt, int ti,
                                const char *name, char *ans, size_t cap, Buf *b) {
   emit_poly_iter_obj_reject(c, id, ta, name, b);
-  emit_poly_iter_obj_normalize(c, ta, b);
+  emit_poly_iter_obj_normalize(c, id, ta, b);
   /* the same receiver check the each emitter makes: nil is no collection,
      and a zero-length loop answered `nil.any?` false and `nil.all?` true
      (#4485) */
@@ -631,7 +633,8 @@ int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       else if (at0 == TY_FLOAT) { buf_puts(b, "sp_float_to_i_checked("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
       /* a Bignum count saturates (sp_bigint_shift_count): every bit leaves */
       else if (repr_of(c, argv[0]).big) { buf_puts(b, "sp_bigint_shift_count("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
-      else emit_int_expr(c, argv[0], b);
+      /* a count that may be nil: "no implicit conversion of nil into Integer" */
+      else if (!emit_int_opnd_maybe_nil(c, argv[0], 1, b)) emit_int_expr(c, argv[0], b);
       buf_puts(b, ")");
       return 1;
     }
@@ -667,6 +670,9 @@ int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       buf_puts(b, is_shift ? "sp_bigint_shift_count(" : "sp_bigint_to_int("); emit_expr(c, argv[0], b); buf_puts(b, ")");
     }
     else if (at0 == TY_UNKNOWN || at0 == TY_VOID) emit_int_expr(c, argv[0], b);
+    /* an operand that may be nil: the coercion TypeError, or a shift
+       count's conversion one */
+    else if (emit_int_opnd_maybe_nil(c, argv[0], is_shift, b)) { }
     else emit_expr(c, argv[0], b);
     if (shl_neg_safe) buf_puts(b, ")");
     buf_puts(b, ")");
@@ -1225,12 +1231,12 @@ int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
     if (ty_is_object(rt)) {
       int cid4 = ty_object_class(rt);
       if (call_target(c, id, cid4, name, 0, NULL) < 0 &&
-          comp_method_in_chain(c, cid4, "<=>", NULL) >= 0 && class_is_comparable(c, cid4)) {
-        if (user_cmp_invalid_ret(c, cid4) != TY_UNKNOWN)
+          cplan_implied_target(c, id, recv, cid4, "<=>", 0, NULL) >= 0 && class_is_comparable(c, cid4)) {
+        if (user_cmp_invalid_ret(c, id, recv, cid4) != TY_UNKNOWN)
           unsupported_feature(c, id, "Comparable operator on an object whose #<=> returns a non-Integer (protocol requires Integer or nil)");
         /* a `<=>` that can return nil: check it -- incomparable raises the
            Comparable ArgumentError instead of comparing a garbage value */
-        if (user_cmp_needs_check(c, cid4)) {
+        if (user_cmp_needs_check(c, id, recv, cid4)) {
           /* a Time subclass instance boxes as its Time, and the boxed
              comparison would read it as one, not ask its own <=> */
           if (comp_ary_is_time(c, cid4))
@@ -1584,15 +1590,15 @@ static int emit_poly_reopened_binop(Compiler *c, int id, const char *name, int r
 }
 
 /* A nullable Bigint holds nil or an Integer. Only their overrides matter. */
-static int bigint_not_overridden(Compiler *c) {
+static int bigint_not_overridden(Compiler *c, int id) {
   static const int roots[] = { CORE_NILCLASS, CORE_INTEGER, CORE_NUMERIC, CORE_COMPARABLE,
                               CORE_OBJECT, CORE_KERNEL, CORE_BASIC_OBJECT, -1 };
-  int top = comp_method_index(c, "!");
+  int top = comp_name_responder(c, -1, "!", 0);
   if (top >= 0 && !c->scopes[top].is_cmethod) return 1;
   for (int r = 0; roots[r] >= 0; r++) {
     int k = comp_core_class(c, roots[r]);
     if (k < 0) continue;
-    if (comp_is_undeffed_in_chain(c, k, "!") || comp_method_in_chain(c, k, "!", NULL) >= 0 ||
+    if (cplan_undef_stops(c, id, k, "!") || comp_name_responder(c, k, "!", 0) >= 0 ||
         comp_native_method_find(c, k, "!", 0, 0) >= 0) return 1;
     /* The load record also holds prepends to builtin modules such as Kernel.
        With no output slots, any version or an unknown chain returns -1. */
@@ -1856,7 +1862,7 @@ int emit_call_operator_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
        receiver to a pointer, which for a value-type object is not even a
        conversion the C accepts (#3819). */
     if (ty_is_object(rt)) {
-      int bmi = comp_method_in_chain(c, ty_object_class(rt), "!", NULL);
+      int bmi = call_target(c, id, ty_object_class(rt), "!", 0, NULL);
       if (bmi >= 0) {
         buf_puts(b, "(");
         buf_puts(b, mc_method(c, &c->scopes[bmi]));
@@ -1879,7 +1885,7 @@ int emit_call_operator_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
       buf_puts(b, "(("); emit_expr_for_effect(c, recv, b); buf_puts(b, "), 0)");
     }
     else if (rt == TY_STRING || ty_is_array(rt) || ty_is_hash(rt) || ty_is_object(rt) ||
-             (rt == TY_BIGINT && !bigint_not_overridden(c)) || rt == TY_PROC ||
+             (rt == TY_BIGINT && !bigint_not_overridden(c, id)) || rt == TY_PROC ||
              rt == TY_MATCHDATA || rt == TY_EXCEPTION || rt == TY_FIBER || rt == TY_IO) {
       buf_puts(b, "(("); emit_expr(c, recv, b); buf_puts(b, ") == 0)");  /* NULL pointer is falsy */
     }
@@ -1890,13 +1896,13 @@ int emit_call_operator_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
   /* default Object#<=>: 0 when the operands are the same object or ==, nil
      otherwise. Only for a reference user object with no user `<=>` (#2686). */
   if (sp_streq(name, "<=>") && argc == 1 && recv >= 0 && ty_is_object(rt) &&
-      !comp_ty_value_obj(c, rt) && comp_method_in_chain(c, ty_object_class(rt), "<=>", NULL) < 0 &&
+      !comp_ty_value_obj(c, rt) && call_target(c, id, ty_object_class(rt), "<=>", 0, NULL) < 0 &&
       comp_native_method_find(c, ty_object_class(rt), "<=>", 1, 0) < 0) {
     const ClassInfo *rci = &c->classes[ty_object_class(rt)];
     const char *cn = rci->c_name;
     /* a class whose == is not identity (its own, or a Struct's or a Data's
        field-wise one): CRuby's rb_equal, the same object first, then == */
-    if (rci->is_struct || rci->is_data || comp_method_in_chain(c, ty_object_class(rt), "==", NULL) >= 0) {
+    if (rci->is_struct || rci->is_data || call_target(c, id, ty_object_class(rt), "==", 0, NULL) >= 0) {
       int ta = ++g_tmp, tb = ++g_tmp;
       buf_printf(b, "({ sp_RbVal _t%d = ", ta); emit_boxed(c, recv, b);
       buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_RbVal _t%d = ", ta, tb); emit_boxed(c, argv[0], b);
@@ -1992,7 +1998,7 @@ int emit_call_operator_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
           if (kmi >= 0 && ml.def_class == k) ucall_observe(c, id, kmi, k, 1);
         }
       Buf pcall; memset(&pcall, 0, sizeof pcall);
-      if (subtree_may_allocate(nt, argv[0])) {
+      if (subtree_may_allocate(c, argv[0])) {
         int th = hold_operand_pre(c, recv, TY_POLY, 1, ++g_tmp, 1);
         buf_printf(&pcall, "%s(_t%d, ", pfn, th); emit_boxed(c, argv[0], &pcall); buf_puts(&pcall, ")");
       }

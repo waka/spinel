@@ -96,10 +96,10 @@ static void pa_arm_text(Compiler *c, const PolyArm *a, char *out, size_t n) {
                                      "default to_i/to_f", "default any?/none?", "default to_h", "default display",
                                      "default hash",
                                      "each_index", "join", "alive?", "kill", "status", "queue", "io-read",
-                                     "io-flush", "io-close", "enum-to_a",
+                                     "io-flush", "io-close", "enum-to_a", "condvar",
                                      "cover?", "try_convert", "gcdlcm", "unpack1", "include?", "str-delete",
                                      "str-partition", "str-setop", "store", "str-encode", "str-split",
-                                     "int-bitref", "index-cases", "io-read_nonblock", "io-readpartial", "io-readpartial(buf)",
+                                     "int-bitref", "str-aset", "index-cases", "io-read_nonblock", "io-readpartial", "io-readpartial(buf)",
                                      "io-setsockopt", "io-write",
                                      "io-syswrite", "io-print", "io-putc", "io-seek/read", "unshift", "push",
                                      "pack", "join(sep)", "include?-cases", "array-index", "intersect?",
@@ -112,6 +112,8 @@ static void pa_arm_text(Compiler *c, const PolyArm *a, char *out, size_t n) {
                                      "block map!", "subclass re-entry", "array re-entry",
                                      "array re-entry (receiver)", "face str-bang", "io-timeout",
                                      "enum-inline" };
+  /* (one label per family, in the enum's order: a family added without one shifted every label after it) */
+  _Static_assert(sizeof fam / sizeof fam[0] == PB_NFAMILIES, "pa_arm_text's fam[] and the PB_ families differ");
   char kb[48];
   if (a->key >= 0 && a->key < c->nclasses) snprintf(kb, sizeof kb, "%s", c->classes[a->key].name);
   else if (a->key == PA_KEY_DEFAULT) snprintf(kb, sizeof kb, "default");
@@ -241,7 +243,7 @@ void emit_poly_user_box(Compiler *c, int id, Scope *m, const char *call, Buf *b)
    expression that allocates? */
 static int zero_arg_default_allocates(Compiler *c, Scope *ds, int ai) {
   if (ai == ds->rest_idx || ai == ds->kwrest_idx) return 1;
-  return ds->pdefault && ds->pdefault[ai] >= 0 && subtree_may_allocate(c->nt, ds->pdefault[ai]);
+  return ds->pdefault && ds->pdefault[ai] >= 0 && subtree_may_allocate(c, ds->pdefault[ai]);
 }
 
 /* Does a default after the first run something (`def z(a = @n, b = (@n
@@ -889,7 +891,7 @@ void emit_poly_enum_includer_arms0(Compiler *c, int id, const char *name, TyKind
     int armed = 0;
     for (int i = 0; p && i < p->n && !armed; i++) armed = p->arm[i].key == k;
     char elems[320];
-    if (armed || !comp_enum_reaches(c, k) || !comp_enum_answers_first(c, k, name) ||
+    if (armed || !comp_enum_reaches(c, k) || !comp_enum_answers_first(c, id, k, name) ||
         !obj_each_elems_text(c, k, v, elems, sizeof elems)) continue;
     char pcall[512];
     snprintf(pcall, sizeof pcall, "sp_poly_enum_proc(%s, %s, _t%d)", elems, op, blk_tmp0);
@@ -1620,10 +1622,10 @@ void emit_poly_index_cases(TyKind ret, int tr, int tv, const char *idxref, int s
    can answer a class-tagged value: an instance method's receiver carries
    SP_TAG_OBJ, so the class-tagged arm stays beside the user arms (a class
    value must not reach them by its cls_id, which is the class's own id). */
-static int recv_user_cdefines(Compiler *c, const char *name) {
+static int recv_user_cdefines(Compiler *c, int id, const char *name) {
   if (g_poly_builtin_arm) return 0;
   for (int uk = 0; uk < c->nclasses; uk++)
-    if (comp_cmethod_in_chain(c, uk, name, NULL) >= 0) return 1;
+    if (call_target(c, id, uk, name, CT_CMETHOD, NULL) >= 0) return 1;
   return 0;
 }
 
@@ -1635,14 +1637,14 @@ static int recv_user_cdefines(Compiler *c, const char *name) {
    chain ahead of Class's. A module value has no Class method, so it keeps
    those instance methods: the caller guards the arm on the value's kind
    (*cls_only). */
-static int recv_class_value_defines(Compiler *c, const char *name) {
+static int recv_class_value_defines(Compiler *c, int id, const char *name) {
   if (g_poly_builtin_arm) return 0;
   if (comp_name_is_shadow_copy(c, name, SHADOW_PREP)) return 0;
-  if (recv_user_cdefines(c, name)) return 1;
+  if (recv_user_cdefines(c, id, name)) return 1;
   for (int uk = 0; uk < c->nclasses; uk++) {
     const char *kn = c->classes[uk].name;
     if ((comp_class_is_module(c, &c->classes[uk]) || (kn && sp_streq(kn, "Module"))) &&
-        comp_method_in_chain(c, uk, name, NULL) >= 0) return 1;
+        comp_name_responder(c, uk, name, 0) >= 0) return 1;
   }
   return 0;
 }
@@ -1663,7 +1665,7 @@ int poly_class_reflect_arm(Compiler *c, int id, const char *name, int *cls_only)
                 (members has its arm in emit_poly_call) */
              (g_gen_cls_answers && nt_ref(nt, id, "block") < 0 &&
               (class_side || sp_streq(name, "keyword_init?")))) &&
-            !recv_class_value_defines(c, name);
+            !recv_class_value_defines(c, id, name);
   if (cls_only)
     *cls_only = arm && (class_side || sp_streq(name, "superclass")) && recv_user_defines(c, name);
   return arm;
@@ -1718,7 +1720,7 @@ void poly_specials0(Compiler *c, int id, const char *name, PolySpecials0 *s) {
      inspect keep the older rule, as a program's own to_s is common and the
      class arm's text beside it does not fit a shared String slot. */
   int is_class_named = is_name_reader(name) &&
-                       !(sp_streq(name, "name") ? recv_user_cdefines(c, name) : recv_user_defines(c, name));
+                       !(is_class_name_name(name) ? recv_user_cdefines(c, id, name) : recv_user_defines(c, name));
   int is_class_reflect_cls_only = 0;
   int is_class_reflect = poly_class_reflect_arm(c, id, name, &is_class_reflect_cls_only);
   /* `members` on a Class read out of a container is its member list (the
@@ -1787,7 +1789,7 @@ void poly_specials0(Compiler *c, int id, const char *name, PolySpecials0 *s) {
     int is_call = comp_poly_arm_defines(c, k, name) ||
                   (nt_ref(nt, id, "block") >= 0 && c->classes[k].is_native_class &&
                    call_target(c, id, k, name, 0, NULL) >= 0);
-    if (is_call || (!c->classes[k].is_native_class && comp_reader_in_chain(c, k, name, NULL))) ncand++;
+    if (is_call || (!c->classes[k].is_native_class && call_attr_target(c, id, k, name, CT_ATTR, NULL))) ncand++;
     /* The root decision counts only the arms the switch below will carry:
        a class no reachable code constructs gets no arm, so it must not
        decide the root either. A dead FFI wrapper's Vector2 counted as a
@@ -1947,13 +1949,12 @@ int emit_poly_obj_default0(Compiler *c, int id, const char *name, int argc, TyKi
    them)? The dispatch key then keeps a non-object value off it. */
 int poly_key_cls0(Compiler *c, int call, const char *name, int argc, int kwh, int pos_argc, int splat_a) {
   if (argc == 0) {
-    int cls0_rd = -1;
     int cls0_mi = c->nclasses > 0 ? call_target(c, call, 0, name, 0, NULL) : -1;
     char cls0_exp[600];
     return ((cls0_mi >= 0 && c->scopes[cls0_mi].nrequired == 0) ||
             /* an arm refusing no arguments raises, and is a `case 0:` all the same */
             poly_arm_refuses_none(c, cls0_mi, cls0_exp, sizeof cls0_exp) ||
-            (c->nclasses > 0 && comp_reader_in_chain(c, 0, name, &cls0_rd))) &&
+            (c->nclasses > 0 && call_attr_target(c, call, 0, name, CT_ATTR, NULL))) &&
            c->nclasses > 0 &&
            (c->classes[0].instantiated || class_is_prim_reopen(c, 0));
   }
@@ -3096,6 +3097,16 @@ int emit_poly_defaults0(Compiler *c, int id, int recv, const char *name, const P
       else plan_put_boxed(c, plan_slot_oint(c, id, ret), is_scalar_ret(ret) ? ret : TY_INT, qv, b);
       buf_puts(b, "; break;");
     }
+  }
+  /* a boxed ConditionVariable's #signal and #broadcast, beside a user class's own */
+  if (argc == 0 && (sp_streq(name, "signal") || sp_streq(name, "broadcast"))) {
+    if (g_plan_check) pa_observe(PA_BUILTIN, PA_KEY_BUILTIN + PB_N_CONDVAR, -1, TY_UNKNOWN, PC_SAME);
+    char cv[96];
+    snprintf(cv, sizeof cv, "((void)sp_CondVar_%s((sp_condvar *)_t%d.v.p), _t%d)", name, tv, tv);
+    buf_printf(b, " case SP_BUILTIN_CONDVAR: _t%d = ", tr);
+    if (ret == TY_POLY) buf_puts(b, cv);
+    else emit_unbox_text(c, ret, cv, b);
+    buf_puts(b, "; break;");
   }
   /* IO#read on a poly value when a user class owns `read` (ffi's
      Pointer#read(type)): a File in the same slot still reads itself */

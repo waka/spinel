@@ -639,8 +639,8 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
          permission bits, which reach open(2) for either mode form */
       int mnode = kw_mode >= 0 ? kw_mode : argc >= 2 ? argv[1] : -1;
       int int_mode = mnode >= 0 &&
-                     (comp_ntype(c, mnode) == TY_INT ||
-                      obj_conv_method(c, comp_ntype(c, mnode), "to_int", TY_INT, NULL) >= 0);
+                     (repr_of(c, mnode).as_ty == TY_INT ||
+                      obj_conv_method(c, mnode, repr_of(c, mnode).as_ty, "to_int", TY_INT, NULL) >= 0);
       int perm = -1;
       if (nt_argv_kwh(nt, argv, argc) >= 0)
         perm = struct_kwarg_value(c, argv[argc - 1], "perm");
@@ -1043,7 +1043,7 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       if (at != TY_INT && at != TY_FLOAT && at != TY_BIGINT && at != TY_UNKNOWN) {
         /* an object answering #to_int is its Integer; any other class is
            CRuby's "can't convert X into an exact number" */
-        if (ty_is_object(at) && obj_conv_method(c, at, "to_int", TY_INT, NULL) >= 0) {
+        if (ty_is_object(at) && obj_conv_method(c, argv[0], at, "to_int", TY_INT, NULL) >= 0) {
           buf_puts(b, "sp_time_at_int("); emit_int_expr(c, argv[0], b); buf_puts(b, ")");
           return 1;
         }
@@ -1375,6 +1375,19 @@ int emit_call_module_fn_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
       const char *unit = NULL;
       if (argc >= 2 && nt_kind(nt, argv[1]) == NK_SymbolNode)
         unit = nt_str(nt, argv[1], "value");
+      /* a unit that is not a Symbol literal (a local, a keyword hash, a
+         String) is judged at run time: the clock id runs first, then the
+         unit; the result is boxed, an Integer or a Float by the unit */
+      if (argc == 2 && !unit && nt_kind(nt, argv[1]) != NK_NilNode) {
+        int t = ++g_tmp;
+        buf_printf(b, "({ sp_int _clk%d = ", t);
+        if (!emit_clock_id(c, argv[0], b)) emit_int_expr(c, argv[0], b);
+        buf_printf(b, "; sp_RbVal _clu%d = ", t);
+        emit_boxed(c, argv[1], b);
+        buf_printf(b, "; sp_process_clock_dyn(_clk%d, _clu%d, %d); })", t, t,
+                   sp_streq(name, "clock_getres") ? 1 : 0);
+        return 1;
+      }
       /* an unknown literal unit is CRuby's ArgumentError, not a silent
          float_second (#2727) */
       if (unit && !sp_streq(unit, "nanosecond") && !sp_streq(unit, "microsecond") &&
@@ -1650,7 +1663,7 @@ else {
      `{...}.to_json` inside a user #to_json is ordinary. A user class that
      defines its own to_json keeps the dispatch (this arm declines then). */
   if (recv >= 0 && sp_streq(name, "to_json") && nt_ref(nt, id, "block") < 0 &&
-      sp_feature_required("json") && json_to_json_is_builtin(c, recv)) {
+      sp_feature_required("json") && json_to_json_is_builtin(c, id, recv)) {
     /* every builtin's #to_json takes an optional state and nothing more
        (a boxed one, whose class the arity guard cannot name, included) */
     if (argc > 1) {
@@ -1660,9 +1673,19 @@ else {
                     " (const char *)0; })", argc);
       return 1;
     }
-    for (int a = 0; a < argc; a++) { buf_puts(b, "((void)("); emit_boxed(c, argv[a], b); buf_puts(b, "), "); }
+    /* a state given is read as generate's options (sp_json_generate_options),
+       the receiver evaluated first */
+    if (argc == 1) {
+      /* as JSON.generate's options arm: a user conversion may run, and the
+         new String's answer clears a published handle */
+      g_conv_emitted++;
+      int t = ++g_tmp;
+      buf_printf(b, "sp_strface_unpub(({ sp_RbVal _t%d = ", t); emit_boxed(c, recv, b);
+      buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_json_generate_options(_t%d, ", t, t); emit_boxed(c, argv[0], b);
+      buf_puts(b, ", 2); }))");
+      return 1;
+    }
     buf_puts(b, "sp_json_val("); emit_boxed(c, recv, b); buf_puts(b, ")");
-    for (int a = 0; a < argc; a++) buf_puts(b, ")");
     return 1;
   }
 
@@ -2299,7 +2322,7 @@ int emit_call_enum_random_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
     /* find_index(v) { } where an Enumerable reopen of the program defines
        find_index: that method answers for the Enumerator, not a value row */
     if (sp_streq(name, "find_index") && argc >= 1 && nt_ref(nt, id, "block") >= 0 &&
-        an_enum_own_find_index(c)) return 0;
+        an_enum_own_find_index(c, id)) return 0;
     /* the readers that render the receiver and the arguments: builtin-op rows */
     if (emit_builtin_op(c, id, recv, TY_ENUMERATOR, name, b)) return 1;
     /* find_index(v) walks it only as far as the hit, so an endless one

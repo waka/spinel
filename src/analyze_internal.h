@@ -224,6 +224,9 @@ int blk_locals_have(const char *locals, const char *nm);
    id >= 0; id = an_calls_named_next(id)). Check each node as before. */
 int an_calls_named_first(Compiler *c, const char *name);
 int an_calls_named_next(int id);
+/* Puts a call `name` (args, -1 for none) between call id and its receiver,
+   carrying id's `&.` and receiver visibility; the new call, or -1. */
+int an_interpose_recv_call(Compiler *c, int id, const char *name, int args);
 /* The calls below n0 named any of names (NULL-terminated), ascending, into
    *out, which the caller frees: their count. A pass that acts only on calls
    of those names, and renames no call it has not reached yet, walks these
@@ -247,8 +250,8 @@ int bind_coerce_operator_params(Compiler *c);
 int is_cmp_op(const char *op);
 int is_numeric_coerce_op(const char *op);
 int class_coerce_emittable(Compiler *c, int k);
-int class_has_coerce_shape(Compiler *c, int k);
-int class_has_to_str_shape(Compiler *c, int k);
+int class_has_coerce_shape(Compiler *c, int site, int op, int k);
+int class_has_to_str_shape(Compiler *c, int site, int op, int k);
 int is_eq_op(const char *op);
 int is_void_call(const char *name);
 /* The enclosing scope's own chain owns this receiverless call's name, so no
@@ -293,6 +296,7 @@ int method_value_leaves_or_nil_narrow(Compiler *c, int mi, int *out, int cap);
 int cmethod_receiver_class(Compiler *c, int mi, int ci);
 int block_given_tail_then_last(Compiler *c, int last);
 int super_forwards_caller_block(Compiler *c, int id);
+int block_pass_is_callers(Compiler *c, const Scope *scope, int block);
 /* 1 if `node` is `<&block-param>.call(...)` / .() / [] for method mi -- the
    explicit-call equivalent of `yield`, inlined the same way. */
 int is_blk_param_call(Compiler *c, int node, int mi);
@@ -340,7 +344,7 @@ int yield_value_diverges(Compiler *c, int mi);
 int node_is_scope_tail(Compiler *c, int mi, int id);
 TyKind yield_aware_elem_ty(Compiler *c, int node);
 int an_user_defines_method(Compiler *c, const char *name);
-int an_enum_own_find_index(Compiler *c);
+int an_enum_own_find_index(Compiler *c, int id);
 int an_enum_prog_method(Compiler *c, const char *nm);
 /* Can no method of the program take `name`: no def of it or of method_missing, and no alias, define_method, attr_* or Struct / Data member that names it (or names a method only the run time knows)? */
 int an_name_binder_free(Compiler *c, const char *name);
@@ -411,6 +415,10 @@ TyKind infer_uncached(Compiler *c, int id);
 void scope_reserve_param(Scope *s);
 void scope_add_param(Scope *s, const char *name, int defnode);
 void collect_def_params(Compiler *c, int def_id, Scope *s);
+/* Class k's instance method `name` that def (disp_def_build, at no line of
+   the program) declares, a helper no call of the program names (the space
+   in its name, name_is_synth_method), its scope walked, reached when run */
+int synth_def_scope(Compiler *c, int k, const char *name, int def, int run);
 char *dm_lit_str(Compiler *c, int lit);
 char *dm_eval_name(Compiler *c, int node, const char *bv, int lit);
 TyKind dm_lit_type(Compiler *c, int lit);
@@ -565,6 +573,12 @@ int rejoin_local_writes(Compiler *c);
 int widen_arrays_from_map_bang(Compiler *c);
 void intern_block_params(Compiler *c);
 int local_all_writes_empty_array(Compiler *c, Scope *sc, const char *name);
+int local_all_writes_fresh_array(Compiler *c, Scope *sc, const char *name);   /* analyze_pass.c */
+/* Widen what array argument `arg` can be to the general Array (analyze_pass.c):
+   1 on a change */
+int widen_arg_array(Compiler *c, int arg);
+/* Can every array value `v` can be be the general Array (analyze_pass.c)? */
+int array_sources_widenable(Compiler *c, int v);
 int infer_param_hash_value(Compiler *c);
 int bind_call_params(Compiler *c, int call_id, int mi);
 int param_src_misfits(Compiler *c, Scope *m, LocalVar *p, TyKind ct, const int *argv,
@@ -639,6 +653,9 @@ TyKind infer_op_assign_type(Compiler *c, TyKind lhs, int write);
 TyKind infer_int_pow_type(Compiler *c, int id, int recv, int exp);
 int infer_array_call(Compiler *c, int id, TyKind rt, TyKind *out);
 int infer_array_reduce(Compiler *c, int id, TyKind rt, TyKind *out);
+/* The Array kind an empty `[]` seed of reduce/inject call id takes from its block's pushes
+   (analyze_infer_recv.c): an Integer or Float Array, TY_UNKNOWN while not typed, else TY_POLY_ARRAY */
+TyKind reduce_empty_seed_kind(Compiler *c, int id);
 int infer_hash_call(Compiler *c, int id, TyKind rt, TyKind *out);
 /* bop_find for the call `id`, recording the row under --plan-check */
 struct BuiltinOp;
@@ -797,7 +814,13 @@ int desugar_index_assign_value(Compiler *c);
 int desugar_io_console_modes(Compiler *c);
 int desugar_reader_index_write(Compiler *c);
 int desugar_body_module_eval(Compiler *c);
+int desugar_sclass_hooks(Compiler *c);
 int desugar_instance_eval_defs(Compiler *c);
+int desugar_user_send_others(Compiler *c);
+int desugar_missing_method_calls(Compiler *c);
+int ie_receiverless_self_class_of(Compiler *c, int id);
+int ie_block_self_class_of(Compiler *c, int id);
+int desugar_self_class_eval_blocks(Compiler *c);
 int enumerator_own_with_object(Compiler *c, int id);
 int block_body_breaks(const NodeTable *nt, int node);   /* a break that leaves this block */
 const LowerRow *lower_row_nt(const NodeTable *nt, int id, int family);   /* the family's row call id's shape matches */
@@ -933,7 +956,9 @@ int desugar_static_class_eval(Compiler *c, HostStep *h);   /* analyze_desugar.c:
 int sce_span(Compiler *c, HostStep *h, int owner, int body, int at, int n, const char *locals, const char *gone);   /* ... over spliced statements */
 void sce_facts_free(struct SceFacts *f);
 int sce_graft_text(Compiler *c, HostStep *h, int owner, const char *text, int site, LoadPoint at, int **out, int *n);   /* a macro's computed class_eval text, grafted, not placed */
-int bo_may_act(const NodeTable *nt, int e);   /* analyze.c: can evaluating e do anything observable (a call may; a read of a local, an instance variable or a constant, a literal cannot) */
+int an_temp_node(NodeTable *nt, Scope *sc, const char *nm, int value);   /* analyze_desugar.c: a local temp's write of value, or (value < 0) its read */
+int bo_shallow_copy(NodeTable *nt, int id);   /* analyze.c: a copy of a call's fields in a fresh node, for the parentheses that run it in the call's place */
+int bo_may_act(Compiler *c, int e);   /* analyze.c: can evaluating e do anything observable (a call may; a read of a local, an instance variable or a constant, a literal cannot) */
 int host_prewalk_shape(NodeTable *nt, const int *ids, int n);   /* a node of the span a pre-walk step reads, or -1 */
 void lower_finish(Compiler *c, LowerCtx *lc);   /* frees; under the check, reports and exits */
 
@@ -1047,6 +1072,8 @@ int type_block_rest_params(Compiler *c);
 void check_block_rest_support(Compiler *c);
 int desugar_dynamic_send(Compiler *c);
 void expand_static_splat_args(Compiler *c, int from, int count);
+void rest_param_copy_name(char *out, size_t cap, const char *rp);   /* the local the reads of an assigned *rest move to */
+int fwd_fixed_call_arity(const NodeTable *nt, const char *name);   /* the one positional count every call of a `...` forwarder passes, -1 when they differ or pass a splat or keywords, -2 for no call */
 int desugar_dynamic_method(Compiler *c);
 int desugar_method_call_runtime_name(Compiler *c);
 int desugar_builtin_method_defined_conds(Compiler *c);
@@ -1066,20 +1093,27 @@ typedef struct { const char *sel; int val; const char *callee; int hist, stmt; }
 int disp_def_build(NodeTable *nt, int like, const char *name, int sg, int ar, int blk,
                    const DispArm *arm, int narm, int els);
 /* `if <arm[0].sel> == <arm[0].val> || ... then <then> end`, a statement
-   ahead of a call kept as it is behind its versions' cells, and `(<st[0]>;
-   ...; <expr>)` (analyze_desugar.c) */
+   ahead of a call kept as it is behind its versions' cells, its test alone,
+   `if <pred> then <then> else <els> end`, `case when <when[0]> then
+   <then[0]> ... else <els> end`, `self.instance_of?(K)` for class ci (the
+   builtin's class test), and `(<st[0]>; ...; <expr>)` (analyze_desugar.c) */
 int disp_cell_guard(NodeTable *nt, const DispArm *arm, int narm, int then);
+int disp_cell_any(NodeTable *nt, const DispArm *arm, int narm);
+int disp_choose(NodeTable *nt, int pred, int then, int els);
+int disp_case(NodeTable *nt, const int *when, const int *then, int n, int els);
+int disp_self_class_is(Compiler *c, int ci);
 int disp_ahead(NodeTable *nt, const int *st, int n, int expr);
 /* The operands of call id that run code held in locals in CRuby's order,
    their writes into *pre, malloc'd with room for one more (analyze.c): how
    many, -1 for a form not held */
-int sd_hold_call_operands(Compiler *c, int id, int **pre);
+int sd_hold_call_operands(Compiler *c, int id, int **pre, int tail);
 int disp_raise_no_method(Compiler *c, const char *name, const char *msg, int ar, int vcall);
 int disp_raise_no_method_self(Compiler *c, const char *name, const char *head, int inst, int ar, int vcall);
 int disp_forward_call(NodeTable *nt, const char *callee, int ar, int blk);
 int disp_self_call(NodeTable *nt, const char *callee, int ar, int blk);
 int disp_when_unspread(Compiler *c, int call);
 int disp_cell_test(NodeTable *nt, const char *sel, int val, int then, int els);
+int disp_raise_no_method_self(Compiler *c, const char *name, const char *head, int inst, int ar, int vcall);
 int disp_super_call(NodeTable *nt, int ar, int blk);
 int disp_method_missing_call(NodeTable *nt, const char *name, int ar, int blk);
 int desugar_dynamic_respond_to(Compiler *c);
@@ -1087,6 +1121,7 @@ int desugar_toplevel_instance_exec(Compiler *c);
 int desugar_binding_lvget(Compiler *c);
 int desugar_step_kwargs(Compiler *c);
 int desugar_defined_method_call(Compiler *c);
+int desugar_respond_to_flag(Compiler *c);
 int desugar_respond_to_missing(Compiler *c);
 int desugar_respond_to_probe(Compiler *c);
 int desugar_symbol_to_proc_call(Compiler *c);
@@ -1211,6 +1246,10 @@ struct ElabNames { ANameIndex hdr; int hdr_unknown, hdr_built; ANameIndex byname
 /* The qualified names the class pass gave constants written under a module
    path ("Mod__LIMIT"), and each tail after a "__": see qc_leaf_qualified. */
 struct QcConstNames { ANameHash quals, leaves; };
+/* the callers memo of the share-strings walks under a pass (analyze.c,
+   strbuf_scope_callers): the pass's `changed` and `any` */
+void sb_targets_share_begin(int *changed, int *any);
+void sb_targets_share_end(void);
 void cr_class_only_names(Compiler *c, ANameHash *out);   /* the names only plain classes' methods hold */
 /* The block-passing call sites, and the supers, of the node table, indexed
    for yield_value_type and its kin (yvt_build, analyze_util.c): built once
@@ -1274,7 +1313,7 @@ int ie_own_recv_block(Compiler *c, int call);
    nodes, and IE_RB_IN on the nodes whose self is another object than their
    scope's: OWN ones, and the blocks build_ie_map resolves to a call that
    hands them to another receiver, a forwarding method's (`def build(&b) =
-   @root.instance_eval(&b)`) too. Read afresh by each build_ie_map, the
+   @root.instance_eval(&b)`) too, IE_RB_FWD on each such literal block. Read afresh by each build_ie_map, the
    structure's also when the tree grew; c->ie_map.rb_ver moves with them. */
 const unsigned char *ie_rebound_marks(Compiler *c);
 int ie_rebound_node(Compiler *c, int node);

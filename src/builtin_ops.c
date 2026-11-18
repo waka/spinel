@@ -1211,6 +1211,24 @@ static const BuiltinOp bop_rows[] = {
   { TY_OBJ_RANGE, "to_a", 0, 0, BF_NONE, TY_POLY_ARRAY, BOPE_TEMPLATE, "sp_orange_to_a($r)", 0 },
   { TY_OBJ_RANGE, "entries", 0, 0, BF_NONE, TY_POLY_ARRAY, BOPE_TEMPLATE, "sp_orange_to_a($r)", 0 },
   { TY_OBJ_RANGE, "freeze", 0, 0, BF_ANY, TY_OBJ_RANGE, BOPE_TEMPLATE, "({ sp_ObjRange *_t$T = $r; _t$T->unfrozen = 0; _t$T; })", 0 },
+  /* ENV. Its calls are emitted by the name-matched arms still (BOPE_NONE);
+     these rows type the ones a rule for any typed receiver would answer
+     first. ENV cannot be copied or frozen: each raises TypeError. */
+  { TY_ENV, "dup", 0, 0, BF_ANY, TY_POLY, BOPE_NONE },
+  { TY_ENV, "clone", 0, 0, BF_ANY, TY_POLY, BOPE_NONE, NULL, 0, 0, BOPF_KEYWORDS },
+  { TY_ENV, "freeze", 0, 0, BF_ANY, TY_POLY, BOPE_NONE },
+  /* ENV is one object: it is equal to itself and to nothing else (a value of
+     another kind is never ENV) */
+  { TY_ENV, "equal?", 1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "((void)($r), (void)($e0), (sp_bool)1)", BOP_K(TY_ENV) },
+  { TY_ENV, "equal?", 1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "((void)($r), (void)($e0), (sp_bool)0)", 0 },
+  { TY_ENV, "==", 1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "((void)($r), (void)($e0), (sp_bool)1)", BOP_K(TY_ENV) },
+  { TY_ENV, "==", 1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "((void)($r), (void)($e0), (sp_bool)0)", 0 },
+  { TY_ENV, "eql?", 1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "((void)($r), (void)($e0), (sp_bool)1)", BOP_K(TY_ENV) },
+  { TY_ENV, "eql?", 1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "((void)($r), (void)($e0), (sp_bool)0)", 0 },
+  { TY_ENV, "!=", 1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "((void)($r), (void)($e0), (sp_bool)0)", BOP_K(TY_ENV) },
+  { TY_ENV, "!=", 1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "((void)($r), (void)($e0), (sp_bool)1)", 0 },
+  { TY_ENV, "nil?", 0, 0, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "((void)($r), (sp_bool)0)", 0 },
+  { TY_ENV, "itself", 0, 0, BF_ANY, TY_ENV, BOPE_TEMPLATE, "$r", 0 },
   /* String range ("a".."e"): the endpoints answer natively (with a count,
      the materialized prefix); every traversal rides the element array
      (#3064). step(n) / %(n) is an Enumerator over every nth member (#3671).
@@ -1221,7 +1239,7 @@ static const BuiltinOp bop_rows[] = {
   { TY_STR_RANGE, "min",          0,   0, BF_NONE,     TY_STRING,      BOPE_TEMPLATE, "sp_srange_min_v($r)" },
   { TY_STR_RANGE, "max",          0,   0, BF_NONE,     TY_STRING,      BOPE_TEMPLATE, "sp_srange_max_v($r)" },
   /* [min, max] off the endpoints, max first as CRuby's range_minmax evaluates them */
-  { TY_STR_RANGE, "minmax",       0,   0, BF_NONE,     TY_STR_ARRAY,   BOPE_TEMPLATE, "({ sp_StrRange _t$T = $r; SP_GC_ROOT_STR(_t$T.first); SP_GC_ROOT_STR(_t$T.last); const char *_t$t = sp_srange_max_v(_t$T); SP_GC_ROOT_STR(_t$t); const char *_t$u = sp_srange_min_v(_t$T); SP_GC_ROOT_STR(_t$u); sp_StrArray *_r$T = sp_StrArray_new(); SP_GC_ROOT(_r$T); sp_StrArray_push(_r$T, _t$u); sp_StrArray_push(_r$T, _t$t); _r$T; })" },
+  { TY_STR_RANGE, "minmax",       0,   0, BF_NONE,     TY_STR_ARRAY,   BOPE_TEMPLATE, "({ sp_StrRange _t$T = $r; SP_GC_ROOT_STR(_t$T.first); SP_GC_ROOT_STR(_t$T.last); const char *_t$t = sp_srange_max_v(_t$T); SP_GC_ROOT_STR(_t$t); const char *_t$u = sp_srange_min_v(_t$T); SP_GC_ROOT_STR(_t$u); sp_StrArray *_r$T = sp_StrArray_new(); SP_GC_ROOT(_r$T); sp_StrArray_push_e(_r$T, SP_STR_HDL(_t$u)); sp_StrArray_push_e(_r$T, SP_STR_HDL(_t$t)); _r$T; })" },
   { TY_STR_RANGE, "to_s",         0,   0, BF_ANY,      TY_STRING,      BOPE_TEMPLATE, "({ sp_StrRange _t$T = $r; sp_srange_to_s(_t$T); })" },
   { TY_STR_RANGE, "inspect",      0,   0, BF_ANY,      TY_STRING,      BOPE_TEMPLATE, "({ sp_StrRange _t$T = $r; sp_srange_inspect(_t$T); })" },
   { TY_STR_RANGE, "first",        0,   0, BF_ANY,      TY_STRING,      BOPE_TEMPLATE, "({ sp_StrRange _t$T = $r; $B; })" },
@@ -1273,7 +1291,8 @@ static const BuiltinOp bop_rows[] = {
   { TY_STR_RANGE, "each_with_index", 0, 0, BF_NONE,    TY_ENUMERATOR,  BOPE_TEMPLATE, "sp_srange_ewi(sp_box_srange($r))" },
   { TY_STR_RANGE, "each_slice",   1,   1, BF_NONE,     TY_ENUMERATOR,  BOPE_TEMPLATE, "({ sp_RbVal _t$y = sp_box_srange($r); SP_GC_ROOT_RBVAL(_t$y); sp_int _t$u = $i0; sp_srange_regroup(_t$y, _t$u, 0); })" },
   { TY_STR_RANGE, "each_cons",    1,   1, BF_NONE,     TY_ENUMERATOR,  BOPE_TEMPLATE, "({ sp_RbVal _t$y = sp_box_srange($r); SP_GC_ROOT_RBVAL(_t$y); sp_int _t$u = $i0; sp_srange_regroup(_t$y, _t$u, 1); })" },
-  { TY_STR_RANGE, "find_index",   1,   1, BF_ANY,      TY_POLY,        BOPE_TEMPLATE, "({ sp_RbVal _t$y = sp_box_srange($r); SP_GC_ROOT_RBVAL(_t$y); sp_RbVal _t$u = $b0; SP_GC_ROOT_RBVAL(_t$u); sp_box_oint(sp_srange_find_index(_t$y, _t$u)); })" },
+  /* the position, nil on a miss: an Integer that may be nil, as an Array's find_index answers */
+  { TY_STR_RANGE, "find_index",   1,   1, BF_ANY,      BOPR_ARRAY_INDEX, BOPE_TEMPLATE, "$<({ sp_RbVal _t$y = sp_box_srange($r); SP_GC_ROOT_RBVAL(_t$y); sp_RbVal _t$u = $b0; SP_GC_ROOT_RBVAL(_t$u); sp_srange_find_index(_t$y, _t$u); })$>" },
   { TY_STR_RANGE, "step",         1,   1, BF_NONE,     TY_ENUMERATOR,  BOPE_TEMPLATE, "({ sp_RbVal _t$y = sp_box_srange($r); SP_GC_ROOT_RBVAL(_t$y); sp_srange_step_enum(_t$y, $b0, SPL(\"step\")); })" },
   { TY_STR_RANGE, "step",         0,   0, BF_NONE,     TY_ENUMERATOR,  BOPE_TEMPLATE, "({ sp_RbVal _t$y = sp_box_srange($r); SP_GC_ROOT_RBVAL(_t$y); sp_srange_stepped_enum(_t$y, 1, SPL(\"step\"), 0); })" },  /* no argument: a step of 1, labeled as written */
   { TY_STR_RANGE, "%",            1,   1, BF_NONE,     TY_ENUMERATOR,  BOPE_TEMPLATE, "({ sp_RbVal _t$y = sp_box_srange($r); SP_GC_ROOT_RBVAL(_t$y); sp_srange_step_enum(_t$y, $b0, SPL(\"%\")); })" },
@@ -2275,6 +2294,7 @@ static const BuiltinOp bop_rows[] = {
   { TY_STRING, "byteslice",       1,   1, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "({ sp_Range _t$t = sp_range_ix($e0); sp_str_byteslice_range($r, _t$t.first, _t$t.last, _t$t.excl, _t$t.nobeg, _t$t.noend); })", BOP_K(TY_RANGE) | BOP_K(TY_FLOAT_RANGE) },
   { TY_STRING, "byteslice",       1,   1, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "sp_str_byteslice1($r, $i0)", 0 },
   { TY_STRING, "byteslice",       0, 127, BF_ANY,      TY_STRING,     BOPE_NONE },
+  { TY_STRING, "bytesplice",      2,   5, BF_ANY,      TY_STRING,     BOPE_STRING_BYTESPLICE, NULL, 0, 0, BOPF_SELF, 7 },
   { TY_STRING, "bytesplice",      0, 127, BF_ANY,      TY_STRING,     BOPE_NONE, NULL, 0, 0, BOPF_SELF },
   /* append_as_bytes() appends nothing and answers its receiver, which it
      checks is not frozen (emit_str_mutator_call's stage 6, as concat() does) */
@@ -3245,15 +3265,19 @@ int bop_flags(TyKind rt, const char *name) {
 /* The rows are sorted by kind, so a name's rows lie apart: the scan is over
    the table, with the first letter tested before the name. A library's row
    says what CRuby's method takes only where its fact holds
-   (builtin_library_fact_holds). */
-static int bop_name_rows(const char *name, int want_kw) {
-  if (!name) return 0;
-  for (int i = 0; i < BOP_NROWS; i++) {
-    const BuiltinOp *r = &bop_rows[i];
-    if (r->name[0] != name[0] || !sp_streq(r->name, name)) continue;
-    if (!builtin_library_fact_holds(r->feature)) continue;
-    if (!!(r->flags & BOPF_KEYWORDS) == want_kw) return 1;
+   (builtin_library_fact_holds). The next row of `name` after row *i (-1 to
+   start) whose library the program has, NULL past the last. */
+static const BuiltinOp *bop_name_row_next(const char *name, int *i) {
+  while (name && ++*i < BOP_NROWS) {
+    const BuiltinOp *r = &bop_rows[*i];
+    if (r->name[0] == name[0] && sp_streq(r->name, name) && builtin_library_fact_holds(r->feature)) return r;
   }
+  return NULL;
+}
+static int bop_name_rows(const char *name, int want_kw) {
+  const BuiltinOp *r;
+  for (int i = -1; (r = bop_name_row_next(name, &i));)
+    if (!!(r->flags & BOPF_KEYWORDS) == want_kw) return 1;
   return 0;
 }
 int bop_name_kwless(const char *name) { return bop_name_rows(name, 0); }
@@ -3270,6 +3294,27 @@ int bop_kernel_answers(const char *name, int argc, int has_block) {
     const BuiltinOp *r = &bop_rows[i];
     if (r->recv == BOP_KERNEL && r->name[0] == name[0] && !(r->flags & BOPF_INTERNAL) && sp_streq(r->name, name)) return 1;
   }
+  return 0;
+}
+
+/* Is the row a method of a builtin class below Object, one a send to a
+   value of it reaches ahead of a top-level def: of a kind the core classes
+   name (core_of_type: an IO's rows are every IO's, a File and a socket
+   among them), or of every Array or Hash kind? Not Object's own surface
+   (TY_POLY, BOP_KERNEL, BOP_IVAR_LESS), Module's (TY_CLASS,
+   bop_class_answers), BasicObject's (BOPF_BASIC_OBJECT) or the compiler's
+   own (BOPF_INTERNAL). */
+static int bop_row_below_object(const BuiltinOp *r) {
+  if ((r->flags & (BOPF_INTERNAL | BOPF_BASIC_OBJECT)) || r->recv == TY_CLASS) return 0;
+  return r->recv == BOP_ANY_ARRAY || r->recv == BOP_ANY_HASH || core_of_type(r->recv) >= 0;
+}
+
+/* See builtin_ops.h. */
+int bop_below_object_answers(const char *name) {
+  const BuiltinOp *r;
+  if (!name || builtin_object_method_known(name)) return 0;
+  for (int i = -1; (r = bop_name_row_next(name, &i));)
+    if (bop_row_below_object(r)) return 1;
   return 0;
 }
 
@@ -3397,8 +3442,7 @@ TyKind bop_result(const BuiltinOp *op, TyKind rt) {
   case (int)BOPR_HASH_KEY_OF: return rt == TY_SYM_POLY_HASH ? TY_SYMBOL : TY_POLY;
   case (int)BOPR_HASH_INVERT: return rt == TY_STR_STR_HASH ? TY_STR_STR_HASH : TY_POLY_POLY_HASH;
   case (int)BOPR_ARRAY_SUM: return rt == TY_INT_ARRAY ? TY_UNKNOWN : fold_sum_type(TY_INT, ty_array_elem(rt), 0);
-  case (int)BOPR_ARRAY_INDEX:
-    return rt == TY_INT_ARRAY || rt == TY_STR_ARRAY || rt == TY_FLOAT_ARRAY ? TY_POLY : TY_INT;
+  case (int)BOPR_ARRAY_INDEX: return TY_INT;
   case (int)BOPR_ARRAY_TUPLES: return rt == TY_POLY_ARRAY ? TY_POLY_ARRAY : TY_ENUMERATOR;
   case (int)BOPR_ASSOC: {
     /* the matching sub-array of a poly array; an array of numbers, Strings,
@@ -3428,6 +3472,10 @@ TyKind bop_result_args(const BuiltinOp *op, TyKind rt, int argc, BopArgKind arg_
     return argc == 1 ? fold_sum_type(arg_of(ud, 0), ty_array_elem(rt), facts & BOPX_PROMOTE) : TY_UNKNOWN;
   case (int)BOPR_ARRAY_TUPLES:
     return rt == TY_POLY_ARRAY && !(facts & BOPX_KEPT) ? TY_ENUMERATOR : bop_result(op, rt);
+  case (int)BOPR_ARRAY_INDEX:
+    return (facts & BOPX_BOXED_USE) && (rt == TY_INT_ARRAY || rt == TY_STR_ARRAY || rt == TY_FLOAT_ARRAY ||
+                                        rt == TY_STR_RANGE)
+           ? TY_POLY : bop_result(op, rt);
   case (int)BOPR_ARRAY_PLUS:
   case (int)BOPR_ARRAY_SETOP:
     break;

@@ -10,6 +10,7 @@
 #include "call_plan.h"
 #include "value_pos.h"
 #include "codegen_call_arms.h"
+#include "implicit_calls.h"
 
 /* a Regexp literal's match / match? / ===, the match family on a String, gsub, and String#% */
 /* The text emit_boxed gives an Integer or a Float is most often one box
@@ -44,22 +45,22 @@ static const char *boxed_number_value(char *text, TyKind at, char **val) {
    -- a boxed value, a Symbol, an object with no #to_str, a number -- takes
    CRuby's reg_operand: a Symbol by its name, a #to_str found at run time, or
    the TypeError naming the operand's class. */
-static int re_operand_at_runtime(Compiler *c, TyKind a0) {
+static int re_operand_at_runtime(Compiler *c, int arg, TyKind a0) {
   if (a0 == TY_STRING || a0 == TY_NIL) return 0;
-  if (ty_is_object(a0) && comp_method_in_chain(c, ty_object_class(a0), "to_str", NULL) >= 0) return 0;
+  if (ty_is_object(a0) && cplan_implied_target(c, ic_operand_host(c, arg), arg, ty_object_class(a0), "to_str", CIT_TABLE, NULL) >= 0) return 0;
   return 1;
 }
 /* A matcher's operand as the `const char *` subject; `strict` is
    sp_re_operand's (all but === raise on a non-String). */
 static void emit_re_subject(Compiler *c, int arg, TyKind a0, int strict, Buf *b) {
-  if (!re_operand_at_runtime(c, a0)) { emit_str_expr_nilable(c, arg, b); return; }
+  if (!re_operand_at_runtime(c, arg, a0)) { emit_str_expr_nilable(c, arg, b); return; }
   buf_puts(b, "sp_re_operand("); emit_boxed(c, arg, b); buf_printf(b, ", %d)", strict);
 }
 /* `fn(pat, subject, pos)`: a converted subject is held rooted while the
    position, which may allocate, is evaluated after it. */
 static void emit_re_subject_at(Compiler *c, const char *fn, const char *pat, int arg, TyKind a0,
                                int pos, Buf *b) {
-  if (!re_operand_at_runtime(c, a0)) {
+  if (!re_operand_at_runtime(c, arg, a0)) {
     buf_printf(b, "%s(%s, ", fn, pat); emit_str_expr_nilable(c, arg, b);
     buf_puts(b, ", "); emit_int_expr(c, pos, b); buf_puts(b, ")");
     return;
@@ -692,7 +693,7 @@ no_gsub_enum:
           if (sp_streq(name, "===") && argc == 1) {
             /* === sets $~ as =~ does (the literal arm's sp_re_case_eq), and
                answers false for an operand match? raises on */
-            if (re_operand_at_runtime(c, a0)) {
+            if (re_operand_at_runtime(c, argv[0], a0)) {
               buf_printf(b, "sp_re_case_eq(%s, ", rp.p); emit_boxed(c, argv[0], b); buf_puts(b, ")");
             }
             else {
@@ -845,7 +846,7 @@ no_gsub_enum:
        object of a class of the program's that is no Array and has no to_ary
        is one argument, whose %s is its to_s, as CRuby formats it boxed. */
     int plain_obj = ty_is_object(at) && class_builtin_parent(c, ty_object_class(at)) == -116 &&
-                    comp_method_in_chain(c, ty_object_class(at), "to_ary", NULL) < 0;
+                    cplan_implied_target(c, id, argv[0], ty_object_class(at), "to_ary", CIT_TABLE, NULL) < 0;
     if (at == TY_POLY || plain_obj) {
       const char *fend = emit_str_format_held(c, recv, argv[0], -1, b);
       if (!fend) { buf_puts(b, "sp_str_format_polyarr("); emit_expr(c, recv, b); }
@@ -1264,8 +1265,9 @@ int emit_call_symbol_bool_string_arms(Compiler *c, int id, Buf *b, const NodeTab
       int eline_whole = eline_sep >= 0 && eline_chomp == 0 &&
                         repr_of(c, argv[0]).as_ty == TY_NIL;
       if (eline_whole)
-        buf_printf(b, "sp_StrArray *_t%d = sp_StrArray_new(); if (sp_str_byte_len(_t%d) > 0) sp_StrArray_push(_t%d, _t%d); ",
-                   tl, ts, tl, ts);
+      { char sn[24]; snprintf(sn, sizeof sn, "_t%d", ts);
+        buf_printf(b, "sp_StrArray *_t%d = sp_StrArray_new(); if (sp_str_byte_len(_t%d) > 0) ", tl, ts);
+        emit_kind_push(c, b, "Str", tl, sn); buf_puts(b, "; "); }
       else if (eline_sep >= 0) {
         buf_printf(b, "sp_StrArray *_t%d = ", tl);
         if (eline_chomp < 0) { emit_kw_flag(c, cv, b); buf_puts(b, " ? "); }
@@ -1787,15 +1789,16 @@ int emit_op_string_dedup(Compiler *c, const BopCtx *x, Buf *b) {
   return 1;
 }
 
-/* ---- String#[]=, #insert, #clear and #slice! (stage 7) ----
+/* ---- String#[]=, #insert, #clear, #slice! and #bytesplice (stage 7) ----
    A String slot holds the String's handle, so these rows change the String
    where it lives: the receiver's handle is taken once, before the arguments
-   run (CRuby evaluates the receiver first), and the new bytes are written
-   into it (sp_String_set_bin), which every name holding the String sees: a
-   variable, an ivar, self in a reopened String, an element, a call's
-   answer, the temp a `&.` tested, the String a bang on a held chain
-   answers. A String no name holds (a call's fresh answer) is changed in a
-   handle of its own, which nobody else reads.
+   run (CRuby evaluates the receiver first), and its bytes are spliced in
+   place (sp_String_splice_chars, sp_String_splice_bytes: the tail moves),
+   which every name holding the String sees: a variable, an ivar, self in
+   a reopened String, an element, a call's answer, the temp a `&.` tested,
+   the String a bang on a held chain answers. A String no name holds (a
+   call's fresh answer) is changed in a handle of its own, which nobody else
+   reads.
 
    Every operand runs once, in Ruby's order -- the receiver, then the
    arguments left to right -- before any check the method makes (StrMutOp);
@@ -1873,10 +1876,13 @@ static int str_mut_inert(Compiler *c, int n, int later_effects) {
 /* Holds argv[i] into *o. As an index (as_index), an Integer stays an
    sp_int and any other value is held boxed, for the conversion CRuby's
    NUM2LONG makes (str_mut_index); otherwise the operand is held as what it
-   is. */
-static void str_mut_hold(Compiler *c, const int *argv, int argc, int i, int as_index, StrMutOp *o, Buf *b) {
-  int n = argv[i], later = 0;
-  for (int j = i + 1; j < argc; j++) later |= subtree_has_side_effect(c, argv[j]);
+   is. A pure read is left where it is used unless a later operand can
+   change what it reads, or, with `changed`, code runs between its turn and
+   its use anyway (a conversion of an operand ahead of it). */
+static void str_mut_hold_as(Compiler *c, const int *argv, int argc, int i, int as_index, int changed,
+                            StrMutOp *o, Buf *b) {
+  int n = argv[i], later = changed;
+  for (int j = i + 1; j < argc && !later; j++) later |= subtree_has_side_effect(c, argv[j]);
   Repr r = repr_of(c, n);
   TyKind ty = r.as_ty;
   int boxed = r.kind == RK_BOXED || ty == TY_POLY || ty == TY_NIL || ty == TY_VOID || ty == TY_UNKNOWN ||
@@ -1887,6 +1893,9 @@ static void str_mut_hold(Compiler *c, const int *argv, int argc, int i, int as_i
   buf_puts(b, " ");
   o->t = hold_operand(c, n, boxed ? TY_POLY : ty, boxed, ++g_tmp, 1, "", b);
   if (!boxed) view_bind_temp(n, o->t);
+}
+static void str_mut_hold(Compiler *c, const int *argv, int argc, int i, int as_index, StrMutOp *o, Buf *b) {
+  str_mut_hold_as(c, argv, argc, i, as_index, 0, o, b);
 }
 
 /* The sp_int index operand o reads as: an Integer as it is; any other
@@ -1946,13 +1955,14 @@ static void str_mut_value_answer(Compiler *c, const BopCtx *x, const StrMutOp *o
   buf_puts(b, "; })");
 }
 
-/* `_t<t>` takes `s` spliced as `splice` (a call over its bytes), which
-   raises its IndexError first; sp_String_set_bin_enc raises FrozenError
-   after it, the order CRuby checks them in for []= and insert, and takes
-   the splice's encoding, which the compatibility rule picked (an
-   ASCII-only binary receiver takes a UTF-8 value's) */
-static void str_mut_set(Buf *b, int t, const char *splice) {
-  buf_printf(b, " sp_String_set_bin_enc(_t%d, %s);", t, splice);
+/* `splice`, a call that changes `_t<t>` where it lives
+   (sp_String_splice_chars or sp_String_splice_bytes): it raises its
+   IndexError first and FrozenError after it, the order CRuby checks them in
+   for []= and insert, and leaves the String in the encoding the
+   compatibility rule picked (an ASCII-only binary receiver takes a UTF-8
+   value's) */
+static void str_mut_set(Buf *b, const char *splice) {
+  buf_printf(b, " %s;", splice);
 }
 
 /* The forms of `[]=`, which CRuby picks by the key's class: an Integer
@@ -2000,7 +2010,7 @@ int emit_op_string_aset(Compiler *c, const BopCtx *x, Buf *b) {
        converted before the index is checked */
     buf_printf(b, " sp_int _t%d = ", tn); str_mut_index(c, &k[0], b); buf_puts(b, ";");
     ts = str_mut_convert(c, &v, b);
-    buf_printf(&sp, "sp_str_splice_at(%s, _t%d, 1, _s%d, 0)", cs.p, tn, ts);
+    buf_printf(&sp, "sp_String_splice_chars(_t%d, _t%d, 1, _s%d, 0, 0)", t, tn, ts);
     break;
   case SA_RANGE:
     /* s[range] = v: the range's character span (a negative length inserts);
@@ -2020,7 +2030,7 @@ int emit_op_string_aset(Compiler *c, const BopCtx *x, Buf *b) {
                   " (_t%d.last < 0 ? _t%d.last + _len%d : _t%d.last);", tn, tn, tn, tn, tn, tn, tn);
     buf_printf(b, " sp_int _n%d = _e%d - _a%d + ((_t%d.excl && !_oe%d) ? 0 : 1);", tn, tn, tn, tn, tn);
     ts = str_mut_convert(c, &v, b);
-    buf_printf(&sp, "sp_str_splice_at(%s, _a%d, _n%d < 0 ? 0 : _n%d, _s%d, 1)", cs.p, tn, tn, tn, ts);
+    buf_printf(&sp, "sp_String_splice_chars(_t%d, _a%d, _n%d < 0 ? 0 : _n%d, _s%d, 1, 0)", t, tn, tn, tn, ts);
     break;
   case SA_RE:
   case SA_RE_N:
@@ -2034,7 +2044,8 @@ int emit_op_string_aset(Compiler *c, const BopCtx *x, Buf *b) {
     if (form == SA_RE_N) buf_printf(b, "_t%d", tn); else buf_puts(b, "0");
     buf_printf(b, ", &_b%d, &_e%d);", tn, tn);
     ts = str_mut_convert(c, &v, b);
-    buf_printf(&sp, "sp_str_bytesplice(%s, _b%d, _e%d - _b%d, _s%d)", cs.p, tn, tn, tn, ts);
+    buf_printf(&sp, "sp_String_splice_bytes(_t%d, _b%d, _e%d - _b%d, _s%d, 0, (sp_int)sp_str_byte_len(_s%d), 0)",
+               t, tn, tn, tn, ts, ts);
     break;
   case SA_STR:
     /* s["sub"] = v: the first occurrence; none raises IndexError, before v
@@ -2044,7 +2055,7 @@ int emit_op_string_aset(Compiler *c, const BopCtx *x, Buf *b) {
     buf_printf(b, " sp_oint _a%d = sp_str_index_opt(%s, _k%d);"
                   " if (_a%d.nil) sp_raise_cls(\"IndexError\", \"string not matched\");", tn, cs.p, tn, tn);
     ts = str_mut_convert(c, &v, b);
-    buf_printf(&sp, "sp_str_splice_at(%s, _a%d.v, (sp_int)sp_str_length(_k%d), _s%d, 0)", cs.p, tn, tn, ts);
+    buf_printf(&sp, "sp_String_splice_chars(_t%d, _a%d.v, (sp_int)sp_str_length(_k%d), _s%d, 0, 0)", t, tn, tn, ts);
     break;
   default:
     /* s[start, len] = v: the start and the length are converted, and a
@@ -2053,10 +2064,10 @@ int emit_op_string_aset(Compiler *c, const BopCtx *x, Buf *b) {
     buf_printf(b, "; sp_int _l%d = ", tn); str_mut_index(c, &k[1], b); buf_puts(b, ";");
     buf_printf(b, " if (_l%d < 0) sp_raise_cls(\"IndexError\", sp_sprintf(\"negative length %%lld\", (long long)_l%d));", tn, tn);
     ts = str_mut_convert(c, &v, b);
-    buf_printf(&sp, "sp_str_splice_at(%s, _t%d, _l%d, _s%d, 0)", cs.p, tn, tn, ts);
+    buf_printf(&sp, "sp_String_splice_chars(_t%d, _t%d, _l%d, _s%d, 0, 0)", t, tn, tn, ts);
     break;
   }
-  if (sp.p) str_mut_set(b, t, sp.p);
+  if (sp.p) str_mut_set(b, sp.p);
   str_mut_value_answer(c, x, &v, b);
   view_unbind(mark);
   free(sp.p); free(cs.p);
@@ -2080,12 +2091,55 @@ int emit_op_string_insert(Compiler *c, const BopCtx *x, Buf *b) {
      counts from the end and inserts after that character (i + 1); an index
      past the ends raises IndexError */
   Buf sp; memset(&sp, 0, sizeof sp);
-  buf_printf(&sp, "sp_str_splice_at(sp_String_cstr(_t%d), _t%d == -1 ? (sp_int)sp_str_length(sp_String_cstr(_t%d)) :"
-                  " _t%d < 0 ? _t%d + 1 : _t%d, 0, _s%d, 0)", t, ti, t, ti, ti, ti, ts);
-  str_mut_set(b, t, sp.p);
+  buf_printf(&sp, "sp_String_splice_chars(_t%d, _t%d == -1 ? (sp_int)sp_str_length(sp_String_cstr(_t%d)) :"
+                  " _t%d < 0 ? _t%d + 1 : _t%d, 0, _s%d, 0, 0)", t, ti, t, ti, ti, ti, ts);
+  str_mut_set(b, sp.p);
   str_mut_self_answer(c, x, t, b);
   view_unbind(mark);
   free(sp.p);
+  return 1;
+}
+
+/* bytesplice(start, len, str[, str_start, str_len]) and (range, str[,
+   str_range]): the receiver's handle is taken before the arguments run,
+   every argument runs (str_mut_hold_as) before any converts, a nil receiver
+   then raises NoMethodError, and the arguments convert as
+   emit_bytesplice_in_place orders them, reading what the holds kept. The
+   bytes are spliced in place (sp_String_splice_bytes): its span checks
+   and the encoding check first, then FrozenError, as CRuby's
+   str_check_beg_len and str_modify_keep_cr come. Answers the receiver; a
+   call shape bytesplice_form_ok does not take is left to the other
+   routes. */
+int emit_op_string_bytesplice(Compiler *c, const BopCtx *x, Buf *b) {
+  int argc;
+  const int *argv = call_args(c->nt, x->id, &argc);
+  if (!bytesplice_form_ok(c, argv, argc)) return 0;
+  int chk, t = str_mut_open(c, x, &chk, b), mark = g_n_argov;
+  /* (a held boxed operand is bound too: the conversions below read the
+     node, and must read the value its hold kept, not run it again. Every
+     operand after the first is held even where it reads as pure, `idx[0]`
+     or `@n`: the conversions run in order after the holds, and one ahead of
+     it -- the String's #to_str, a boxed index's #to_int -- can change what
+     it reads, where Ruby has read it already.) */
+  for (int i = 0; i < argc; i++) {
+    StrMutOp o;
+    str_mut_hold_as(c, argv, argc, i, 0, i > 0, &o, b);
+    if (o.t >= 0 && o.boxed) view_bind_temp(o.node, o.t);
+  }
+  str_mut_nil_check(x, t, chk, b);
+  char h[24], rs[48];
+  snprintf(h, sizeof h, "_t%d", t);
+  snprintf(rs, sizeof rs, "sp_String_cstr(_t%d)", t);
+  /* (a #to_str renders here, inline, as str_mut_convert renders it: in the
+     call's conversion hold it would be declared ahead of the row) */
+  ConvHold *hold0 = g_conv_hold;
+  g_conv_hold = NULL;
+  buf_puts(b, " (void)");
+  emit_bytesplice_in_place(c, argv, argc, rs, h, b);
+  buf_puts(b, ";");
+  g_conv_hold = hold0;
+  str_mut_self_answer(c, x, t, b);
+  view_unbind(mark);
   return 1;
 }
 
@@ -2164,9 +2218,9 @@ int emit_op_string_slice(Compiler *c, const BopCtx *x, Buf *b) {
                cs.p, tn, tn, tn, tn, tn);
     buf_printf(b, " if (_t%d && _t%d >= 0 && _t%d <= 9) {"
                   " sp_int _b = sp_re_caps[2 * _t%d], _e = sp_re_caps[2 * _t%d + 1];"
-                  " sp_String_set_bin(_t%d, sp_str_bytesplice(%s, _b, _e - _b, (&(\"\\xff\")[1]))); }"
+                  " sp_String_splice_bytes(_t%d, _b, _e - _b, NULL, 0, 0, 1); }"
                   " _t%d; })",
-               th, tn, tn, tn, tn, t, cs.p, th);
+               th, tn, tn, tn, tn, t, th);
   }
   else {
     /* slice!(i), slice!(start, len), slice!(range): the part removed, by
@@ -2199,13 +2253,13 @@ int emit_op_string_slice(Compiler *c, const BopCtx *x, Buf *b) {
                   " if (_t%d >= 0 && _t%d %s _t%d && _t%d >= 0) {"
                   " if (_t%d > _t%d - _t%d) _t%d = _t%d - _t%d;"
                   " _t%d = sp_str_sub_range(%s, _t%d, _t%d); SP_GC_ROOT_STR(_t%d);"
-                  " sp_String_set_bin(_t%d, sp_str_splice_at(%s, _t%d, _t%d, (&(\"\\xff\")[1]), 0)); }"
+                  " sp_String_splice_chars(_t%d, _t%d, _t%d, NULL, 0, 1); }"
                   " _t%d; })",
                tr,
                tb, tb, span ? "<=" : "<", tn, tl,
                tl, tn, tb, tl, tn, tb,
                tr, cs.p, tb, tl, tr,
-               t, cs.p, tb, tl,
+               t, tb, tl,
                tr);
   }
   view_unbind(mark);

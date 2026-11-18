@@ -7,9 +7,11 @@
 #include "analyze.h"
 #include "analyze_internal.h"
 #include "builtin_names.h"
+#include "builtin_ops.h"
 #include "codegen_poly.h"
 #include "value_pos.h"
 #include "call_plan.h"
+#include "implicit_calls.h"
 #include "holder.h"
 #include "method_table_check.h"
 
@@ -577,15 +579,19 @@ void comp_free(Compiler *c) {
   for (int i = 0; i < c->nver_late; i++) free(c->ver_late[i].name);
   free(c->ver_late); c->ver_late = NULL; c->nver_late = 0;
   ver_hold_free(c);
+  main_chain_free(c);
   ver_chain_free(c);
   new_inits_free(c);
   new_sites_free(c);
+  attr_facts_free(c);
   free(c->ver_ix); free(c->ver_ix_next); free(c->ver_names); free(c->ver_names_next);
   c->ver_ix = c->ver_ix_next = c->ver_names = c->ver_names_next = NULL; c->ver_ix_nb = 0;
   free(c->ver_pins); c->ver_pins = NULL; c->nver_pins = 0;
   free(c->ver_cell_dropped); c->ver_cell_dropped = NULL; c->nver_cell_dropped = 0;
   free(c->top_self_marks); c->top_self_marks = NULL; c->top_self_stamp = 0;
   free(c->ver_vis_after); c->ver_vis_after = NULL; c->nver_vis_after = 0;
+  free(c->ver_kern_after); c->ver_kern_after = NULL; c->nver_kern_after = c->ver_kern_made = 0;
+  free(c->ver_kern_has); c->ver_kern_has = NULL;
   free(c->ver_guards); c->ver_guards = NULL; c->nver_guards = 0;
   for (int i = 0; i < c->nver_vis_reads; i++) free(c->ver_vis_reads[i].name);
   free(c->ver_vis_reads); c->ver_vis_reads = NULL; c->nver_vis_reads = c->ver_vis_read_new = 0;
@@ -2208,6 +2214,17 @@ int comp_name_reader_any(Compiler *c, const char *name) {
   return ans;
 }
 
+/* See compiler.h. */
+int comp_poly_arm_reader_any(Compiler *c, const char *name, int argc) {
+  /* (a candidate scan: does any class of the program, at any point, give the name an arm; no call's point is asked, and
+     an accessor with versions is an `accessor` table answer. poly_name_user_claimed keeps its answer per name where
+     the scope index is frozen; the analysis's and the emitters' other callers ask it directly) */
+  for (int k = 0; k < c->nclasses; k++)
+    if (comp_poly_arm_defines_n(c, k, name, argc) ||
+        (!c->classes[k].is_native_class && call_attr_target(c, -1, k, name, CT_ATTR, NULL))) return 1;
+  return 0;
+}
+
 /* See compiler.h. Kept as comp_name_reader_any's answers are, under the same
    stamps, in a table of its own: the names, each one's list and count. */
 static char **rdo_name; static int **rdo_list; static int *rdo_n; static int rdo_cap, rdo_cnt;
@@ -2366,13 +2383,18 @@ int comp_arysub_emb(Compiler *c, int cid) {
 int comp_arysub_builtin(Compiler *c, int cid) {
   return comp_ary_is_time(c, cid) ? CORE_TIME : comp_ary_is_str(c, cid) ? CORE_STRING : comp_ary_is_hash(c, cid) ? CORE_HASH : CORE_ARRAY;
 }
+/* An Array subclass instance is an Array already: CRuby (rb_check_array_type)
+   takes it as it is and never calls its own #to_ary. */
+int comp_ary_is_array_proper(Compiler *c, int cid) {
+  return comp_ary_root(c, cid) >= 0 && comp_arysub_emb(c, cid) == 0;
+}
 /* The scope of the #to_ary an implicit Array conversion of a class cid
-   instance calls, or -1. An Array subclass instance is an Array already:
-   CRuby (rb_check_array_type) takes it as it is and never calls its own
-   #to_ary. */
-int comp_implicit_to_ary_mi(Compiler *c, int cid) {
-  if (comp_ary_root(c, cid) >= 0 && comp_arysub_emb(c, cid) == 0) return -1;
-  return comp_method_in_chain(c, cid, "to_ary", NULL);
+   instance calls, or -1 (comp_ary_is_array_proper: none): the table's, as
+   the call plan answers it for the implied call of node site on operand op
+   (-1 for a survey of the classes a box may hold). */
+int comp_implicit_to_ary_mi(Compiler *c, int site, int op, int cid) {
+  if (comp_ary_is_array_proper(c, cid)) return -1;
+  return cplan_implied_target(c, site, op, cid, "to_ary", CIT_TABLE, NULL);
 }
 
 int builtin_instance_method_known(const char *cls, const char *m);
@@ -2429,6 +2451,7 @@ int comp_arysub_reopen(Compiler *c, int cid) {
 const int *comp_strsub_own_classes(Compiler *c, const char *name, int *n) {
   static int *ks; static int cap;
   int cnt = 0;
+  mtab_enter(c);   /* (the candidate owner of the String subclasses that answer name: no call's question) */
   for (int k = 0; name && k < c->nclasses; k++) {
     if (c->classes[k].ary_root <= 0 || !c->classes[k].ary_str) continue;
     int dc = -1, ro = comp_arysub_reopen(c, k);
@@ -2442,22 +2465,25 @@ const int *comp_strsub_own_classes(Compiler *c, const char *name, int *n) {
     }
     ks[cnt++] = k;
   }
+  mtab_leave(c);
   *n = cnt;
   return ks;
 }
 /* Whether a call named n on an instance of Array subclass cid is Array's:
    no method, reader or writer of the class chain takes the name (as
-   call_target answers call id; -1 for no call), it asks nothing about the
-   object itself, and Array (or Enumerable, which Array includes) has it. */
+   call_target and call_attr_target answer call id, an accessor where an
+   attr_* of the name has run at the call; -1 for no call), it asks nothing
+   about the object itself, and Array (or Enumerable, which Array includes)
+   has it. */
 int comp_arysub_name_is_array(Compiler *c, int id, int cid, const char *n) {
   if (comp_ary_root(c, cid) < 0 || !n) return 0;
   /* a method of the builtin's reopen is the builtin's */
   MethodLookup ml = { .def_class = -1 };
   int ro = comp_arysub_reopen(c, cid);
   if (((call_target(c, id, cid, n, 0, &ml) >= 0 && (ro < 0 || ml.def_class != ro)) ||
-       comp_reader_in_chain(c, cid, n, NULL)) && !comp_enum_answers_first(c, cid, n)) return 0;
+       call_attr_target(c, id, cid, n, CT_ATTR, NULL)) && !comp_enum_answers_first(c, id, cid, n)) return 0;
   char base[256];
-  if (setter_base_name(n, base, sizeof base) && comp_writer_in_chain(c, cid, base, NULL)) return 0;
+  if (setter_base_name(n, base, sizeof base) && call_attr_target(c, id, cid, base, CT_ATTR | CT_WRITER, NULL)) return 0;
   /* != is BasicObject's, which calls == and negates it: a class with its
      own == answers != with that == (the call plan's delegate) */
   if (sp_streq(n, "!=")) {
@@ -2481,7 +2507,11 @@ int comp_arysub_call(Compiler *c, int id, TyKind rt, TyKind *kind) {
   if (comp_ary_root(c, cid) < 0 || nt_kind(c->nt, id) != NK_CallNode) return 0;
   const char *n = nt_str(c->nt, id, "name");
   if (!n) return 0;
-  if (!cplan_builtin_call(c, id) && !comp_arysub_name_is_array(c, id, cid, n)) return 0;
+  MtabMark mt_was = mtab_push_in(c, id);   /* (what the call's name asks of the subclass's chain is the call's) */
+  /* (the identity a dispatch over a splat leaves, nt_set_itself_call, is no builtin method: its value is the instance) */
+  int builtin = (cplan_builtin_call(c, id) && !is_itself_name(n)) || comp_arysub_name_is_array(c, id, cid, n);
+  mtab_pop(c, mt_was);
+  if (!builtin) return 0;
   *kind = comp_ary_kind(c, cid);
   /* A String subclass instance's String is a handle (TY_STRBUF). A call
      that changes it, or answers it, takes it boxed (the poly String arms
@@ -2698,6 +2728,10 @@ int comp_method_vis_declared(Compiler *c, int class_id, const char *name, int *a
         int mci = ci->included_mods[m];
         if (mci < 0 || mci >= c->nclasses) continue;
         ClassInfo *mc_ = &c->classes[mci];
+        /* (an attribute's: a module's method the class holds no copy of, an include that added nothing for it, is
+           no answer of the module's) */
+        char base[256];
+        if (!comp_is_reader(mc_, name) && !(setter_base_name(name, base, sizeof base) && comp_is_writer(mc_, base))) continue;
         for (int i = 0; i < mc_->nvis; i++)
           if (sp_streq(mc_->vis_names[i], name)) { if (at) *at = mci; return mc_->vis_kinds[i]; }
       }
@@ -2838,8 +2872,7 @@ int comp_sg_reader_const(Compiler *c, int call_id) {
   if (recv < 0) return -1;
   NodeKind rk = nt_kind(nt, recv);
   if (rk != NK_ConstantReadNode && rk != NK_ConstantPathNode) return -1;
-  const char *rn = const_key_at(c, recv);
-  int ci = rn ? comp_class_index(c, rn) : -1;
+  int ci = const_node_class_index(c, recv);
   if (ci < 0 || !comp_is_sg_reader(&c->classes[ci], nm)) return -1;
   return comp_sg_const_binding(c, ci, nm);
 }
@@ -3503,6 +3536,12 @@ int comp_scope_native_twin(Compiler *c, int mi) {
          nt_int(c->nt, c->scopes[mi].def_node, "native_twin", 0);
 }
 
+/* Is `name` the rest parameter of scope s (`*args`)? */
+int comp_scope_rest_param_is(const Scope *s, const char *name) {
+  return s && name && s->rest_idx >= 0 && s->rest_idx < s->nparams && s->pnames && s->pnames[s->rest_idx] &&
+         sp_streq(s->pnames[s->rest_idx], name);
+}
+
 TyKind native_spec_to_ty(const char *spec) {
   if (!spec) return TY_UNKNOWN;
   if (sp_streq(spec, "any"))    return TY_POLY;
@@ -3577,16 +3616,22 @@ int comp_native_binding_class(Compiler *c, int k, const char *name) {
 /* The native class whose binding answers `name` on an instance of class
    cid: cid itself for a native class, and for a subclass of one (#9269)
    the native class its chain reaches, where no method or reader of the
-   program's in the chain answers the name first. -1 otherwise. */
+   program's in the chain answers the name first. -1 otherwise. The plan's
+   no-site asks: the answer picks the binding (and the slot layout) that
+   inference, the arms and repr_of all serve for every object of cid,
+   several of them with no call to ask at, so a def or accessor that runs
+   anywhere stands the binding down. */
 int comp_native_answer_class(Compiler *c, int cid, const char *name) {
   if (cid < 0 || cid >= c->nclasses) return -1;
   if (c->classes[cid].is_native_class) return cid;
   int r = c->classes[cid].nsub_root - 1;
   if (r < 0 || !name) return -1;
-  if (comp_method_in_chain(c, cid, name, NULL) >= 0 || comp_reader_in_chain(c, cid, name, NULL)) return -1;
+  if (call_target(c, -1, cid, name, CT_METHODS, NULL) >= 0 ||
+      call_attr_target(c, -1, cid, name, CT_ATTR, NULL)) return -1;
   /* (nor an attribute writer of the program's) */
   char base[256];
-  if (setter_base_name(name, base, sizeof base) && comp_writer_in_chain(c, cid, base, NULL)) return -1;
+  if (setter_base_name(name, base, sizeof base) &&
+      call_attr_target(c, -1, cid, base, CT_ATTR | CT_WRITER, NULL)) return -1;
   return r;
 }
 
@@ -3743,31 +3788,22 @@ int comp_subclass_answers(Compiler *c, int class_id, const char *name) {
   if (class_id < 0) return 0;
   /* the strict subclasses alone (comp_descendants), where every class and
      its parent chain was walked at every call asked */
-  int nd = 0;
+  int nd = 0, ans = 0;
   const int *ds = comp_descendants(c, class_id, &nd);
-  for (int i = 0; i < nd; i++) {
+  /* (the candidate owner of "does a subclass answer name": it reads the chains of the program's classes, no call's) */
+  mtab_enter(c);
+  for (int i = 0; i < nd && !ans; i++) {
     int k = ds[i];
-    if (comp_method_in_chain(c, k, name, NULL) >= 0 || comp_reader_in_chain(c, k, name, NULL)) return 1;
+    ans = comp_method_in_chain(c, k, name, NULL) >= 0 || comp_reader_in_chain(c, k, name, NULL);
   }
-  return 0;
+  mtab_leave(c);
+  return ans;
 }
 int comp_writer_in_chain(Compiler *c, int class_id, const char *name, int *def_class) {
   if (g_method_table_check) mtab_read(c, MT_WRITER_IN_CHAIN, class_id, MTS_INST, name);
   return accessor_chain(c, class_id, name, def_class, 1);
 }
 
-/* Whether the program answers `name` at one level of the lookup, class or
-   module k itself: a def of its own (not a copy an include made), a reader
-   its own body declared, or an alias. */
-static int mixin_level_answers(Compiler *c, int k, const char *name) {
-  ClassInfo *ci = &c->classes[k];
-  int mi = comp_method_in_class(c, k, name);
-  if (mi >= 0 && (!c->scopes[mi].is_include_copy || c->scopes[mi].is_prepend_copy)) return 1;
-  if (comp_is_own_reader(ci, name)) return 1;
-  for (int a = 0; a < ci->naliases; a++)
-    if ((!ci->alias_sg || !ci->alias_sg[a]) && sp_streq(ci->alias_new[a], name)) return 1;
-  return 0;
-}
 /* Ruby's lookup from level k: 1 when the program answers first, 2 when
    Enumerable does, 0 when neither does at k or below the modules it
    includes (the last included first, Enumerable at its place among them).
@@ -3778,52 +3814,63 @@ static int mixin_level_answers(Compiler *c, int k, const char *name) {
    precedence; neither query reconstructs includes from the node table. */
 /* What the mixin walk looks for: Enumerable, Comparable, or any core module
    (one of those, or a builtin module named by path) */
-enum { MX_ENUM = 0, MX_CMP = 1, MX_CORE = 2 };
-static int mixin_here(const ClassInfo *ci, int what) {
+enum { MX_ENUM = 0, MX_CMP = 1, MX_CORE = 2, MX_ANSWERS = 3 };   /* MX_ANSWERS: one of them has the name (mixin_here's `name`) ahead of Object */
+static int mixin_here(const ClassInfo *ci, int what, const char *name) {
   int en = ci->enum_inc_at || ci->enum_prepended, cm = ci->cmp_inc_at || ci->cmp_prepended;
+  if (what == MX_ANSWERS) {
+    /* a core module of this level, Comparable, Enumerable or one named by path (Math), that has the name */
+    if ((en && builtin_answers_ahead_of(core_class_name(CORE_ENUMERABLE), name, NULL)) ||
+        (cm && builtin_answers_ahead_of(core_class_name(CORE_COMPARABLE), name, NULL))) return 1;
+    for (int i = 0; i < ci->nincluded_mod_names; i++)
+      if (builtin_answers_ahead_of(ci->included_mod_names[i], name, NULL)) return 1;
+    return 0;
+  }
   return what == MX_ENUM ? en : what == MX_CMP ? cm : en || cm || ci->nincluded_mod_names > 0;
 }
 /* Whether what is among the ancestors class or module k brings: it
    includes (or prepends) it, or includes a module that does, at any depth.
    Each module is asked once (`seen`), so a module several includes share
    costs one visit. */
-static int mixin_reaches_from(Compiler *c, int k, int what, unsigned char *seen) {
+static int mixin_reaches_from(Compiler *c, int k, int what, const char *name, unsigned char *seen) {
   ClassInfo *ci = &c->classes[k];
   seen[k] = 1;
-  if (mixin_here(ci, what)) return 1;
+  if (mixin_here(ci, what, name)) return 1;
   for (int j = 0; j < ci->nincluded_mods; j++) {
     int m = ci->included_mods[j];
-    if (m >= 0 && m < c->nclasses && !seen[m] && mixin_reaches_from(c, m, what, seen)) return 1;
+    /* (a builtin module of the program's classes: Math) */
+    if (what == MX_ANSWERS && m >= 0 && m < c->nclasses && c->classes[m].is_builtin_const && builtin_answers_ahead_of(c->classes[m].name, name, NULL)) return 1;
+    if (m >= 0 && m < c->nclasses && !seen[m] && mixin_reaches_from(c, m, what, name, seen)) return 1;
   }
   return 0;
 }
-static int mixin_reaches(Compiler *c, int k, int what) {
+static int mixin_reaches(Compiler *c, int k, int what, const char *name) {
   const ClassInfo *ci = &c->classes[k];
   /* a class with no includes answers by its own flags, with no set */
-  if (ci->nincluded_mods == 0) return mixin_here(ci, what);
+  if (ci->nincluded_mods == 0) return mixin_here(ci, what, name);
   unsigned char *seen = (unsigned char *)calloc((size_t)c->nclasses, 1);
   if (!seen) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-  int r = mixin_reaches_from(c, k, what, seen);
+  int r = mixin_reaches_from(c, k, what, name, seen);
   free(seen);
   return r;
 }
-static int mixin_level_walk(Compiler *c, int k, const char *name, int own_enum, int comparable, int depth) {
+static int mixin_level_walk(Compiler *c, int id, int k, const char *name, int own_enum, int comparable, int depth) {
   ClassInfo *ci = &c->classes[k];
   /* A prepended module's method precedes its includes. Its transplanted
      scope records the module whose own lookup supplies that order. */
   if (comparable && ci->cmp_prepended == 2) {
-    int mi = comp_method_in_class(c, k, name);
+    /* (the copy the prepend made: its module, the walk's next level) */
+    int mi = comp_name_responder(c, k, name, CT_OWN);
     if (mi >= 0 && c->scopes[mi].is_prepend_copy && depth < c->nclasses) {
       int m = c->scopes[mi].origin_module_ci - 1;
       if (m >= 0 && m != k) {
-        int r = mixin_level_walk(c, m, name, own_enum, comparable, depth + 1);
+        int r = mixin_level_walk(c, id, m, name, own_enum, comparable, depth + 1);
         if (r) return r;
       }
     }
     return 2;
   }
   if (comparable ? ci->cmp_prepended == 1 : ci->enum_prepended) return 2;   /* in front of the class's own */
-  if (mixin_level_answers(c, k, name)) return 1;
+  if (cplan_level_answers(c, id, k, name)) return 1;
   int pos = comparable ? ci->cmp_inc_at : ci->enum_inc_at;
   int at = own_enum && pos ? pos - 1 : -1;
   for (int j = ci->nincluded_mods - 1; ; j--) {
@@ -3831,16 +3878,23 @@ static int mixin_level_walk(Compiler *c, int k, const char *name, int own_enum, 
     if (j < 0) return 0;
     int m = ci->included_mods[j];
     if (m < 0 || m >= c->nclasses || m == k || depth >= (comparable ? c->nclasses : 16)) continue;
-    int r = mixin_level_walk(c, m, name, own_enum, comparable, depth + 1);
+    int r = mixin_level_walk(c, id, m, name, own_enum, comparable, depth + 1);
     if (r) return r;
   }
 }
-static int mixin_answers_first(Compiler *c, int cid, const char *name, int comparable) {
-  /* what master answers: the program's method or reader anywhere in the chain */
-  int master = comp_method_in_chain(c, cid, name, NULL) < 0 && !comp_reader_in_chain(c, cid, name, NULL);
-  if (cid < 0 || cid >= c->nclasses || !name) return master;
+static int mixin_answers_first(Compiler *c, int id, int cid, const char *name, int comparable) {
+  /* the table's answer at the call: the program's method or reader anywhere in the chain, whatever its visibility (a
+     private def comes first in a lookup too); with no call (-1) a no-site ask of the program-wide dispatchers. A call that
+     binds the builtin's own method (cplan_builtin_call) asks no site: its answer none (call_target's ML_BUILTIN) is not the
+     program's method the Enumerable-first rewrite is asked about, which the class's own def of the name gives */
+  int at = id >= 0 && cplan_builtin_call(c, id) ? -1 : id;
+  /* (no call's question: a dispatcher of the whole program's, or a call that binds the builtin's own method) */
+  if (at < 0) mtab_enter(c);
+  int tbl = !call_answers(c, at, cid, name, CT_NOFACE | (at < 0 ? CT_SHARED : 0), NULL);
+  if (at < 0) mtab_leave(c);
+  if (cid < 0 || cid >= c->nclasses || !name) return tbl;
   /* a name Enumerable does not have (each, join, index ...): the program's alone */
-  if (core_method_vis(comparable ? "Comparable" : "Enumerable", name, 0, NULL) <= 0) return master;
+  if (core_method_vis(comparable ? "Comparable" : "Enumerable", name, 0, NULL) <= 0) return tbl;
   /* the topmost class that has Enumerable among its ancestors, by an include
      of its own or of a module: below it the include is a no-op. A Struct, an Array or a native class has Enumerable of its
      own, at a place the includes do not show: master's answer there. */
@@ -3852,28 +3906,28 @@ static int mixin_answers_first(Compiler *c, int cid, const char *name, int compa
          prepended to, behind the ones below it */
       for (int j = cid, g = 0; g < 256; j = c->classes[j].parent, g++) {
         if (c->classes[j].enum_prepended) return 1;
-        if (mixin_level_answers(c, j, name)) return 0;
+        if (cplan_level_answers(c, at, j, name)) return 0;
         if (j == k || c->classes[j].parent < 0) break;
       }
-      return master;
+      return tbl;
     }
-    if (mixin_reaches(c, k, comparable)) top = k;
+    if (mixin_reaches(c, k, comparable, NULL)) top = k;
     if (k == ci->parent) break;
   }
   n = 0;
   for (int k = cid; k >= 0 && k < c->nclasses && n < 256; k = c->classes[k].parent, n++) {
-    int r = mixin_level_walk(c, k, name, k == top, comparable, 0);
+    int r = mixin_level_walk(c, at, k, name, k == top, comparable, 0);
     if (r) return r == 2;
     if (k == c->classes[k].parent) break;
   }
-  return master;
+  return tbl;
 }
 
-int comp_enum_answers_first(Compiler *c, int cid, const char *name) {
-  return mixin_answers_first(c, cid, name, 0);
+int comp_enum_answers_first(Compiler *c, int id, int cid, const char *name) {
+  return mixin_answers_first(c, id, cid, name, 0);
 }
-int comp_comparable_answers_first(Compiler *c, int cid, const char *name) {
-  return mixin_answers_first(c, cid, name, 1);
+int comp_comparable_answers_first(Compiler *c, int id, int cid, const char *name) {
+  return mixin_answers_first(c, id, cid, name, 1);
 }
 /* Enumerable reaches class cid through it or a superclass: a subclass of a
    class that includes it (Journey's Cat < Binary < Node) answers its
@@ -3881,7 +3935,18 @@ int comp_comparable_answers_first(Compiler *c, int cid, const char *name) {
 int comp_enum_reaches(Compiler *c, int cid) {
   int n = 0;
   for (int k = cid; k >= 0 && k < c->nclasses && n < c->nclasses; k = c->classes[k].parent, n++) {
-    if (mixin_reaches(c, k, 0)) return 1;
+    if (mixin_reaches(c, k, 0, NULL)) return 1;
+    if (k == c->classes[k].parent) break;
+  }
+  return 0;
+}
+/* Does a builtin module that class cid or a superclass includes (Comparable, Enumerable, one named by path such as
+   Math), at any depth, answer the name ahead of Object (whose place a top-level def takes in the ancestors)? Those
+   modules' methods are then what a super past the program's defs reaches. */
+int comp_chain_core_answers(Compiler *c, int cid, const char *name) {
+  int n = 0;
+  for (int k = cid; k >= 0 && k < c->nclasses && n < c->nclasses; k = c->classes[k].parent, n++) {
+    if (mixin_reaches(c, k, MX_ANSWERS, name)) return 1;
     if (k == c->classes[k].parent) break;
   }
   return 0;
@@ -3907,13 +3972,13 @@ int comp_plain_class(Compiler *c, int cid) {
   for (int k = cid; k >= 0 && k < c->nclasses && n < c->nclasses; k = c->classes[k].parent, n++) {
     ClassInfo *ci = &c->classes[k];
     if (ci->is_native_class || ci->is_struct || ci->nsub_root > 0 || comp_ary_root(c, k) >= 0 || comp_class_is_module(c, ci) ||
-        ci->def_node < 0 || mixin_reaches(c, k, MX_CORE)) return 0;
+        ci->def_node < 0 || mixin_reaches(c, k, MX_CORE, NULL)) return 0;
     if (k == ci->parent) break;
   }
   return cid >= 0 && cid < c->nclasses && !class_is_exc_subclass(c, cid) && is_plain_builtin_superclass(class_builtin_parent(c, cid));
 }
 int comp_comparable_reaches(Compiler *c, int cid) {
-  return cid >= 0 && cid < c->nclasses && mixin_reaches(c, cid, 1);
+  return cid >= 0 && cid < c->nclasses && mixin_reaches(c, cid, 1, NULL);
 }
 
 /* ---- Poly-dispatch candidates by method name ----
@@ -5320,102 +5385,6 @@ int class_is_blank_slate(Compiler *c, int ci) {
   return 0;
 }
 
-/* Does the body of the class or module named `cn` write `include Kernel`,
-   or include a module whose body does (through that module's own includes,
-   to a bounded depth)? */
-static int def_body_includes_kernel(Compiler *c, const char *cn, int depth) {
-  const NodeTable *nt = c->nt;
-  if (!cn || depth > 16) return 0;
-  for (int q = 0; q < 2; q++)
-    NT_FOREACH_KIND(nt, q ? NK_ModuleNode : NK_ClassNode, id) {
-      int cp = nt_ref(nt, id, "constant_path");
-      const char *nm = cp >= 0 ? key_name(c, cp) : NULL;
-      int body = nt_ref(nt, id, "body"), bn = 0;
-      if (!nm || !sp_streq(nm, cn) || body < 0 || nt_kind(nt, body) != NK_StatementsNode) continue;
-      const int *bb = nt_arr(nt, body, "body", &bn);
-      for (int j = 0; j < bn; j++) {
-        if (nt_kind(nt, bb[j]) != NK_CallNode || nt_ref(nt, bb[j], "receiver") >= 0 ||
-            !sp_streq(nt_str(nt, bb[j], "name"), "include")) continue;
-        int an = 0, args = nt_ref(nt, bb[j], "arguments");
-        const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
-        for (int a = 0; a < an; a++) {
-          const char *mn = nt_str(nt, av[a], "name");
-          if (mn && (sp_streq(mn, "Kernel") || def_body_includes_kernel(c, mn, depth + 1))) return 1;
-        }
-      }
-    }
-  return 0;
-}
-
-/* Is class ci under BasicObject with no `include Kernel` in its chain's
-   bodies or in a module they include: neither Kernel's methods nor Object's
-   are in its ancestry? */
-int class_lacks_kernel(Compiler *c, int ci) {
-  if (!class_is_blank_slate(c, ci)) return 0;
-  for (int k = ci; k >= 0; k = c->classes[k].parent)
-    if (def_body_includes_kernel(c, c->classes[k].name, 0)) return 0;
-  return 1;
-}
-
-/* class_lacks_kernel for the class named `nm`, before the class table exists
-   (the lowerings ahead of it, which read the class nodes). The name must
-   name one class: every node of it (a reopen is one) sits in the same
-   enclosing class or module node, none is a module, and none is written
-   under another constant (`class P::Q`, whose namespace this does not
-   resolve); a name two scopes carry (P::Q and Q) is not known to lack
-   Kernel. Its superclass, as the first node that writes one gives it, is
-   BasicObject written as such (bare only where no class or module of that
-   name is declared below the top level, which a bare read in its scope
-   would find: basic_object_shadowed), or a program class that lacks Kernel
-   in turn; and no body on the chain includes Kernel. A class node named
-   BasicObject is the root itself. */
-/* Is a class or module named BasicObject declared below the top level (in a
-   class or module body, or as `P::BasicObject`)? */
-static int basic_object_shadowed(Compiler *c, const int *par) {
-  const NodeTable *nt = c->nt;
-  for (int q = 0; q < 2; q++)
-    NT_FOREACH_KIND(nt, q ? NK_ModuleNode : NK_ClassNode, id) {
-      int cp = nt_ref(nt, id, "constant_path");
-      if (!is_basic_object_name(key_name(c, cp))) continue;
-      if (nt_kind(nt, cp) == NK_ConstantPathNode && nt_ref(nt, cp, "parent") >= 0) return 1;
-      for (int up = par[id]; up >= 0; up = par[up])
-        if (nt_kind(nt, up) == NK_ClassNode || nt_kind(nt, up) == NK_ModuleNode) return 1;
-    }
-  return 0;
-}
-static int class_name_lacks_kernel(Compiler *c, const int *par, const char *nm, int hop) {
-  const NodeTable *nt = c->nt;
-  int sup = -1, encl = -2, found = 0;
-  if (hop > 16 || !nm || def_body_includes_kernel(c, nm, 0)) return 0;
-  for (int q = 0; q < 2; q++)
-    NT_FOREACH_KIND(nt, q ? NK_ModuleNode : NK_ClassNode, id) {
-      int cp = nt_ref(nt, id, "constant_path");
-      const char *cn = key_name(c, cp);
-      if (!cn || !sp_streq(cn, nm)) continue;
-      if (nt_kind(nt, cp) == NK_ConstantPathNode && nt_ref(nt, cp, "parent") >= 0) return 0;
-      int up = par[id];
-      while (up >= 0 && nt_kind(nt, up) != NK_ClassNode && nt_kind(nt, up) != NK_ModuleNode) up = par[up];
-      if (q || (found && up != encl)) return 0;
-      if (sup < 0) sup = class_def_super(nt, id);
-      encl = up;
-      found = 1;
-    }
-  if (!found) return 0;
-  if (is_basic_object_name(nm)) return encl < 0;
-  if (sup < 0) return 0;
-  NodeKind sk = nt_kind(nt, sup);
-  if (sk == NK_ConstantPathNode && nt_ref(nt, sup, "parent") >= 0) return 0;
-  if (sk != NK_ConstantReadNode && sk != NK_ConstantPathNode) return 0;
-  const char *sn = key_name(c, sup);
-  if (sn && is_basic_object_name(sn))
-    return (sk == NK_ConstantPathNode || !basic_object_shadowed(c, par)) && !def_body_includes_kernel(c, sn, 0);
-  return sn && class_name_lacks_kernel(c, par, sn, hop + 1);
-}
-int class_node_lacks_kernel(Compiler *c, int cnode) {
-  if (cnode < 0 || nt_kind(c->nt, cnode) != NK_ClassNode) return 0;
-  return class_name_lacks_kernel(c, comp_parent_map(c), key_name(c, nt_ref(c->nt, cnode, "constant_path")), 0);
-}
-
 /* Find a method named `name` in any top-level included module.
    module_function methods are class-level (is_cmethod=1), so check both
    (toplevel_mod_method).
@@ -5450,9 +5419,9 @@ static int main_call_site(Compiler *c, int call_id) {
    `def self.x`.) */
 static int toplevel_mod_method(Compiler *c, int k, const char *name, int mf_only) {
   int ci = c->toplevel_includes[k];
-  int mi = comp_self_method_in_chain(c, ci, name, NULL);
+  int mi = call_target(c, -1, ci, name, CT_CAPTURE | CT_SHARED, NULL);
   if (mi >= 0) return mi;
-  mi = comp_cmethod_in_chain(c, ci, name, NULL);
+  mi = call_target(c, -1, ci, name, CT_CMETHOD | CT_SHARED, NULL);
   return mi >= 0 && (!mf_only || c->scopes[mi].is_module_function) ? mi : -1;
 }
 static int comp_included_method_index_1(Compiler *c, const char *name, int call_id);
@@ -5507,9 +5476,9 @@ int comp_main_extend_defines(Compiler *c, int call_id, const char *name) {
 }
 /* Whether a module the top level includes (extend 0) or main extends
    (extend 1) has an instance method `name`. */
-int comp_toplevel_mod_defines(Compiler *c, const char *name, int extend) {
+int comp_toplevel_mod_defines(Compiler *c, int id, const char *name, int extend) {
   for (int k = 0; k < c->ntoplevel_includes; k++)
-    if (c->toplevel_extends[k] == extend && comp_method_in_chain(c, c->toplevel_includes[k], name, NULL) >= 0)
+    if (c->toplevel_extends[k] == extend && call_target(c, id, c->toplevel_includes[k], name, CT_METHODS, NULL) >= 0)
       return 1;
   return 0;
 }
@@ -5662,33 +5631,6 @@ const char *comp_prep_chain_target(Compiler *c, int class_id, const char *name) 
   return NULL;
 }
 
-/* Marks (a calloc'd array over the node table, NULL when there is none to
-   mark) the nodes of ids[0..n) that sit in a ClassNode nested in that walk,
-   less the nodes of a block or lambda inside one. A nested module is left
-   in: the outer body can include or prepend it, or send it :include. */
-static char *nested_class_body_marks(NodeTable *nt, const int *ids, int n) {
-  int nn = 0, *roots = malloc(sizeof(int) * (size_t)(n > 0 ? n : 1));
-  if (!roots) return NULL;
-  for (int i = 0; i < n; i++) {
-    NodeKind k = nt_kind(nt, ids[i]);
-    if (k == NK_ClassNode) roots[nn++] = ids[i];
-  }
-  char *mark = nn > 0 ? calloc((size_t)nt->count, 1) : NULL;
-  if (!mark) { free(roots); return NULL; }
-  int m = 0, *in = nt_subtree_ids(nt, roots, nn, &m);
-  int nb = 0;
-  for (int i = 0; i < m; i++) {
-    mark[in[i]] = 1;
-    NodeKind k = nt_kind(nt, in[i]);
-    if (k == NK_BlockNode || k == NK_LambdaNode) roots[nb++] = in[i];
-  }
-  free(in);
-  int b = 0, *blk = nt_subtree_ids(nt, roots, nb, &b);
-  for (int i = 0; i < b; i++) mark[blk[i]] = 0;
-  free(blk);
-  free(roots);
-  return mark;
-}
 /* Is this `super` (with or without arguments) Class#new? Inside a class
    method `new` whose ancestors define no class method of that name, the
    parent is Class itself: `def self.new(x) = super(x * 10)` allocates the
@@ -5698,79 +5640,6 @@ static char *nested_class_body_marks(NodeTable *nt, const int *ids, int n) {
    parent, and past the top of an explicit chain, Object -- where a method the
    program defines on Object is every class's superclass method. A module's
    super is its includer's, and a class method's chain has no such end. */
-/* Does the program use Kernel as a value: `include Kernel` in any body,
-   `BasicObject.include(Kernel)`, `send(:include, ::Kernel)`, `K = Kernel`?
-   Every read of the constant counts but a call's receiver (`Kernel.puts`)
-   and a `module Kernel` header. A class under the program's own
-   BasicObject may then reach Kernel's methods through Object's chain, so
-   that BasicObject keeps the lookup it had. Kept until the table changes. */
-static int kernel_const_node(const NodeTable *nt, int id) {
-  if (id < 0) return 0;
-  NodeKind k = nt_kind(nt, id);
-  return (k == NK_ConstantReadNode || k == NK_ConstantPathNode) && sp_streq(nt_str(nt, id, "name"), "Kernel");
-}
-static int program_names_kernel(Compiler *c) {
-  static const NodeTable *knt; static unsigned kver; static int kcount = -1, kans;
-  const NodeTable *nt = c->nt;
-  if (knt == nt && kver == nt->version && kcount == nt->count) return kans;
-  int reads = 0, held = 0;
-  NT_FOREACH_KIND(nt, NK_ConstantReadNode, id) reads += kernel_const_node(nt, id);
-  NT_FOREACH_KIND(nt, NK_ConstantPathNode, id) reads += kernel_const_node(nt, id);
-  NT_FOREACH_KIND(nt, NK_CallNode, id) held += kernel_const_node(nt, nt_ref(nt, id, "receiver"));
-  NT_FOREACH_KIND(nt, NK_ModuleNode, id) held += kernel_const_node(nt, nt_ref(nt, id, "constant_path"));
-  kans = reads > held;
-  knt = nt; kver = nt->version; kcount = nt->count;
-  return kans;
-}
-/* Is class ci under BasicObject with no Kernel among its ancestors? The
-   includes registration recorded are asked first (an `include` through a
-   constant alias, in a block or a class method of the body), then the
-   bodies' text (class_lacks_kernel), which runs for such a class alone.
-   The program's own BasicObject (`class BasicObject; end`) is such a
-   class too, when the program passes Kernel to no call
-   (program_names_kernel): Object is not past it. */
-static int blank_slate_without_kernel(Compiler *c, int ci) {
-  int bo = ci >= 0 && ci == comp_core_class(c, CORE_BASIC_OBJECT);
-  int ans = bo || class_is_blank_slate(c, ci);
-  int ke = comp_core_class(c, CORE_KERNEL);
-  for (int k = ci, d = 0; ans && k >= 0 && k < c->nclasses && d < 64; k = c->classes[k].parent, d++) {
-    const ClassInfo *ki = &c->classes[k];
-    for (int i = 0; ans && i < ki->nincluded_mod_names; i++) {
-      const char *n = ki->included_mod_names[i], *l = n ? strrchr(n, ':') : NULL;
-      if (n && sp_streq(l ? l + 1 : n, "Kernel")) ans = 0;
-    }
-    for (int i = 0; ans && ke >= 0 && i < ki->nincluded_mods; i++) {
-      int m = ki->included_mods[i];
-      if (m == ke || (m >= 0 && comp_module_includes(c, m, ke, 0))) ans = 0;
-    }
-  }
-  if (!ans || (bo ? program_names_kernel(c) : !class_lacks_kernel(c, ci))) return 0;
-  /* an `include` the body makes another way (through a constant alias, in
-     a block, in a class method it calls) may bring Kernel in: such a chain
-     keeps the lookup it had */
-  NodeTable *nt = (NodeTable *)c->nt;
-  for (int k = ci, d = 0; k >= 0 && k < c->nclasses && d < 64; k = c->classes[k].parent, d++) {
-    int body = c->classes[k].def_node >= 0 ? nt_ref(nt, c->classes[k].def_node, "body") : -1;
-    if (body < 0) continue;
-    int n = 0, found = 0, *ids = nt_subtree_ids(nt, &body, 1, &n);
-    /* a class the body nests is another self: its bare include goes to
-       that class (class B; class Inner; include Kernel). A block
-       there may run with this class as self (B.class_eval { include ... }),
-       so an include inside a block still counts. */
-    char *skip = nested_class_body_marks(nt, ids, n);
-    for (int i = 0; i < n && !found; i++) {
-      if (skip && skip[ids[i]]) continue;
-      if (nt_kind(nt, ids[i]) != NK_CallNode || nt_ref(nt, ids[i], "arguments") < 0) continue;
-      const char *nm = nt_str(nt, ids[i], "name");
-      int r = nt_ref(nt, ids[i], "receiver");
-      found = nm && sp_streq(nm, "include") && (r < 0 || nt_kind(nt, r) == NK_SelfNode);
-    }
-    free(ids);
-    free(skip);
-    if (found) return 0;
-  }
-  return 1;
-}
 int comp_super_parent(Compiler *c, int class_id, int is_cmethod) {
   if (class_id < 0) return -1;
   int p = c->classes[class_id].parent;
@@ -5778,11 +5647,85 @@ int comp_super_parent(Compiler *c, int class_id, int is_cmethod) {
   int obj = comp_core_class(c, CORE_OBJECT);
   if (obj < 0 || obj == class_id) return -1;
   if (comp_class_is_module(c, &c->classes[class_id])) return -1;
-  /* under BasicObject with no `include Kernel`, neither Object nor Kernel
-     is in the chain: a super finds no method there (one that includes
-     Kernel reaches Kernel's methods through Object's chain, as before) */
-  if (blank_slate_without_kernel(c, class_id)) return -1;
+  /* under BasicObject with no Kernel among its ancestors, neither Object
+     nor Kernel is in the chain: a super finds no method there (one that
+     includes Kernel reaches Kernel's methods through Object's chain, as
+     before). The record answers it (elab_class_kernel), and the call plan's cells where an include that may not
+     run decides (cplan_class_kernel: the super is then guarded, ver_kernel_guards). */
+  if (cplan_class_kernel(c, class_id) == KERN_LACKS) return -1;
   return obj;
+}
+
+/* The builtin class at the top of class cid's chain, by name: a reopening's
+   own class, Struct or Data, the builtin its superclass constant names (Array,
+   Hash, String, an Exception), BasicObject for a blank slate, else Object.
+   NULL for a native class and for a superclass the method tables do not know
+   (an expression): nothing says what its methods are. *self: cid is that
+   reopening itself. */
+const char *comp_super_builtin_root(Compiler *c, int cid, int *self) {
+  int k = cid, n = 0;
+  if (self) *self = 0;
+  for (; k >= 0 && n < 256; n++, k = c->classes[k].parent) {
+    if (c->classes[k].is_native_class || c->classes[k].nsub_root > 0) return NULL;   /* (a native class has its own methods) */
+    if (c->classes[k].parent < 0) break;
+  }
+  if (k < 0) return NULL;
+  const char *kn = c->classes[k].name;
+  if (kn && is_builtin_reopen(kn)) {
+    if (self) *self = k == cid;
+    return kn;
+  }
+  if (c->classes[k].is_data) return "Data";
+  if (c->classes[k].is_struct) return "Struct";
+  int sc = c->classes[k].def_node >= 0 ? class_def_super(c->nt, c->classes[k].def_node) : -1;
+  /* (a builtin exception named by its path, Math::DomainError, is read whole) */
+  const char *sn = sc >= 0 ? superclass_builtin_exc_name(c, c->nt, sc) : NULL;
+  if (!sn && sc >= 0 && (nt_kind(c->nt, sc) == NK_ConstantReadNode || nt_kind(c->nt, sc) == NK_ConstantPathNode))
+    sn = nt_str(c->nt, sc, "name");
+  if (class_is_blank_slate(c, k)) return cplan_class_kernel(c, cid) == KERN_LACKS ? "BasicObject" : "Object";
+  if (sn && builtin_table_known(sn)) return sn;
+  return sc >= 0 ? NULL : "Object";
+}
+/* The builtin whose method a `super` named uname in instance method scope s
+   reaches once no program method answers it (the call plan's, for the plan
+   to copy; see MethodLookup.bowner): the first ancestor of the chain's
+   builtin root that has the name, as builtin_super_owner gives it, NULL for
+   none. The site's own place is the root's when the method is the root
+   reopening's own or a module included into it (its methods come first), not
+   when a module is prepended to it. */
+const char *comp_super_bowner(Compiler *c, const Scope *s, const char *uname) {
+  if (!uname || s->is_cmethod || s->class_id < 0) return NULL;
+  int self = 0;
+  const char *root = comp_super_builtin_root(c, s->class_id, &self);
+  return root ? builtin_super_owner(root, uname, self && !s->is_prepend_copy) : NULL;
+}
+
+/* Does lower_builtin_supers lower a super in site scope st named uname whose
+   plan names builtin bowner? Not every owner has a call path from a program
+   object's self yet: each family is carried when its path is (the owners
+   not carried keep the ladder in emit_super, which answers them, as before).
+   Carried: a Kernel module function that takes no block (BSP_KERNEL: called
+   bare, as `Kernel.format` is); a super in an Array, Hash, String or Time
+   subclass (the instance is the builtin's value) for the names the Array
+   path answers (comp_arysub_builtin_name; BSP_ARRAY, which passes the
+   method's block on); a method a module prepended to a builtin reopening put
+   in front of the builtin's (BSP_PREPENDED). A module included into a
+   reopened builtin, and a prepended one's self typed as the builtin's value,
+   have no such path: `self.m` there reaches no method at run time, or
+   returns an Enumerator where the method answers a boxed value. */
+BsuperPath comp_bsuper_carried(Compiler *c, int id, const Scope *st, const char *uname, const char *bowner) {
+  /* (the stand-in a version entry's else arm calls for the call made before a later include or prepend is that
+     call's method: a Kernel function is private, and the visibility-blind call a lowered super is would answer an
+     explicit receiver where CRuby raises) */
+  if (builtin_owner_kind(bowner) == BOWN_KERNEL && !st->super_behind && is_kernel_module_function(uname) && !is_frame_reading_function(uname) &&
+      !iter_row(BOP_KERNEL, uname, -1, 0))
+    return BSP_KERNEL;
+  int self = 0;
+  const char *root = comp_super_builtin_root(c, st->class_id, &self);
+  int slot = root ? builtin_core_class_slot(root) : -1;
+  if (st->is_prepend_copy && self && slot >= 0 && slot != CORE_OBJECT && is_builtin_reopen_name(root)) return BSP_PREPENDED;
+  /* (Array's initialize and initialize_copy are rewrite_array_subclass_super's) */
+  return comp_ary_root(c, st->class_id) >= 0 && !is_initialize_family(uname) && comp_arysub_builtin_name(c, id, st->class_id, uname) ? BSP_ARRAY : BSP_NONE;
 }
 
 /* The proc-form clone scope `s` runs, or -1. A def that was cloned holds its
@@ -6243,8 +6186,15 @@ int self_class_static_ci(Compiler *c, int recv) {
   const char *cn = nt_str(nt, recv, "name");
   int cr = nt_ref(nt, recv, "receiver");
   if (!cn || !sp_streq(cn, "class") || cr < 0 || nt_kind(nt, cr) != NK_SelfNode) return -1;
+  /* (not a self an instance_exec rebinds: a stored block's, whose class is
+     the receiver's at run time, not the method's it is written in) */
+  if (nt_int(nt, cr, "ie_rself", 0)) return -1;
+  /* (nor a literal block's an instance_eval or instance_exec runs on
+     another object: its self is that object, whose class the block gives) */
+  int ie = ie_class_of(c, cr);
+  if (ie < -1) return -1;
   Scope *s = comp_scope_of(c, recv);
-  int cid = s ? s->class_id : -1;
+  int cid = ie >= 0 ? ie : s ? s->class_id : -1;
   if (cid < 0 || comp_class_is_module(c, &c->classes[cid])) return -1;
   return comp_class_is_leaf(c, cid) ? cid : -1;
 }
@@ -6290,56 +6240,6 @@ int allocate_super_reaches_class(Compiler *c, int id) {
   return nt_ref(nt, s->def_node, "parameters") < 0;
 }
 
-/* Does call `call` (-1: any) of `allocate` on class or module ci reach a
-   class method `allocate` of the program's own: on ci, its singleton
-   class, a parent or a module it extends? Not a call the analysis made
-   for Class#new's allocation (cnew_alloc: CRuby's new does not call
-   allocate), and not one whose method calls a super that reaches neither
-   Class#allocate (allocate_super_reaches_class: not one with arguments,
-   in an Exception class, ...) nor a parent's own allocate that answers:
-   that super has no target here, so such a call keeps Class#allocate as
-   before. */
-/* `<class value>.allocate` where the class value is no written-out constant
-   (`x.class.allocate`, a local holding a class): a call the generated
-   sp_cls_allocate answers, as it does a boxed class value, and whose value is
-   boxed. A constant has its own static arm; a `self` receiver and a program
-   that gives some class a class method `allocate` of its own keep the paths
-   they had (that method is the user dispatch's). One rule for the analyzer's
-   type of the call, the emitter, and the pass that asks for the sp_cls_*
-   answers (g_gen_cls_answers). */
-int comp_class_value_allocate(Compiler *c, int id) {
-  const NodeTable *nt = c->nt;
-  if (nt_kind(nt, id) != NK_CallNode) return 0;
-  const char *name = nt_str(nt, id, "name");
-  int recv = nt_ref(nt, id, "receiver");
-  if (recv < 0 || !name || !sp_streq(name, "allocate") || nt_ref(nt, id, "arguments") >= 0 ||
-      nt_ref(nt, id, "block") >= 0 || comp_ntype(c, recv) != TY_CLASS)
-    return 0;
-  NodeKind rk = nt_kind(nt, recv);
-  if (rk == NK_ConstantReadNode || rk == NK_ConstantPathNode || rk == NK_SelfNode) return 0;
-  for (int k = 0; k < c->nclasses; k++)
-    if (comp_cmethod_in_chain(c, k, "allocate", NULL) >= 0) return 0;
-  return 1;
-}
-int comp_own_allocate(Compiler *c, int ci, int call) {
-  NodeTable *nt = (NodeTable *)c->nt;
-  if (ci < 0 || ci >= c->nclasses) return 0;
-  if (call >= 0 && nt_int(nt, call, "cnew_alloc", 0)) return 0;
-  int mi = comp_cmethod_in_chain(c, ci, "allocate", NULL);
-  int d = mi >= 0 ? c->scopes[mi].def_node : -1;
-  if (mi < 0) return 0;
-  if (d < 0) return 1;
-  /* a super that reaches a parent's own allocate has that target, when
-     that method itself answers (its own supers checked the same way) */
-  int pc = c->scopes[mi].class_id >= 0 ? comp_super_parent(c, c->scopes[mi].class_id, 1) : -1;
-  int parent_own = pc >= 0 && comp_cmethod_in_chain(c, pc, "allocate", NULL) >= 0 && comp_own_allocate(c, pc, -1);
-  int n = 0, sup = 0, *ids = nt_subtree_ids(nt, &d, 1, &n);
-  for (int i = 0; i < n && !sup; i++)
-    sup = (nt_kind(nt, ids[i]) == NK_SuperNode || nt_kind(nt, ids[i]) == NK_ForwardingSuperNode) &&
-          !allocate_super_reaches_class(c, ids[i]) && !parent_own;
-  free(ids);
-  return !sup;
-}
 /* `allocate` on the class the method runs for: bare or `self.allocate` in a
    class method, `self.class.allocate` in an instance method. Returns that
    class -- the base of what it builds, since a subclass receiving the class
@@ -6348,7 +6248,7 @@ int allocate_on_own_class(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
   if (id < 0 || nt_kind(nt, id) != NK_CallNode) return -1;
   const char *nm = nt_str(nt, id, "name");
-  if (!nm || !sp_streq(nm, "allocate") || nt_ref(nt, id, "block") >= 0) return -1;
+  if (!nm || !is_allocate_name(nm) || nt_ref(nt, id, "block") >= 0) return -1;
   int an = 0; nt_arr(nt, nt_ref(nt, id, "arguments"), "arguments", &an);
   if (an) return -1;
   Scope *s = comp_scope_of(c, id);
@@ -6356,7 +6256,7 @@ int allocate_on_own_class(Compiler *c, int id) {
   if (cid < 0 || cid >= c->nclasses || comp_class_is_module(c, &c->classes[cid])) return -1;
   int recv = nt_ref(nt, id, "receiver");
   /* (a class method `allocate` of the program's own answers the call) */
-  if (comp_own_allocate(c, cid, id)) return -1;
+  if (cplan_own_allocate(c, id, cid)) return -1;
   if (s->is_cmethod) return (recv < 0 || nt_kind(nt, recv) == NK_SelfNode) ? cid : -1;
   return self_class_base_ci(c, recv);
 }
@@ -6476,17 +6376,19 @@ const char *comp_class_base_display_fn(Compiler *c) {
 }
 /* A class method to_s / inspect (nm) of class k's own, taking no arguments
    and answering a String: what prints the class (sp_class_user_to_s and
-   _inspect); -1 when the class has none. */
-int cls_user_display_mi(Compiler *c, int k, const char *nm) {
+   _inspect); -1 when the class has none. The call plan answers it at node
+   site, the class constant a puts prints; -1 for the table behind the run-time
+   dispatcher, which no call stands behind. */
+int cls_user_display_mi(Compiler *c, int site, int k, const char *nm) {
   if (k < 0 || k >= c->nclasses || is_builtin_reopen(c->classes[k].name)) return -1;
-  int mi = comp_cmethod_in_chain(c, k, nm, NULL);
+  int mi = cplan_implied_target(c, ic_operand_host(c, site), site, k, nm, CT_CMETHOD, NULL);
   if (mi < 0) return -1;
   const Scope *s = &c->scopes[mi];
   if (s->nparams > 0 || s->yields || (s->blk_param && s->blk_param[0]) || (TyKind)s->ret != TY_STRING) return -1;
   return mi;
 }
 int prog_has_cls_user_display(Compiler *c, const char *nm) {
-  for (int k = 0; k < c->nclasses; k++) if (cls_user_display_mi(c, k, nm) >= 0) return 1;
+  for (int k = 0; k < c->nclasses; k++) if (cls_user_display_mi(c, -1, k, nm) >= 0) return 1;
   return 0;
 }
 /* ... and for to_s, the table behind the program's own class method to_s */

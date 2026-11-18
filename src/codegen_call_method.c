@@ -386,10 +386,14 @@ static const char *const BAM_RECV_TST[] = {
   "_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_RANGE" };
 
 /* The test of the cells an arm of a version entry runs under: the tests
-   cplan_method_arms gives it (an arm of an arm: both), `&&`-joined */
+   cplan_method_arms gives it (an arm of an arm: both), `&&`-joined. Each
+   is a condition (emit_cond), a C truth value: a cell no reachable
+   statement writes (a prepend in a method an application never runs) is
+   boxed, and its `== 1` emitted as a value is a boxed answer, which the
+   `?:` the arms are chained by cannot test. */
 static void emit_arm_cells_test(Compiler *c, const int *t, Buf *b) {
   for (int k = 0, first = 1; k < 2; k++)
-    if (t[k] >= 0) { if (!first) buf_puts(b, " && "); emit_expr(c, t[k], b); first = 0; }
+    if (t[k] >= 0) { if (!first) buf_puts(b, " && "); emit_cond(c, t[k], b); first = 0; }
 }
 
 /* The value one class's arm stands for, as f writes it for a method mi (-1:
@@ -2194,7 +2198,8 @@ static int emit_method_obj_target(Compiler *c, int id, Buf *b, const NodeTable *
     /* a boxed obj: its class is checked at run time */
     if (t2 >= 0 && c->scopes[t2].class_id >= 0 && !c->scopes[t2].is_cmethod &&
         repr_of(c, argv[0]).kind == RK_BOXED && nt_kind(nt, argv[0]) != NK_SplatNode &&
-        class_value_bind_call_target(c, c->scopes[t2].class_id, c->scopes[t2].name, NULL) == t2) {
+        class_value_bind_call_target(c, method_recv_node(c, recv), c->scopes[t2].class_id,
+                                     c->scopes[t2].name, NULL) == t2) {
       emit_bind_call_boxed(c, id, t2, -1, NULL, argv, argc, b);
       return 1;
     }
@@ -2487,7 +2492,9 @@ static int emit_method_obj_target(Compiler *c, int id, Buf *b, const NodeTable *
             const char *getfn  = (ki == 0) ? "sp_IntArray_oget" : "sp_StrArray_get";
             /* the element the typed array is asked to hold: its own kind
                or the refusal, never a coercion (#4481) */
-            const char *unbox  = (ki == 0) ? "sp_poly_elem_i" : "sp_poly_elem_s";
+            /* (an Array that holds the handle stores its row's `_e` entries, the value as its handle) */
+            const char *hs     = typed_elem_store_sfx(array_kind_ty(bk));
+            const char *unbox  = (ki == 0) ? "sp_poly_elem_i" : hs[0] ? "sp_poly_elem_e" : "sp_poly_elem_s";
             const char *boxarr = (ki == 0) ? "sp_box_int_array" : "sp_box_str_array";
             if (oi == 0) {
               buf_printf(&g_proc_protos, "static sp_RbVal _bam_%sArray_get(void *a, sp_RbVal i);\n", bk);
@@ -2496,13 +2503,17 @@ static int emit_method_obj_target(Compiler *c, int id, Buf *b, const NodeTable *
             }
             else if (oi == 1) {
               buf_printf(&g_proc_protos, "static sp_RbVal _bam_%sArray_set(void *a, sp_RbVal i, sp_RbVal v);\n", bk);
+              Buf en = {0}; emit_elem_entry(&en, 0, array_kind_ty(bk), bk, ki == 0 ? "oset" : "set", "");
               buf_printf(&g_procs, "static sp_RbVal _bam_%sArray_set(void *a, sp_RbVal i, sp_RbVal v) {\n"
-                                   "  sp_%sArray_%s((sp_%sArray *)a, sp_poly_arg_int_chk(i), %s(v));\n  return v;\n}\n", bk, bk, ki == 0 ? "oset" : "set", bk, unbox);
+                                   "  %s((sp_%sArray *)a, sp_poly_arg_int_chk(i), %s(v));\n  return v;\n}\n", bk, en.p, bk, unbox);
+              free(en.p);
             }
             else {
               buf_printf(&g_proc_protos, "static sp_RbVal _bam_%sArray_push(void *a, sp_RbVal v);\n", bk);
+              Buf en = {0}; emit_elem_entry(&en, 0, array_kind_ty(bk), bk, ki == 0 ? "push_o" : "push", "");
               buf_printf(&g_procs, "static sp_RbVal _bam_%sArray_push(void *a, sp_RbVal v) {\n"
-                                   "  sp_%sArray_%s((sp_%sArray *)a, %s(v));\n  return %s(a);\n}\n", bk, bk, ki == 0 ? "push_o" : "push", bk, unbox, boxarr);
+                                   "  %s((sp_%sArray *)a, %s(v));\n  return %s(a);\n}\n", bk, en.p, bk, unbox, boxarr);
+              free(en.p);
             }
           }
           else if (oi == 0) {
@@ -2743,7 +2754,8 @@ int emit_call_method_obj_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
   if (plan.absent && plan.mi < 0) {
     buf_puts(b, "({ ");
     if (recv >= 0) { buf_puts(b, "(void)("); emit_expr(c, recv, b); buf_puts(b, "); "); }
-    emit_capture_absent_raise(c, id, &plan, b);
+    if (plan.absent == CP_ABSENT_MAIN) emit_main_capture_absent_raise(c, id, b);
+    else emit_capture_absent_raise(c, id, &plan, b);
     /* (a pointer's NULL is cast to the call's C type: a Method's fields
        are read off the value, `.name`) */
     TyKind at = repr_of(c, id).as_ty;
@@ -2965,7 +2977,7 @@ int emit_call_poly_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       int cmi = g_cls_tag_skip != id ? cplan_cmethod_arm(c, id, _k, name, NULL, NULL) : -1;
       if ((umi >= 0 && (is_aref0 || argc >= c->scopes[umi].nrequired)) ||
           (cmi >= 0 && (is_aref0 || argc >= c->scopes[cmi].nrequired)) ||
-          (argc == 0 && comp_reader_in_chain(c, _k, name, NULL)))
+          (argc == 0 && call_attr_target(c, id, _k, name, CT_ATTR, NULL)))
         has_user_call = 1;
     }
     /* A call of any count: the slots are sized for it, and an argument past
@@ -3281,6 +3293,17 @@ int emit_owner_class_test(Compiler *c, int recv, const char *name, int tv, int n
   const char **owners = nl ? malloc(sizeof *owners * (size_t)nl) : NULL;
   if (nl && !owners) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   if (nl) cplan_send_split_owners(c, recv, name, owners, nl);
+  /* No class of the program is on the list: a program object is none of
+     them and passes no test. No class whose boxed value carries a tag of its
+     own (an Integer, a String) is: a value of a tag is none of them. Either
+     skips the class name read (a call) for such values. */
+  int nprog = 0, ntag = 0;
+  for (int i = 0; i < nl; i++) {
+    int s = builtin_core_class_slot(owners[i]);
+    if (no_class_values && (s == CORE_MODULE || s == CORE_CLASS)) continue;
+    nprog += comp_class_index(c, owners[i]) >= 0;
+    ntag += builtin_boxed_by_tag(s);
+  }
   /* a builtin class by its class id, which the value's class name comes
      with (sp_poly_class_name_id); a class of the program's under one by
      its name */
@@ -3291,6 +3314,10 @@ int emit_owner_class_test(Compiler *c, int recv, const char *name, int tv, int n
     if (no_class_values && (s == CORE_MODULE || s == CORE_CLASS)) continue;
     if (b && !n) {
       ti = ++g_tmp; ts = ++g_tmp;
+      if (!ntag || !nprog) buf_puts(b, "(");
+      if (!ntag) buf_printf(b, "_t%d.tag == SP_TAG_OBJ && ", tv);
+      if (!nprog && !ntag) buf_printf(b, "_t%d.cls_id < 0 && ", tv);
+      else if (!nprog) buf_printf(b, "!(_t%d.tag == SP_TAG_OBJ && _t%d.cls_id >= 0) && ", tv, tv);
       buf_printf(b, "({ int _t%d; const char *_t%d = sp_poly_class_name_id(_t%d, &_t%d); (void)_t%d; (0", ti, ts, tv, ti, ts);
     }
     if (b && bid) buf_printf(b, " || _t%d == %d", ti, bid);
@@ -3299,9 +3326,18 @@ int emit_owner_class_test(Compiler *c, int recv, const char *name, int tv, int n
   }
   free(owners);
   if (b && names.p) buf_printf(b, " || sp_str_in_list(_t%d, (const char *const[]){%s, NULL})", ts, names.p);
-  if (b && n) buf_puts(b, "); })");
+  if (b && n) buf_puts(b, !ntag || !nprog ? "); }))" : "); })");
   free(names.p);
   return n;
+}
+
+/* The class key of arm k of a send split's plan that the split's test takes
+   (-1: none): a class of the program's, and a reopened builtin's unless the
+   call is one the builtin's own emission answers (PPF_SURFACE). */
+static int split_arm_key(Compiler *c, const PolyPlan *arms, int k, int surface) {
+  int key = arms->arm[k].key;
+  if (key < 0 || key >= c->nclasses) return -1;
+  return surface && class_is_builtin_reopen(c, key) ? -1 : key;
 }
 
 int emit_send_blind(Compiler *c, int id, Buf *b) {
@@ -3324,12 +3360,32 @@ int emit_send_blind(Compiler *c, int id, Buf *b) {
         int sv_argov = g_n_argov;
         view_bind_temp(srcv, tv);
         if (sav && sac > 0) emit_args_in_source_order(c, sav, sac, g_pre);
-        buf_printf(b, "(((_t%d.tag == SP_TAG_OBJ && (0", tv);
+        /* The values the dispatch's arms take are the ones whose key (the
+           switch's, emit_poly_plan_key) is an arm's: a program object by
+           its class id, a value of a builtin the program reopens (`class
+           Integer; def m`) by the class its key names, the reopening's or
+           Numeric's. The test reads that key, so no value reaches the
+           dispatch that no arm takes (a Rational beside a Numeric
+           reopening), and none that one takes goes to the top-level def. */
+        /* (with no class arm, no value takes it: the key is not read) */
         const PolyPlan arms = cplan_poly_arms(c, id);
-        for (int k = 0; k < arms.n; k++)
-          if (arms.arm[k].key >= 0 && arms.arm[k].key < c->nclasses)
-            buf_printf(b, " || _t%d.cls_id == %d", tv, arms.arm[k].key);
-        buf_puts(b, "))");
+        /* (a name the builtin emission of Object's surface answers, ahead of
+           the dispatch, ignores a reopened builtin's method: that arm is no
+           emission of the call, so its values stay where they went) */
+        int surface = (arms.flags & PPF_SURFACE) != 0;
+        int nkeys = 0;
+        for (int k = 0; k < arms.n; k++) nkeys += split_arm_key(c, &arms, k, surface) >= 0;
+        if (nkeys) {
+          int kt = ++g_tmp;
+          buf_printf(b, "((({ int _t%d = ", kt);
+          emit_poly_plan_key(c, id, arms.flags & ~PPF_SEEN, tv, nt_str(c->nt, id, "name"), b);
+          buf_printf(b, "; (0");
+          for (int k = 0; k < arms.n; k++)
+            if (split_arm_key(c, &arms, k, surface) >= 0)
+              buf_printf(b, " || _t%d == %d", kt, arms.arm[k].key);
+          buf_puts(b, "); })");
+        }
+        else buf_puts(b, "(((0)");
         /* a builtin value whose class below Object answers the name
            (Integer#to_s) takes the dispatch too: its method comes before
            the top-level def */

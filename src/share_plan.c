@@ -264,7 +264,7 @@ static int share_plan_leaf_ok(Compiler *c, int a, int foreign, int depth) {
   if (k == NK_LocalVariableReadNode || k == NK_InstanceVariableReadNode || repr_static_read_kind(k))
     return depth < 16 && share_plan_supplies_d(c, a, depth + 1);
   const char *nm = k == NK_CallNode ? nt_str(nt, a, "name") : NULL;
-  if (nm && is_raise_alias(nm) && nt_ref(nt, a, "receiver") < 0 && comp_method_index(c, nm) < 0) return 1;
+  if (nm && is_raise_alias(nm) && nt_ref(nt, a, "receiver") < 0 && call_target(c, a, -1, nm, CT_TOP, NULL) < 0) return 1;
   if (share_plan_need(c, a) != SPN_OBJECT) return 1;
   return depth < 16 && share_plan_supplies_d(c, a, depth + 1);
 }
@@ -593,7 +593,7 @@ int share_plan_call_answers_literal(Compiler *c, int v) {
   for (int k = 0; k < c->nclasses; k++) {
     if (k != s->class_id && !is_descendant(c, k, s->class_id)) continue;
     if (!c->classes[k].instantiated && !c->classes[k].is_builtin_const) continue;
-    int mi = comp_method_in_chain(c, k, nm, NULL);
+    int mi = call_target(c, u, k, nm, 0, NULL);
     if (mi < 0 || !scope_ret_str_literal(c, mi)) return 0;
     any = 1;
   }
@@ -1017,6 +1017,7 @@ static int share_plan_builtin_keeps(Compiler *c, int call) {
   else if (ty_is_array(rt) || ty_is_ptr_array(rt)) fams[nf++] = BOP_ANY_ARRAY;
   else if (ty_is_hash(rt)) fams[nf++] = BOP_ANY_HASH;
   else if (rt == TY_PROC || rt == TY_METHOD || rt == TY_CURRY) fams[nf++] = BOP_CALLABLE;
+  else if (rt == TY_ENV) fams[nf++] = BOP_ENV;
   else if (recv >= 0 && rt != TY_POLY && rt != TY_UNKNOWN) fams[nf++] = rt;
   else { fams[nf++] = BOP_ANY_ARRAY; fams[nf++] = BOP_ANY_HASH; fams[nf++] = TY_CLASS; fams[nf++] = BOP_CALLABLE; }
   fams[nf++] = BOP_ANY_RECV;

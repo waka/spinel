@@ -7,6 +7,7 @@
 #include "builtin_ops.h"
 #include "implicit_calls.h"
 #include "codegen_call_arms.h"
+#include "method_table_check.h"
 #include <ctype.h>
 
 Buf expr_buf(Compiler *c, int node) {
@@ -680,7 +681,8 @@ int  g_cls_tag_skip = -1;
    interpolation, or a read of the last match qualifies -- `$~` builds its
    MatchData, $` and $' their String; $& and $+ are reads, counted with
    them. */
-int subtree_allocates(const NodeTable *nt, int id) {
+int subtree_allocates(Compiler *c, int id) {
+  const NodeTable *nt = c->nt;
   if (id < 0) return 0;
   const char *ty = nt_type(nt, id);
   NodeKind k = nt_kind(nt, id);
@@ -692,6 +694,9 @@ int subtree_allocates(const NodeTable *nt, int id) {
       k == NK_LambdaNode || k == NK_SuperNode ||
       k == NK_ForwardingSuperNode || k == NK_YieldNode)
     return 1;
+  /* A constant read that autoloads runs its file, which allocates; a path's
+     parent is asked below, with the node's other children. */
+  if (nt_kind_is_constant(k) && an_const_read_effect(c, id).autoload) return 1;
   /* Prism reads the match globals as plain globals as often as not. */
   if (k == NK_GlobalVariableReadNode) {
     const char *nm = nt_str(nt, id, "name");
@@ -716,13 +721,13 @@ int subtree_allocates(const NodeTable *nt, int id) {
     return nt_int(nt, id, "rat_big", 0) != 0 || (g_promote_mode && an_rat_boxed(id));
   int nr = nt_num_refs(nt, id);
   for (int i = 0; i < nr; i++)
-    if (subtree_allocates(nt, nt_ref_at(nt, id, i))) return 1;
+    if (subtree_allocates(c, nt_ref_at(nt, id, i))) return 1;
   int na = nt_num_arrs(nt, id);
   for (int i = 0; i < na; i++) {
     int n = 0;
     const int *ids = nt_arr_at(nt, id, i, &n);
     for (int j = 0; j < n; j++)
-      if (subtree_allocates(nt, ids[j])) return 1;
+      if (subtree_allocates(c, ids[j])) return 1;
   }
   return 0;
 }
@@ -731,9 +736,9 @@ int subtree_allocates(const NodeTable *nt, int id) {
    (src/decide.c), keyed at the operand: a refused one is treated as
    allocating, which every caller answers with the root or the ordered temp
    it gives an operand that does allocate. */
-int subtree_may_allocate(const NodeTable *nt, int id) {
-  if (subtree_allocates(nt, id)) return 1;
-  return id >= 0 && !decide_node(nt, id, "no-alloc", NULL);
+int subtree_may_allocate(Compiler *c, int id) {
+  if (subtree_allocates(c, id)) return 1;
+  return id >= 0 && !decide_node(c->nt, id, "no-alloc", NULL);
 }
 /* subtree_may_allocate, plus the one allocation the node table cannot show:
    an ordinary read of a shared-mutable String slot (a TY_STRBUF local or
@@ -749,7 +754,7 @@ int operand_may_allocate(Compiler *c, int id) {
   /* a node the binder ran into a temp first is read as that temp, which
      allocates nothing, whatever its subtree does */
   if (view_ran_first(id) || (inner >= 0 && view_ran_first(inner))) return 0;
-  if (subtree_may_allocate(c->nt, id)) return 1;
+  if (subtree_may_allocate(c, id)) return 1;
   id = inner;
   if (id < 0 || repr_of(c, id).handle) return 0;
   if (strbuf_local_name(c, id)) return 1;
@@ -866,8 +871,10 @@ int node_has_side_effect(Compiler *c, int id) {
       k == NK_YieldNode || strstr(ty, "WriteNode"))
     return 1;
   /* a bare Array.new / Hash.new is as empty and as unobservable as the
-     literal `[]` / `{}`, which is no effect */
-  if (k == NK_CallNode && !call_is_scalar_op(c, id) && !node_is_empty_container(c, id)) return 1;
+     literal `[]` / `{}`, which is no effect; a builtin operator over
+     scalars is none where its operand's implicit call (to_int, coerce)
+     reaches no method of the program's (scalar_op_runs_no_code) */
+  if (k == NK_CallNode && !scalar_op_runs_no_code(c, id) && !node_is_empty_container(c, id)) return 1;
   return -1;
 }
 int subtree_has_side_effect(Compiler *c, int id) {
@@ -2071,7 +2078,7 @@ int g_re_init_needed = 0;
    handle (sp_strelem), stored through the `_e` entries: the value is taken
    as its handle where it is written (emit_typed_elem_hold), so a String in
    hand is stored as itself rather than handed over as its bytes for the
-   runtime to find the handle again (sp_strelem_fx). */
+   runtime to find the handle again. */
 void emit_typed_elem_value(Compiler *c, int node, TyKind rt, Buf *b) {
   TyKind et = typed_elem_kind(rt);
   Repr vr = repr_of(c, node);
@@ -2113,6 +2120,41 @@ const char *typed_elem_sfx(TyKind rt) {
 TyKind typed_elem_held(TyKind rt) {
   const TyTraits *tr = ty_traits_of(rt);
   return tr ? (TyKind)tr->elem_held : TY_UNKNOWN;
+}
+/* The typed Array kind whose element-kind name (array_kind) is k, or TY_UNKNOWN: the way back from the
+   names the emitters carry to the kind whose container row answers how its element is held */
+TyKind array_kind_ty(const char *k) {
+  static const TyKind arrs[] = { TY_INT_ARRAY, TY_FLOAT_ARRAY, TY_STR_ARRAY };
+  for (size_t i = 0; k && i < sizeof arrs / sizeof arrs[0]; i++)
+    if (sp_streq(k, array_kind(arrs[i]))) return arrs[i];
+  return TY_UNKNOWN;
+}
+/* The push entry's suffix for the Array kind rt (or element kind name k, where only the name is in hand)
+   where nil_store_sfx chose sfx: the row's (typed_elem_store_sfx: `_e` for an Array that holds the handle)
+   where the nil store chose none */
+const char *elem_push_sfx(TyKind rt, const char *sfx) {
+  return sfx[0] ? sfx : typed_elem_store_sfx(rt);
+}
+const char *array_push_sfx(const char *k, const char *sfx) {
+  return elem_push_sfx(array_kind_ty(k), sfx);
+}
+/* The ONE formatter of the name of a typed container's store or search entry: `sp_<cname>Array_<op><sfx>`
+   (hash: `sp_<cname>Hash_<op><sfx>`) for the operation `op` (push, set, insert, index, rindex, has_value, ...)
+   on the container of kind rt. The suffix is the container row's (typed_elem_store_sfx: `_e` for a
+   container that holds the handle, so no name for a deleted bytes entry is ever formatted), or the nil store
+   the caller chose (nil_sfx, "" when it chose none: `_nilable`, `_o`). tools/entry_names_check.rb fails a
+   store or search name formatted anywhere else in src/. */
+void emit_elem_entry(Buf *b, int hash, TyKind rt, const char *cname, const char *op, const char *nil_sfx) {
+  buf_printf(b, "sp_%s%s_%s%s", cname ? cname : "", hash ? "Hash" : "Array", op, elem_push_sfx(rt, nil_sfx));
+}
+void emit_array_entry(Buf *b, const char *k, const char *op) { emit_elem_entry(b, 0, array_kind_ty(k), k, op, ""); }
+void emit_hash_entry(Buf *b, TyKind hrt, const char *op) { emit_elem_entry(b, 1, hrt, ty_hash_cname(hrt), op, ""); }
+/* `sp_<k>Array_push(_t<t>, <text>)` for an element kind k: the text as the kind's push takes it
+   (a String Array: its handle). No semicolon. */
+void emit_kind_push(Compiler *c, Buf *b, const char *k, int t, const char *text) {
+  emit_array_entry(b, k, "push"); buf_printf(b, "(_t%d, ", t);
+  emit_typed_elem_hold(c, -1, array_kind_ty(k), text, b);
+  buf_puts(b, ")");
 }
 /* The element store's suffix for rt, "" where its entries take none */
 const char *typed_elem_store_sfx(TyKind rt) {
@@ -2159,8 +2201,7 @@ int emit_typed_elem_coerce(Compiler *c, int node, TyKind rt, const char *what, B
 /* text, the value node is written as on its way into an element of rt, as
    the element is held: for the handle, the handle of either face (SP_STR_HDL:
    a handle is itself; bytes adopt the handle they were born in, or name a
-   payload's owner, or get the new handle sp_strelem_fx made for them in the
-   bytes entries) and a frozen literal's static object (strbuf_new_of_text),
+   payload's owner, or get a new handle) and a frozen literal's static object (strbuf_new_of_text),
    nil's NULL; for any other kind the text as it is. */
 void emit_typed_elem_hold(Compiler *c, int node, TyKind rt, const char *text, Buf *b) {
   if (typed_elem_held(rt) != TY_STRBUF) { buf_puts(b, text); return; }
@@ -2457,6 +2498,18 @@ void emit_param_cell_publish(Compiler *c, int blk, const char *pname, Buf *b, in
     buf_printf(b, "*_cell_%s = (sp_int)(uintptr_t)lv_%s;\n", prn, prn);
   else
     buf_printf(b, "*_cell_%s = lv_%s;\n", prn, prn);
+}
+/* A fresh cell for a captured block parameter about to be bound again: each
+   call of the receiving block keeps its own binding for readers that outlive
+   the call, as emit_param_cell_publish's callers do for ordinary parameters. */
+void emit_param_cell_fresh(Compiler *c, int blk, const char *pname, Buf *b, int indent) {
+  Scope *psc = blk >= 0 ? comp_scope_of(c, blk) : NULL;
+  LocalVar *plv = psc ? scope_local(psc, pname) : NULL;
+  if (!plv || !plv->is_cell) return;
+  const char *prn = rename_local(pname);
+  if (g_cap_struct && g_cap_names && nameset_has(g_cap_names, prn)) return;
+  char pcell_buf[160];
+  emit_fresh_cell(c, plv, cell_var_name(prn, pcell_buf, sizeof pcell_buf), b, indent);
 }
 void emit_block_locals_reset(Compiler *c, int blk, Buf *b, int indent) {
   if (blk < 0) return;
@@ -2877,7 +2930,7 @@ static int ivs_never_nil(Compiler *c, int v) {
       if (!nm || r < 0) return 0;
       if (sp_streq(nm, "new") && nt_kind(nt, r) == NK_ConstantReadNode) {
         int ci = const_node_class_index(c, r);
-        return ci < 0 ? 1 : comp_cmethod_in_chain(c, ci, "new", NULL) < 0;
+        return ci < 0 ? 1 : cplan_user_new(c, v, ci) < 0;
       }
       if (is_unary_sign(nm)) return nt_kind(nt, r) == NK_StringNode;
       TyKind rt = comp_ntype(c, r);
@@ -3644,7 +3697,7 @@ int emit_poly_rhs_coerced(Compiler *c, TyKind slot, int v, Buf *b) {
     free(e.p);
     return 1;
   }
-  const char *fn = slot == TY_STRING && prog_has_conv_method(c, "to_str", TY_STRING)
+  const char *fn = slot == TY_STRING && prog_has_conv_method(c, v, "to_str", TY_STRING)
                    ? "sp_poly_arg_str" : poly_rhs_unbox_fn(slot);
   if (!fn) return 0;
   buf_printf(b, "%s(", fn); emit_expr(c, v, b); buf_puts(b, ")");
@@ -3980,7 +4033,18 @@ int str_changing_name(const char *nm) {
 int strbuf_poly_ivar_mutated(Compiler *c, int n) {
   int pc = comp_recv_parent(c, n);
   const char *pn = pc >= 0 ? nt_str(c->nt, pc, "name") : NULL;
-  return pn && str_changing_name(pn) && !is_freeze_name(pn);
+  if (!pn || !str_changing_name(pn) || is_freeze_name(pn)) return 0;
+  /* (a mutator's name a Hash or an Array answers too, `[]=` or `<<`: only
+     a slot of the name some class keeps a String in has a handle to give) */
+  int a = nt_ref(c->nt, n, "arguments"), ac = 0;
+  const int *av = a >= 0 ? nt_arr(c->nt, a, "arguments", &ac) : NULL;
+  const char *ivn = ac == 1 ? nt_str(c->nt, av[0], "value") : NULL;
+  if (!ivn) return 0;
+  for (int k = 0; k < c->nclasses; k++) {
+    int iv = comp_ivar_index(&c->classes[k], ivn);
+    if (iv >= 0 && (c->classes[k].ivar_types[iv] == TY_STRING || c->classes[k].ivar_types[iv] == TY_STRBUF)) return 1;
+  }
+  return 0;
 }
 int strbuf_call_reads_handle(Compiler *c, int recv) {
   return recv >= 0 && nt_kind(c->nt, recv) == NK_CallNode &&
@@ -4407,6 +4471,11 @@ int unsup_message(Compiler *c, int id, const char *what, int self_ci, char *msg,
   NodeKind k = nt_kind(c->nt, id);
   const char *mname = k == NK_CallNode ? nt_str(c->nt, id, "name") : NULL;
   if (mname) {
+    /* a define_method handed a parameter of its method as the body: the
+       words of the pass that refuses it ahead of emission, which
+       --defer-refusals leaves to this site (reject_define_method_runtime_block) */
+    const char *dm = define_method_param_body_refusal(c, id);
+    if (dm) { snprintf(msg, cap, "%s", dm); return CR_FEATURE; }
     int recv = nt_ref(c->nt, id, "receiver");
     int args = nt_ref(c->nt, id, "arguments");
     int ac = 0; const int *av = args >= 0 ? nt_arr(c->nt, args, "arguments", &ac) : NULL;
@@ -4562,6 +4631,7 @@ void refuse_prepass_at_emit(Compiler *c, int id) {
   refuse_from_plan(c, id, CRF_CONST_GET, "refuse-const-get");
   refuse_from_plan(c, id, CRF_BINDING, "refuse-binding");
   refuse_from_plan(c, id, CRF_TOP_SELF, "refuse-top-self");
+  refuse_from_plan(c, id, CRF_MAIN_CHAIN, "refuse-main-chain");
 }
 
 __attribute__((noreturn)) void unsupported(Compiler *c, int id, const char *what) {
@@ -4736,7 +4806,7 @@ int emit_const_read_prefix(Compiler *c, int id, Buf *b) {
   if (!nt_kind_is_constant(k) || view_const_read_done(c, id)) return 0;
   int n = k == NK_ConstantPathNode ? emit_const_read_prefix(c, nt_ref(c->nt, id, "parent"), b) : 0;
   ConstReadEffect ce = an_const_read_effect(c, id);
-  if (ce.presence || ce.autoload || ce.class_presence) {
+  if (!an_const_effect_runs_nothing(ce)) {
     if (!n) buf_puts(b, "(");
     emit_const_read_open_checked(c, id, ce, b);
     buf_puts(b, "0");
@@ -5563,12 +5633,12 @@ const char *default_value(TyKind t) {
 static const char *const plain_int_ops[] = {
   "+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>", NULL
 };
-static int plain_int_op(Compiler *c, const char *nm) {
+static int plain_int_op(Compiler *c, int id, const char *nm) {
   for (int i = 0; plain_int_ops[i]; i++)
     if (!strcmp(nm, plain_int_ops[i])) {
       /* a program that reopens Integer with the operator owns its answer */
       int ci = comp_core_class(c, CORE_INTEGER);
-      return ci < 0 || comp_method_in_chain(c, ci, nm, NULL) < 0;
+      return ci < 0 || call_target(c, id, ci, nm, 0, NULL) < 0;
     }
   return 0;
 }
@@ -5614,7 +5684,7 @@ static int plain_local(Compiler *c, LocalVar *lv, const char *name, int depth) {
     if (k == NK_LocalVariableWriteNode) ok = plain_expr(c, nt_ref(nt, w, "value"), depth + 1);
     else if (k == NK_LocalVariableOperatorWriteNode) {
       const char *op = nt_str(nt, w, "binary_operator");
-      ok = op && plain_int_op(c, op) && comp_ntype(c, w) == TY_INT;
+      ok = op && plain_int_op(c, w, op) && comp_ntype(c, w) == TY_INT;
     }
     else ok = 0;
   }
@@ -5687,7 +5757,7 @@ static int plain_expr(Compiler *c, int n, int depth) {
       if (ci >= 0 && call_target(c, n, ci, nm, 0, NULL) >= 0) return 0;
       return nm[0] == 't' ? plain_expr(c, recv, depth + 1) : 1;
     }
-    return plain_int_op(c, nm) && argc == 1 && comp_ntype(c, argv[0]) == TY_INT;
+    return plain_int_op(c, n, nm) && argc == 1 && comp_ntype(c, argv[0]) == TY_INT;
   }
   default: return 0;
   }
@@ -6897,7 +6967,7 @@ int exc_text_override_calls_super(Compiler *c) {
   for (int i = 0; i < c->nclasses && c->exc_text_super == 1; i++) {
     if (!class_is_exc_subclass(c, i) && !class_is_exc_reopen(c, i)) continue;
     for (int k = 0; k < 2; k++) {
-      int mi = comp_method_in_class(c, i, k ? "to_s" : "message");
+      int mi = cplan_implied_target(c, -1, -1, i, k ? "to_s" : "message", CT_OWN, NULL);
       /* (--share-strings: one that answers a new String of its own,
          `"B:" + super`, never hands on super's answer, and one that
          publishes the handle it answers, `def message = super`, hands on
@@ -7097,7 +7167,18 @@ static char *mc_version_name(const Scope *s) {
   else memcpy(v, s->name, (size_t)n + 1);
   return v;
 }
+/* A replaced version no call marked reachable has no number and no
+   function: spelled from its name it would be the table's method */
+static int mc_version_unkept(const Scope *s) {
+  return s->replaced && !s->reachable && !s->version_n && !s->main_n && !s->entry && !s->c_name;
+}
 const char *mc_method(Compiler *c, const Scope *s) {
+  /* a call that names one would run the wrong version without a word */
+  if (mc_version_unkept(s)) {
+    fprintf(stderr, "spinel: internal error: a call names the replaced version %s#%s, which no call kept reachable\n",
+            s->class_id >= 0 ? c->classes[s->class_id].name : "main", s->name ? s->name : "?");
+    exit(1);
+  }
   char *name = mc_version_name(s);
   const char *out;
   if (s->c_name) out = mc_ring_setf(c, "sp_%s", s->c_name);
@@ -7185,6 +7266,7 @@ static void mc_number_entry(Compiler *c, McDefNames *dn, int s) {
 }
 void mc_number_versions(Compiler *c) {
   const NodeTable *nt = c->nt;
+  mtab_enter(c);   /* (construction: it reads the program's own defs to number or judge them, no call asks) */
   int body = nt_ref(nt, nt->root_id, "statements"), n = 0, top = 0, cls = 0, main = 0;
   const int *st = body >= 0 ? nt_arr(nt, body, "body", &n) : NULL;
   McDefNames dn = { 0 };
@@ -7210,6 +7292,7 @@ void mc_number_versions(Compiler *c) {
     if (sc->class_id < 0) sc->version_n = mc_number_top(c, &dn, sc, "%s__redef%d", &top);
     else sc->version_n = ++cls;
   }
+  mtab_leave(c);
   free(dn.v);
   free(dn.ix.slot);
 }
@@ -7245,7 +7328,7 @@ static int mc_find_clash(Compiler *c, int *first, int *later) {
     const Scope *s = i >= 0 ? &c->scopes[i] : NULL;
     const char *nm;
     if (s) {
-      if (!s->name || s->c_name) continue;
+      if (!s->name || s->c_name || mc_version_unkept(s)) continue;   /* (a function nothing emits spells no name) */
       nm = mc_method(c, s);
     } else if (i < -nh) {
       const ClassInfo *ci = &c->classes[-i - 1 - nh];
@@ -9105,6 +9188,18 @@ void emit_oint_unwrap_ck(Compiler *c, int node, TyKind t, const char *op, Buf *b
   free(side.p);
 }
 
+/* An Integer operand that may be nil, unwrapped with the error its consumer
+   raises for nil: an operator's right operand (`1 & x`, `1 / x`,
+   `7.divmod(x)`: "nil can't be coerced into Integer"), or a shift count
+   (`1 << x`: "no implicit conversion of nil into Integer"). 0 when the
+   operand cannot be nil, for the caller's own emission. */
+int emit_int_opnd_maybe_nil(Compiler *c, int node, int shift_count, Buf *b) {
+  if (node < 0 || !node_is_oint(c, node) || !nullable_int_value(c, node)) return 0;
+  if (shift_count) { buf_puts(b, "sp_oint_arg_of("); emit_oint_expr(c, node, TY_INT, b); buf_puts(b, ")"); }
+  else emit_oint_unwrap_ck(c, node, TY_INT, g_ck_opnd, b);
+  return 1;
+}
+
 /* An Integer key of a boxed receiver's [] / []= / index op-write that can be
    nil goes to the runtime boxed (sp_poly_index_poly / sp_poly_set_poly),
    its nil with it: CRuby calls [] on the receiver before the key is
@@ -9117,9 +9212,16 @@ int poly_int_key_boxed(Compiler *c, int key) {
 }
 
 void emit_scalar_operand_op(Compiler *c, int node, const char *op, Buf *b) {
-  TyKind t = comp_ntype(c, node);
-  if (oint_kind(t) && cmp_operand_may_be_nil(c, node)) { emit_oint_unwrap_ck(c, node, t, op, b); return; }
-  emit_scalar_operand(c, node, t == TY_FLOAT ? "0.0" : "0", b);
+  if (emit_scalar_recv_maybe_nil(c, node, op, b)) return;
+  emit_scalar_operand(c, node, comp_ntype(c, node) == TY_FLOAT ? "0.0" : "0", b);
+}
+
+/* See codegen_internal.h. */
+int emit_scalar_recv_maybe_nil(Compiler *c, int node, const char *op, Buf *b) {
+  TyKind t = node >= 0 ? comp_ntype(c, node) : TY_UNKNOWN;
+  if (!oint_kind(t) || !cmp_operand_may_be_nil(c, node)) return 0;
+  emit_oint_unwrap_ck(c, node, t, op, b);
+  return 1;
 }
 
 /* See codegen_internal.h. */

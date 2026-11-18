@@ -10,6 +10,7 @@
 #endif
 #include "sp_alloc.h"   /* sp_box_nil / sp_box_obj */
 #include "sp_exc.h"     /* sp_exc_cls_display / sp_exc_cls_unnamed (the thread report) */
+#include "sp_re.h"      /* sp_re_switch: the match registers of a thread */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -1072,6 +1073,7 @@ void sp_stw_collect(void) { sp_stw_collect_impl(0); }
    any threaded program calling GC.start hung (#3781). Forced: an explicit
    request collects even when neither heap is over its trigger. */
 void sp_gc_collect_request(void) {
+  sp_gc_full_next = 1;   /* GC.start: a full collection (sp_gc_collect) */
 #ifdef SP_THREADS
   sp_stw_collect_impl(1);
 #else
@@ -1576,11 +1578,12 @@ static int sp_ev_backend_wait(int set, sp_ev_ready *out, int max, int tmo_ms) {
   int n = kevent(set, NULL, 0, evs, max, &ts);
   for (int i = 0; i < n; i++) {
     out[i].fd = (int)evs[i].ident;
-    /* EV_EOF is a peer that closed: readable (and writable, for a socket whose
-       other end is gone) exactly as POLLHUP is. EV_ERROR answers both so the
-       waiter's own read or write reports the error, which is what poll did. */
+    /* EV_EOF is a peer that closed its side of this filter's direction, so it
+       answers that direction only, as epoll's EPOLLIN does for a peer that
+       stopped sending. EV_ERROR answers both so the waiter's own read or
+       write reports the error, which is what poll did. */
     short r = (evs[i].filter == EVFILT_WRITE) ? POLLOUT : POLLIN;
-    if (evs[i].flags & (EV_EOF | EV_ERROR)) r = POLLIN | POLLOUT;
+    if (evs[i].flags & EV_ERROR) r = POLLIN | POLLOUT;
     out[i].rev = r;
   }
   return n;
@@ -2196,7 +2199,12 @@ static void reg_add(sp_thread *t) {
 int sp_sched_other_threads_live(void) {
   int other = 0;
   SCHED_LOCK();
-  if (g_current != &g_main_thread) other = 1;
+  /* (no green thread yet: the scheduler never started, and the caller, main
+     or a Fiber it resumed, is all there is. NULL read as another thread sent
+     a child wait inside a Fiber to sp_Thread_pass, which switched out to no
+     thread, #12024) */
+  if (!g_current) other = 0;
+  else if (g_current != &g_main_thread) other = 1;
   else { REG_LOCK(); sp_thread *t = g_all;
     while (t) { if (t != g_current) { other = 1; break; } t = t->all_next; }
     REG_UNLOCK(); }
@@ -2962,6 +2970,14 @@ static void sp_sched_signal_if_quiescent(void) {
    caller_ctx rather than its own, so a switch to it lands on a context that
    was never saved. run_thread_once never nests on a worker, so it sets the
    home and clears it after. */
+/* The match registers (`$~`) are per thread in Ruby and per worker in the
+   runtime. A green thread that stops and gives its worker to another one
+   saves its own on its stack and puts them back when it runs again, and so
+   does the side that runs it (run_thread_once), so the threads of one worker
+   do not read each other's. The trap thread (lib/sp_cold.c) takes no part:
+   CRuby runs a trap in the main thread, with the `$~` of that thread, and
+   the trap thread reads and writes the registers of the side that runs it. */
+static int sp_thread_own_match(const sp_thread *t) { return t && !t->internal; }
 static SP_TLS sp_Fiber *g_sched_home = NULL;
 static sp_Fiber *sp_sched_home(void) { return g_sched_home ? g_sched_home : sp_fiber_worker_root(); }
 sp_Fiber *sp_sched_home_fiber(void) { return sp_sched_home(); }
@@ -2971,7 +2987,11 @@ sp_Fiber *sp_sched_home_fiber(void) { return sp_sched_home(); }
 static void sp_sched_switch_out(void) {
   sp_thread *self = g_current;
   if (self && sp_fiber_current != self->fiber) self->at = sp_fiber_current;
+  int own = sp_thread_own_match(self);
+  sp_re_switch match;
+  if (own) sp_re_switch_out(&match);
   sp_fiber_sched_switch(sp_sched_home());
+  if (own) sp_re_switch_in(&match);
 }
 
 static void run_thread_once(sp_thread *t) { sp_gc_wb((void*)t);   /* PRE/POST: sched lock held, or not held from the worker's fast path */
@@ -3034,9 +3054,17 @@ static void run_thread_once(sp_thread *t) { sp_gc_wb((void*)t);   /* PRE/POST: s
   g_sched_home = sp_fiber_current;
   sp_Fiber *at = t->at;   /* it stopped inside a Fiber it resumed */
   t->at = NULL;
+  /* the thread runs with its own `$~`; a new one starts with none */
+  int own = sp_thread_own_match(t);
+  sp_re_switch match;
+  if (own) {
+    sp_re_switch_out(&match);
+    if (t->fiber->state == 0) sp_re_thread_begin();
+  }
   if (locked) SCHED_UNLOCK();
   sp_Fiber_transfer_catch(t->fiber, at, in, &raised, &ec, &em, &eo);
   if (locked) SCHED_LOCK();
+  if (own) sp_re_switch_in(&match);
   g_sched_home = NULL;
   g_current = saved;
 #ifdef SP_THREADS
@@ -3208,7 +3236,14 @@ static void sp_sched_pump(sp_thread *target, int may_wait) {
        no wait list here, so nothing marks it RUNNABLE for it) */
     if (target && sp_thread_inject_pending(&g_main_thread)) return;
 #ifdef SP_EV_BACKEND
-    if (g_wslot[0].evfd > 0) sp_ev_worker_wait(0, 0);   /* see sp_worker_main */
+    /* A look at the set before each thread was a syscall that, when nothing
+       is ready, leaves the CPU on Darwin (about 12 us). With threads queued
+       it is taken when the helpers take theirs (sp_ev_drain_due); with none,
+       the wait below, or the look before returning, takes it. */
+    if (g_wslot[0].evfd > 0 &&
+        (SP_ATOMIC_LOAD(&g_lrq[0].head, __ATOMIC_ACQUIRE) || SP_ATOMIC_LOAD(&g_grq.head, __ATOMIC_ACQUIRE)) &&
+        sp_ev_drain_due(0))
+      sp_ev_worker_wait(0, 0);   /* see sp_worker_main */
 #endif
     /* main blocked on a Queue/Mutex and a runnable thread just woke it */
     if (g_main_thread.state == SP_TH_RUNNABLE) { SP_TH_SET_STATE(&g_main_thread, SP_TH_RUNNING); return; }
@@ -3271,6 +3306,9 @@ static void sp_sched_pump(sp_thread *target, int may_wait) {
     }
 #else
     (void)may_wait;
+#endif
+#ifdef SP_EV_BACKEND
+    if (g_wslot[0].evfd > 0 && sp_ev_worker_wait(0, 0) > 0) continue;
 #endif
     return;
   }
@@ -3367,6 +3405,9 @@ static void sp_thread_scan(void *p) {
   sp_mark_rbval(t->retval);
   sp_mark_rbval(t->name);
   if (t->exc_obj) sp_gc_mark(t->exc_obj);
+  /* the message beside it is the copy a raise put on the exception stack,
+     not the object's own: a root until a join or value re-raises it */
+  if (t->exc_msg) sp_mark_string(t->exc_msg);
   if (t->tls) sp_gc_mark(t->tls);
 }
 
@@ -3384,7 +3425,9 @@ sp_thread *sp_Thread_spawn_fiber_at(sp_Fiber *f, sp_RbVal arg, const char *file,
   t->birth_line = line;
   return t;
 }
-sp_thread *sp_Thread_spawn_fiber(sp_Fiber *f, sp_RbVal arg) {
+/* `internal` marks the runtime's own thread. It is set before the thread
+   goes on a run queue, so the worker that runs the thread first reads it. */
+static sp_thread *thread_spawn(sp_Fiber *f, sp_RbVal arg, int internal) {
 #ifdef SP_THREADS
   if (!g_workers_started) {
     if (!sp_sched_ensure_workers())
@@ -3399,6 +3442,7 @@ sp_thread *sp_Thread_spawn_fiber(sp_Fiber *f, sp_RbVal arg) {
   sp_thread *volatile t = (sp_thread *)sp_gc_alloc(sizeof(sp_thread), NULL, sp_thread_scan);
   memset(t, 0, sizeof *t);
   t->home_wid = -1;              /* not yet started: any worker may pick it up */
+  t->internal = internal ? 1 : 0;
   t->fiber = f;
   t->arg = arg;
   t->retval = sp_box_nil();
@@ -3428,6 +3472,8 @@ sp_thread *sp_Thread_spawn_fiber(sp_Fiber *f, sp_RbVal arg) {
   SCHED_UNLOCK();
   return t;
 }
+sp_thread *sp_Thread_spawn_fiber(sp_Fiber *f, sp_RbVal arg) { return thread_spawn(f, arg, 0); }
+sp_thread *sp_Thread_spawn_internal(sp_Fiber *f) { return thread_spawn(f, sp_box_nil(), 1); }
 
 /* Joining the current thread can never finish. Reject it before attempting to
    park, including on the main thread before the timer monitor has started. */
@@ -3560,6 +3606,9 @@ void sp_Thread_pass(void) {
   if (SP_ATOMIC_LOAD(&sp_sig_pending_flag, __ATOMIC_ACQUIRE)) sp_sig_run_pending();
   SCHED_LOCK();
   sp_thread *self = g_current;
+  /* (no green thread yet: there is no one to pass to, and a switch out from
+     a Fiber of main's would go to no thread, #12024) */
+  if (!self) { SCHED_UNLOCK(); return; }
   if (self == &g_main_thread) {
     sp_sched_pass();   /* one round-robin sweep, then main resumes (not a drain) */
     SCHED_UNLOCK();
@@ -3632,7 +3681,6 @@ sp_thread *sp_Thread_list_at(sp_int i) {
   REG_UNLOCK();
   return t ? t : &g_main_thread;
 }
-void sp_thread_set_internal(sp_thread *t) { t->internal = 1; }
 
 /* #status: "run" while runnable/running, "sleep" while blocked, false when it
    finished normally, nil when it died with an unhandled exception. */

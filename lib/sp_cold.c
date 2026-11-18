@@ -1567,7 +1567,7 @@ static void sp_typed_array_replace_boxed(sp_RbVal recv, sp_RbVal src) {
         if (e.tag == SP_TAG_STR) sp_StrArray_push_e(st, sp_String_new_shared(e.v.s));
         else if (e.tag == SP_TAG_OBJ && e.cls_id == SP_BUILTIN_STRBUF)
           sp_StrArray_push_e(st, (sp_strelem)e.v.p);   /* the handle itself: one String */
-        else if (e.tag == SP_TAG_NIL) sp_StrArray_push(st, NULL);
+        else if (e.tag == SP_TAG_NIL) sp_StrArray_push_e(st, NULL);
         else sp_typed_replace_elem_error(e, "String");
       }
       sp_StrArray_replace((sp_StrArray *)recv.v.p, st);
@@ -4291,8 +4291,7 @@ static void sp_sig_thread_start(void) {
   sp_sig_wake[0] = pf[0];
   SP_ATOMIC_STORE(&sp_sig_wake[1], pf[1], __ATOMIC_RELEASE);   /* the handler writes it from here on */
   started = 1;
-  sp_thread *t = sp_Thread_spawn_fiber(sp_Fiber_new(sp_sig_thread_body), sp_box_nil());
-  sp_thread_set_internal(t);
+  sp_Thread_spawn_internal(sp_Fiber_new(sp_sig_thread_body));
   /* a delivery recorded before the pipe, whose proc has not run yet */
   if (SP_ATOMIC_LOAD(&sp_sig_pending_flag, __ATOMIC_ACQUIRE)) { char b = 0; ssize_t w = write(pf[1], &b, 1); (void)w; }
 }
@@ -4484,6 +4483,15 @@ sp_StrStrHash *sp_env_value(void) {
   sp_StrStrHash_mark_env(h);
   return h;
 }
+/* A store, a delete or a clear on the snapshot a boxed ENV is read through
+   (sp_env_box_read, marked by sp_StrStrHash_mark_env) goes on to the
+   environment, as ENV's own does (lib/sp_hash.c calls these). v NULL unsets. */
+void sp_env_write_through(const char *k, const char *v) {
+  if (v) setenv(sp_env_chk(k, 0), sp_env_chk(v, 1), 1);
+  else unsetenv(sp_env_chk(k, 0));
+}
+sp_StrStrHash *sp_env_clear(void);
+void sp_env_clear_through(void) { (void)sp_env_clear(); }
 sp_StrStrHash *sp_env_clear(void) {
   extern char **environ;
   for (;;) {   /* environ shifts under unsetenv: restart until empty */
@@ -4574,7 +4582,10 @@ sp_StrIntHash*sp_gc_stat(void){
   for(sp_str_hdr*sh=sp_str_old; sh; sh=sh->next){ str_bytes+=sh->size & SP_STR_SIZE_MASK; str_count++; }
   SP_HEAP_UNLOCK();
 #endif
-  sp_StrIntHash*h=sp_StrIntHash_new();sp_StrIntHash_set(h,SPL("bytes"),(sp_int)SP_GC_CTR_GET(sp_gc_bytes));sp_StrIntHash_set(h,SPL("old_bytes"),(sp_int)sp_gc_old_bytes);sp_StrIntHash_set(h,SPL("threshold"),(sp_int)sp_gc_threshold);sp_StrIntHash_set(h,SPL("cycle"),(sp_int)sp_gc_cycle);sp_StrIntHash_set(h,SPL("full_runs"),(sp_int)sp_gc_full_runs);sp_StrIntHash_set(h,SPL("remembered"),(sp_int)sp_gc_nremembered);sp_StrIntHash_set(h,SPL("remembered_peak"),(sp_int)sp_gc_rem_peak);sp_StrIntHash_set(h,SPL("str_bytes"),(sp_int)str_bytes);sp_StrIntHash_set(h,SPL("str_count"),str_count);return h;}
+  /* CRuby's count of the objects the heap holds (sp_gc_live_objects), so a
+     program can measure a release the same way on both */
+  long long live_objs=sp_gc_live_objects();
+  sp_StrIntHash*h=sp_StrIntHash_new();sp_StrIntHash_set(h,SPL("bytes"),(sp_int)SP_GC_CTR_GET(sp_gc_bytes));sp_StrIntHash_set(h,SPL("heap_live_slots"),(sp_int)live_objs);sp_StrIntHash_set(h,SPL("old_bytes"),(sp_int)sp_gc_old_bytes);sp_StrIntHash_set(h,SPL("threshold"),(sp_int)sp_gc_threshold);sp_StrIntHash_set(h,SPL("cycle"),(sp_int)sp_gc_cycle);sp_StrIntHash_set(h,SPL("full_runs"),(sp_int)sp_gc_full_runs);sp_StrIntHash_set(h,SPL("remembered"),(sp_int)sp_gc_nremembered);sp_StrIntHash_set(h,SPL("remembered_peak"),(sp_int)sp_gc_rem_peak);sp_StrIntHash_set(h,SPL("str_bytes"),(sp_int)str_bytes);sp_StrIntHash_set(h,SPL("str_count"),str_count);return h;}
 /* String#setbyte over value-semantics strings: copy-on-write (a literal's
    bytes are static storage). The caller re-binds an lvalue receiver. */
 const char *sp_str_setbyte_cow(const char *s, sp_int i, sp_int v) {SP_GC_ROOT_STR(s);
@@ -4962,7 +4973,7 @@ sp_StrArray *sp_get_load_path(void) {
   if (!sp_load_path_cache) {
     sp_load_path_cache = sp_StrArray_new();   /* (marked from here: the seeds allocate) */
     for (int i = 0; i < sp_load_seed_n; i++)
-      sp_StrArray_push(sp_load_path_cache, sp_sprintf("%s", sp_load_seed_dirs[i]));
+      sp_StrArray_push_e(sp_load_path_cache, sp_String_new_shared(sp_sprintf("%s", sp_load_seed_dirs[i])));
   }
   return sp_load_path_cache;
 }
@@ -5337,7 +5348,7 @@ sp_Enumerator *sp_srange_stepped_enum(sp_RbVal src, sp_int n, const char *label,
     SP_GC_ROOT(all);
     sp_StrArray *v = sp_StrArray_new();
     SP_GC_ROOT(v);
-    for (sp_int i = 0; i < sp_StrArray_length(all); i += n) sp_StrArray_push(v, sp_StrArray_get(all, i));
+    for (sp_int i = 0; i < sp_StrArray_length(all); i += n) sp_StrArray_push_e(v, sp_StrArray_get_e(all, i));
     sp_PolyArray *items;
     if (r.sym) {   /* the members of a Range of Symbols are Symbols (the program's interner) */
       items = sp_PolyArray_new();
