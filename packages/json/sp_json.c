@@ -142,23 +142,6 @@ static const char *jb_finish(jbuf *b) {
   return r;
 }
 
-/* An object's #to_s, the way sp_poly_to_s renders it: the class's own method
-   through the generated dispatcher, a built-in object's (a Time) through
-   sp_poly_to_s, and otherwise CRuby's default form. The generated TU's
-   renderer is a static inline in spinel_rt.h, which this TU deliberately does
-   not include (see the note at the top), so these arms are reached through
-   the hooks the generated program installs. */
-static const char *sp_json_obj_to_s(sp_RbVal v) {
-  if (v.cls_id >= 0 && sp_obj_to_s_fn) {
-    const char *us = sp_obj_to_s_fn(v.cls_id, v.v.p);
-    if (us) return us;
-  }
-  if (v.cls_id < 0 && sp_poly_to_s_fn) return sp_poly_to_s_fn(v);
-  return sp_sprintf("#<%s:0x%016llx>",
-                    sp_obj_cls_name_fn ? sp_obj_cls_name_fn(v.cls_id) : "Object",
-                    (unsigned long long)(uintptr_t)v.v.p);
-}
-
 /* The escape a byte takes in a JSON string: 0 for none, 'u' for \u00XX, and
    otherwise the letter after the backslash. */
 static const char jb_esc[256] = {
@@ -380,7 +363,30 @@ static sp_RbVal sp_json_user_view(sp_RbVal v) {
    json reads a String subclass instance's bytes, not its #to_s); any other
    object is its #to_s, as Object#to_json is. */
 static void sp_json_obj_text_b(jbuf *b, sp_RbVal v) {
-  const char *t = sp_json_is_strbuf(v) ? sp_poly_to_s(v) : sp_json_obj_to_s(v);
+  /* a class's own #to_s: its answer must be a String, as the generator
+     takes it (`to_s.to_json`); anything else is CRuby's TypeError, where
+     an interpolation (sp_poly_to_s) falls back to the default text */
+  if (v.tag == SP_TAG_OBJ && v.cls_id >= 0 && v.v.p && sp_obj_to_s_fn) {
+    SP_GC_ROOT_RBVAL(v);
+    int found = 0;
+    sp_RbVal r = sp_obj_to_s_fn(v.cls_id, v.v.p, &found);
+    if (found) {
+      const char *us = r.tag == SP_TAG_STR ? r.v.s
+                     : r.tag == SP_TAG_OBJ && r.cls_id == SP_BUILTIN_STRBUF && r.v.p ? sp_String_cstr((sp_String *)r.v.p)
+                     : NULL;
+      if (!us) {
+        const char *tn = r.tag == SP_TAG_NIL ? "nil" : r.tag == SP_TAG_BOOL ? (r.v.b ? "true" : "false")
+                       : r.tag == SP_TAG_INT || r.tag == SP_TAG_BIGINT ? "Integer" : r.tag == SP_TAG_FLT ? "Float"
+                       : r.tag == SP_TAG_SYM ? "Symbol"
+                       : r.tag == SP_TAG_OBJ && r.cls_id >= 0 && sp_obj_cls_name_fn ? sp_obj_cls_name_fn(r.cls_id) : "Object";
+        sp_raise_cls("TypeError", sp_sprintf("wrong argument type %s (expected String)", tn));
+      }
+      SP_GC_ROOT_STR(us);
+      jb_rstr(b, us);
+      return;
+    }
+  }
+  const char *t = sp_poly_to_s(v);
   SP_GC_ROOT_STR(t);
   jb_rstr(b, t);
 }

@@ -379,9 +379,15 @@ static const BuiltinOp bop_rows[] = {
     BOP_K(TY_STR_INT_HASH) | BOP_K(TY_STR_STR_HASH) | BOP_K(TY_INT_INT_HASH) | BOP_K(TY_INT_STR_HASH) |
     BOP_K(TY_SYM_POLY_HASH) | BOP_K(TY_STR_POLY_HASH) | BOP_K(TY_POLY_POLY_HASH), 0, BOPF_INTERNAL },
   { BOP_KERNEL, "__blk_conv",  1, 1, BF_NONE, TY_POLY, BOPE_CONV_USER_OK, "sp_poly_blk_conv", 0, 0, BOPF_INTERNAL },
+  { BOP_KERNEL, "String", 1, 1, BF_ANY, TY_STRBUF, BOPE_KERNEL_STRING },
   /* Kernel#respond_to_missing?: false, its two operands, where they have an effect, run first (private: a program's own definition, and the explicit forms that reach it, are the plan's) */
   { BOP_KERNEL, "respond_to_missing?", 2, 2, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "($j0$j1(sp_bool)0)" },
 #include "builtin_zero_ops.inc"
+  /* Stage 1 is the boxed display fallback after ordinary dispatch. Only
+     id2name guarantees a String handle where it returns. */
+  { BOP_BOXED_FALLBACK, "to_s", 0, 0, BF_ANY, TY_POLY, BOPE_TEMPLATE, "sp_poly_to_s_box($r)", 0, 0, 0, 1 },
+  { BOP_BOXED_FALLBACK, "inspect", 0, 0, BF_ANY, TY_POLY, BOPE_TEMPLATE, "sp_poly_inspect_box($r)", 0, 0, 0, 1 },
+  { BOP_BOXED_FALLBACK, "id2name", 0, 0, BF_ANY, TY_STRBUF, BOPE_TEMPLATE, "sp_poly_sym_id2name($r)", 0, 0, 0, 1 },
   /* Boxed reads that answer a new Array. A zero-argument rotate uses one;
      shuffle has no count. Reached after the earlier routes: a call inference
      types by a rule of its own (a builtin's super from its reopening, the
@@ -411,8 +417,8 @@ static const BuiltinOp bop_rows[] = {
      (an_poly_concrete). */
   { TY_POLY, "dump", 0, 0, BF_ANY, TY_STRING, BOPE_TEMPLATE,
     "sp_str_dump(sp_poly_recv_s($r, \"dump\"))", 0, 0, 0, 1 },
-  { TY_POLY, "b", 0, 0, BF_ANY, TY_STRING, BOPE_TEMPLATE,
-    "sp_str_b(sp_poly_recv_s($r, \"b\"))", 0, 0, 0, 1 },   /* a binary copy (#4441) */
+  { TY_POLY, "b", 0, 0, BF_ANY, TY_STRBUF, BOPE_TEMPLATE,
+    "sp_String_binary_copy(sp_poly_recv_s($r, \"b\"))", 0, 0, 0, 1 },   /* a binary copy (#4441) */
   { TY_POLY, "scrub", 0, 0, BF_ANY, TY_STRING, BOPE_TEMPLATE,   /* a block is not called yet, as before */
     "sp_str_scrub(sp_poly_recv_s($r, \"scrub\"), 0)", 0, 0, 0, 1 },
   { TY_POLY, "encode", 0, 0, BF_ANY, TY_STRING, BOPE_TEMPLATE,
@@ -1474,7 +1480,7 @@ static const BuiltinOp bop_rows[] = {
   { TY_ENUMERATOR, "each",            0,   0, BF_NONE,     TY_ENUMERATOR,  BOPE_TEMPLATE, "$r", 0 },  /* a blockless #each is the Enumerator itself */
   { TY_ENUMERATOR, "each_with_index", 0,   0, BF_NONE,     TY_ENUMERATOR,  BOPE_NONE },  /* #2487 */
   { TY_ENUMERATOR, "each_index",      0,   0, BF_NONE,     TY_ENUMERATOR,  BOPE_NONE },  /* #2487 */
-  { TY_ENUMERATOR, "size",            0,   0, BF_ANY,      TY_POLY,        BOPE_TEMPLATE, "sp_Enumerator_size($r)", 0 },
+  { TY_ENUMERATOR, "size",            0,   0, BF_ANY,      TY_POLY,        BOPE_TEMPLATE, "sp_Enumerator_size(sp_nil_recv_named($r, \"size\"))", 0 },
   { TY_ENUMERATOR, "size",            0, 127, BF_ANY,      TY_POLY,        BOPE_NONE },  /* nil, an Integer or a stored size */
   { TY_ENUMERATOR, "take",            1,   1, BF_ANY,      TY_POLY_ARRAY,  BOPE_TEMPLATE, "sp_Enumerator_take($r, $i0)" },
   { TY_ENUMERATOR, "first",           1,   1, BF_ANY,      TY_POLY_ARRAY,  BOPE_TEMPLATE, "sp_Enumerator_take($r, $i0)" },
@@ -1939,10 +1945,10 @@ static const BuiltinOp bop_rows[] = {
   { TY_REGEX, "timeout",         0, 127, BF_ANY,      TY_POLY,          BOPE_NONE },  /* nil: no per-instance timeout */
   { TY_REGEX, "hash",            0,   0, BF_ANY,      TY_INT,        BOPE_TEMPLATE, "(sp_int)sp_re_hash((void *)($r))", 0 },
 
-  /* Symbol: result kinds; emission stays in emit_call_body. <=> and
-     casecmp/casecmp? are typed by the operand (nil for a non-Symbol). */
-  { TY_SYMBOL, "to_s",            0, 127, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "sp_sym_to_s_new($r)", 0 },
-  { TY_SYMBOL, "id2name",         0, 127, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "sp_sym_to_s_new($r)", 0 },
+  /* Symbol: <=> and casecmp/casecmp? are typed by the operand (nil for a
+     non-Symbol). */
+  { TY_SYMBOL, "to_s",            0,   0, BF_ANY,      TY_STRBUF,     BOPE_TEMPLATE, "sp_sym_to_s_new($r)", 0 },
+  { TY_SYMBOL, "id2name",         0,   0, BF_ANY,      TY_STRBUF,     BOPE_TEMPLATE, "sp_sym_to_s_new($r)", 0 },
   { TY_SYMBOL, "name",            0, 127, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "sp_sym_name_str($r)", 0 },
   { TY_SYMBOL, "inspect",         0, 127, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "sp_sym_inspect($r)", 0 },
   { TY_SYMBOL, "upcase",          0, 127, BF_ANY,      TY_SYMBOL,     BOPE_TEMPLATE, "sp_sym_intern(sp_str_upcase$C(sp_sym_to_s($r)))", 0 },
@@ -2284,6 +2290,7 @@ static const BuiltinOp bop_rows[] = {
   { TY_STRING, "delete",          2, 127, BF_ANY,      TY_STRING,     BOPE_STR_SET_N, NULL, 0 },
   { TY_STRING, "delete",          1,   1, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "sp_str_delete($r, $s0)", 0 },
   { TY_STRING, "delete",          0, 127, BF_ANY,      TY_STRING,     BOPE_NONE },
+  { TY_STRING, "scan", 1, 1, BF_REQUIRED, TY_STRING, BOPE_NONE, NULL, 0, 0, BOPF_SELF },
   /* Pattern analysis determines the result's element shape. */
   { TY_STRING, "scan", 1, 1, BF_NONE, TY_UNKNOWN, BOPE_STRING_SCAN_CHECKED, NULL, 0, 0, BOPF_INFERRED },  /* typed from the pattern's source (infer_string_recv_call) */
   { TY_STRING, "slice!", 1, 2, BF_ANY, TY_STRING, BOPE_STRING_SLICE, 0, 0, 0, 0, 7 },
@@ -2301,7 +2308,7 @@ static const BuiltinOp bop_rows[] = {
   { TY_STRING, "append_as_bytes", 0,   0, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "({ const char *_t$t = $r; sp_str_check_mutable(_t$t); _t$t; })", 0, 0, BOPF_SELF, 6 },
   { TY_STRING, "append_as_bytes", 0, 127, BF_ANY,      TY_STRING,     BOPE_NONE, NULL, 0, 0, BOPF_SELF },
   { TY_STRING, "force_encoding",  0, 127, BF_ANY,      TY_STRING,     BOPE_NONE, NULL, 0, 0, BOPF_SELF },
-  { TY_STRING, "b",               0,   0, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "sp_str_b($r)", 0 },
+  { TY_STRING, "b",               0,   0, BF_ANY,      TY_STRBUF,     BOPE_TEMPLATE, "sp_String_binary_copy($r)", 0 },
   { TY_STRING, "b",               0, 127, BF_ANY,      TY_STRING,     BOPE_NONE },
   { TY_STRING, "encode",          0,   0, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "((const char *)sp_nil_recv_named($r, \"encode\"))", 0, 0, BOPF_KEYWORDS },  /* the receiver, so nil raises */
   { TY_STRING, "encode",          0, 127, BF_ANY,      TY_STRING,     BOPE_NONE, NULL, 0, 0, BOPF_KEYWORDS },
@@ -2437,16 +2444,8 @@ static const BuiltinOp bop_rows[] = {
   { TY_STRING, "casecmp?",        1,   1, BF_ANY,      TY_POLY,       BOPE_TEMPLATE, "({ const char *_t$t = $r; SP_GC_ROOT_STR(_t$t); sp_RbVal _t$u = $e0; const char *_t$v = sp_poly_check_str(_t$u); (_t$v || _t$u.tag == SP_TAG_STR) ? sp_box_bool(sp_str_casecmp_p(_t$t, _t$v ? _t$v : \"\")) : sp_box_nil(); })", BOP_K(TY_POLY) },
   { TY_STRING, "casecmp",         1,   1, BF_ANY,      TY_INT,        BOPE_TEMPLATE, "sp_str_casecmp($r, $e0)", BOP_K(TY_STRING) | BOP_K(TY_UNKNOWN) },
   { TY_STRING, "casecmp?",        1,   1, BF_ANY,      TY_BOOL,       BOPE_TEMPLATE, "sp_str_casecmp_p($r, $e0)", BOP_K(TY_STRING) | BOP_K(TY_UNKNOWN) },
-  /* sp_str_lines reads nil as "" (each_line's arms take it too); a nil
-     receiver raises as lines(sep)'s sp_str_lines_sep does */
-  { TY_STRING, "lines",           0,   0, BF_NONE,     TY_STR_ARRAY,  BOPE_TEMPLATE, "sp_str_lines(sp_nil_recv_named($r, \"lines\"))", 0, 0, BOPF_KEYWORDS },
-  { TY_STRING, "lines",           0,   0, BF_REQUIRED, TY_STRING,     BOPE_TEMPLATE, "sp_str_lines(sp_nil_recv_named($r, \"lines\"))", 0, 0, BOPF_SELF | BOPF_KEYWORDS },  /* the block form iterates and answers the receiver */
-  /* lines(sep): without a block the Array, with one the receiver (the block
-     form iterates), whatever the separator's kind */
-  { TY_STRING, "lines",           1,   1, BF_NONE,     TY_STR_ARRAY,  BOPE_TEMPLATE, "sp_str_lines_sep($r, $e0)", BOP_K(TY_STRING), 0, BOPF_KEYWORDS },
-  { TY_STRING, "lines",           1,   1, BF_REQUIRED, TY_STRING,     BOPE_TEMPLATE, "sp_str_lines_sep($r, $e0)", BOP_K(TY_STRING), 0, BOPF_SELF | BOPF_KEYWORDS },
-  { TY_STRING, "lines",           1,   1, BF_NONE,     TY_STR_ARRAY,  BOPE_TEMPLATE, "sp_str_lines_sep($r, sp_poly_arg_str_or_null($b0))", BOP_K(TY_POLY) | BOP_K(TY_NIL), 0, BOPF_KEYWORDS },
-  { TY_STRING, "lines",           1,   1, BF_REQUIRED, TY_STRING,     BOPE_TEMPLATE, "sp_str_lines_sep($r, sp_poly_arg_str_or_null($b0))", BOP_K(TY_POLY) | BOP_K(TY_NIL), 0, BOPF_SELF | BOPF_KEYWORDS },
+  { TY_STRING, "lines",           0,   2, BF_NONE,     TY_STR_ARRAY,  BOPE_STRING_LINES, NULL, 0, 0, BOPF_KEYWORDS },
+  { TY_STRING, "lines",           0,   2, BF_REQUIRED, TY_STRING,     BOPE_NONE, NULL, 0, 0, BOPF_SELF | BOPF_KEYWORDS },
   { TY_STRING, "gsub",            2,   2, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "sp_str_gsub_str_str_hash($r, $e0, $e1)", 0, BOP_K(TY_STR_STR_HASH) },
   { TY_STRING, "gsub",            2,   2, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "sp_str_gsub_str_str_hash($r, $e0, sp_StrPolyHash_to_s_values($e1))", 0, BOP_K(TY_STR_POLY_HASH) },
   { TY_STRING, "gsub",            2,   2, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "sp_str_gsub_str_str_hash($r, $e0, sp_StrIntHash_to_s_values($e1))", 0, BOP_K(TY_STR_INT_HASH) },
@@ -2484,7 +2483,7 @@ static const BuiltinOp bop_rows[] = {
   { TY_STRING, "unicode_normalize",   0,   1, BF_ANY,      TY_UNKNOWN,    BOPE_NONE },
   { TY_STRING, "unicode_normalize!",  0,   1, BF_ANY,      TY_UNKNOWN,    BOPE_NONE, NULL, 0, 0, BOPF_SELF },
   { TY_STRING, "unicode_normalized?", 0,   1, BF_ANY,      TY_UNKNOWN,    BOPE_NONE },
-  { TY_STRING, "each_line",           0,   1, BF_REQUIRED, TY_UNKNOWN,    BOPE_NONE, NULL, 0, 0, BOPF_SELF | BOPF_KEYWORDS },  /* the walks answer the receiver */
+  { TY_STRING, "each_line",           0,   2, BF_REQUIRED, TY_UNKNOWN,    BOPE_NONE, NULL, 0, 0, BOPF_SELF | BOPF_KEYWORDS },  /* the walks answer the receiver */
   { TY_STRING, "each_grapheme_cluster", 0,   0, BF_REQUIRED, TY_UNKNOWN,    BOPE_NONE, NULL, 0, 0, BOPF_SELF },
   { TY_STRING, "each_codepoint",      0,   0, BF_REQUIRED, TY_UNKNOWN,    BOPE_NONE, NULL, 0, 0, BOPF_SELF },
   { TY_STRING, "grapheme_clusters",   0,   0, BF_REQUIRED, TY_UNKNOWN,    BOPE_NONE, NULL, 0, 0, BOPF_SELF },
@@ -3432,7 +3431,7 @@ int bop_args_as_builtin(TyKind rt, const char *name, int argc, int has_block) {
   return (bop_call_flags(rt, name, argc, has_block) & BOPF_ARGS_BUILTIN) != 0;
 }
 
-TyKind bop_result(const BuiltinOp *op, TyKind rt) {
+TyKind bop_native_result(const BuiltinOp *op, TyKind rt) {
   switch ((int)op->result) {
   case (int)BOPR_SELF:      return rt;
   case (int)BOPR_HASH_VAL:  return ty_hash_val(rt);
@@ -3466,16 +3465,16 @@ TyKind bop_result(const BuiltinOp *op, TyKind rt) {
   }
 }
 
-TyKind bop_result_args(const BuiltinOp *op, TyKind rt, int argc, BopArgKind arg_of, const void *ud, int facts) {
+TyKind bop_native_result_args(const BuiltinOp *op, TyKind rt, int argc, BopArgKind arg_of, const void *ud, int facts) {
   switch ((int)op->result) {
   case (int)BOPR_ARRAY_SUM_SEED:
     return argc == 1 ? fold_sum_type(arg_of(ud, 0), ty_array_elem(rt), facts & BOPX_PROMOTE) : TY_UNKNOWN;
   case (int)BOPR_ARRAY_TUPLES:
-    return rt == TY_POLY_ARRAY && !(facts & BOPX_KEPT) ? TY_ENUMERATOR : bop_result(op, rt);
+    return rt == TY_POLY_ARRAY && !(facts & BOPX_KEPT) ? TY_ENUMERATOR : bop_native_result(op, rt);
   case (int)BOPR_ARRAY_INDEX:
     return (facts & BOPX_BOXED_USE) && (rt == TY_INT_ARRAY || rt == TY_STR_ARRAY || rt == TY_FLOAT_ARRAY ||
                                         rt == TY_STR_RANGE)
-           ? TY_POLY : bop_result(op, rt);
+           ? TY_POLY : bop_native_result(op, rt);
   case (int)BOPR_ARRAY_PLUS:
   case (int)BOPR_ARRAY_SETOP:
     break;
@@ -3496,7 +3495,7 @@ TyKind bop_result_args(const BuiltinOp *op, TyKind rt, int argc, BopArgKind arg_
   case (int)BOPR_HASH_STORE:
     return argc >= 2 ? ty_unify(arg_of(ud, 1), ty_hash_val(rt)) : TY_UNKNOWN;
   default:
-    return bop_result(op, rt);
+    return bop_native_result(op, rt);
   }
   if (argc < 1) return TY_UNKNOWN;
   /* An Array of the receiver's kind, or an untyped operand (an empty
@@ -3519,6 +3518,14 @@ TyKind bop_result_args(const BuiltinOp *op, TyKind rt, int argc, BopArgKind arg_
     if (!ty_is_array(aj) && aj != TY_POLY) boxable = 0;
   }
   return same ? rt : boxable ? TY_POLY_ARRAY : TY_UNKNOWN;
+}
+
+TyKind bop_result(const BuiltinOp *op, TyKind rt) {
+  return op->result == TY_STRBUF ? TY_STRING : bop_native_result(op, rt);
+}
+
+TyKind bop_result_args(const BuiltinOp *op, TyKind rt, int argc, BopArgKind arg_of, const void *ud, int facts) {
+  return op->result == TY_STRBUF ? TY_STRING : bop_native_result_args(op, rt, argc, arg_of, ud, facts);
 }
 
 int bop_covers(TyKind rt) {
@@ -4115,41 +4122,41 @@ static const IterRow iter_rows[] = {
   { TY_STRING, "upto",       1, 2, 1, { YS_FRESH }, IA_RECV, IRF_GAP_SHAPE },
   { TY_STRING, "split",      0, 2, 1, { YS_FRESH }, IA_RECV, IRF_GAP_SHAPE },
 
-  { BOP_ANY_ARRAY, "each",            0, 0, 1, { YS_ELEM }, IA_RECV, 0 },
-  { BOP_ANY_ARRAY, "each_entry",      0, 0, 1, { YS_ELEM }, IA_RECV, 0 },
-  { BOP_ANY_ARRAY, "reverse_each",    0, 0, 1, { YS_ELEM }, IA_RECV, 0 },
-  { BOP_ANY_ARRAY, "each_with_index", 0, 0, 2, { YS_ELEM, YS_INDEX }, IA_RECV, 0 },
-  { BOP_ANY_ARRAY, "map",             0, 0, 1, { YS_ELEM }, IA_BLOCKVALS, 0 },
-  { BOP_ANY_ARRAY, "collect",         0, 0, 1, { YS_ELEM }, IA_BLOCKVALS, 0 },
-  { BOP_ANY_ARRAY, "flat_map",        0, 0, 1, { YS_ELEM }, IA_BLOCKVALS, 0 },
-  { BOP_ANY_ARRAY, "collect_concat",  0, 0, 1, { YS_ELEM }, IA_BLOCKVALS, IRF_GAP_SHARE },
-  { BOP_ANY_ARRAY, "filter_map",      0, 0, 1, { YS_ELEM }, IA_BLOCKVALS, 0 },
-  { BOP_ANY_ARRAY, "map!",            0, 0, 1, { YS_ELEM }, IA_BLOCKVALS_INPLACE, IRF_SHAPE_BOXED },
-  { BOP_ANY_ARRAY, "collect!",        0, 0, 1, { YS_ELEM }, IA_BLOCKVALS_INPLACE, IRF_SHAPE_BOXED },
-  { BOP_ANY_ARRAY, "select",          0, 0, 1, { YS_ELEM }, IA_SOME, 0 },
-  { BOP_ANY_ARRAY, "filter",          0, 0, 1, { YS_ELEM }, IA_SOME, 0 },
-  { BOP_ANY_ARRAY, "reject",          0, 0, 1, { YS_ELEM }, IA_SOME, 0 },
+  { BOP_ANY_ARRAY, "each",            0, 0, 1, { YS_ELEM }, IA_RECV, 0, IR_EACH },
+  { BOP_ANY_ARRAY, "each_entry",      0, 0, 1, { YS_ELEM }, IA_RECV, 0, IR_EACH },
+  { BOP_ANY_ARRAY, "reverse_each",    0, 0, 1, { YS_ELEM }, IA_RECV, 0, IR_EACH },
+  { BOP_ANY_ARRAY, "each_with_index", 0, 0, 2, { YS_ELEM, YS_INDEX }, IA_RECV, 0, IR_EACH },
+  { BOP_ANY_ARRAY, "map",             0, 0, 1, { YS_ELEM }, IA_BLOCKVALS, 0, IR_EACH },
+  { BOP_ANY_ARRAY, "collect",         0, 0, 1, { YS_ELEM }, IA_BLOCKVALS, 0, IR_EACH },
+  { BOP_ANY_ARRAY, "flat_map",        0, 0, 1, { YS_ELEM }, IA_BLOCKVALS, 0, IR_EACH },
+  { BOP_ANY_ARRAY, "collect_concat",  0, 0, 1, { YS_ELEM }, IA_BLOCKVALS, IRF_GAP_SHARE, IR_EACH },
+  { BOP_ANY_ARRAY, "filter_map",      0, 0, 1, { YS_ELEM }, IA_BLOCKVALS, 0, IR_EACH },
+  { BOP_ANY_ARRAY, "map!",            0, 0, 1, { YS_ELEM }, IA_BLOCKVALS_INPLACE, IRF_SHAPE_BOXED, IR_EACH },
+  { BOP_ANY_ARRAY, "collect!",        0, 0, 1, { YS_ELEM }, IA_BLOCKVALS_INPLACE, IRF_SHAPE_BOXED, IR_EACH },
+  { BOP_ANY_ARRAY, "select",          0, 0, 1, { YS_ELEM }, IA_SOME, 0, IR_EACH },
+  { BOP_ANY_ARRAY, "filter",          0, 0, 1, { YS_ELEM }, IA_SOME, 0, IR_EACH },
+  { BOP_ANY_ARRAY, "reject",          0, 0, 1, { YS_ELEM }, IA_SOME, 0, IR_EACH },
   { BOP_ANY_ARRAY, "find_all",        0, 0, 1, { YS_ELEM }, IA_SOME, IRF_GAP_SHARE | IRF_GAP_SHAPE },
-  { BOP_ANY_ARRAY, "select!",         0, 0, 1, { YS_ELEM }, IA_RECV, 0 },
-  { BOP_ANY_ARRAY, "filter!",         0, 0, 1, { YS_ELEM }, IA_RECV, 0 },
-  { BOP_ANY_ARRAY, "reject!",         0, 0, 1, { YS_ELEM }, IA_RECV, 0 },
-  { BOP_ANY_ARRAY, "keep_if",         0, 0, 1, { YS_ELEM }, IA_RECV, 0 },
-  { BOP_ANY_ARRAY, "delete_if",       0, 0, 1, { YS_ELEM }, IA_RECV, 0 },
+  { BOP_ANY_ARRAY, "select!",         0, 0, 1, { YS_ELEM }, IA_RECV, 0, IR_EACH },
+  { BOP_ANY_ARRAY, "filter!",         0, 0, 1, { YS_ELEM }, IA_RECV, 0, IR_EACH },
+  { BOP_ANY_ARRAY, "reject!",         0, 0, 1, { YS_ELEM }, IA_RECV, 0, IR_EACH },
+  { BOP_ANY_ARRAY, "keep_if",         0, 0, 1, { YS_ELEM }, IA_RECV, 0, IR_EACH },
+  { BOP_ANY_ARRAY, "delete_if",       0, 0, 1, { YS_ELEM }, IA_RECV, 0, IR_EACH },
   { BOP_ANY_ARRAY, "find",            0, 0, 1, { YS_ELEM }, IA_ONE, 0 },
   { BOP_ANY_ARRAY, "find",            1, 1, 1, { YS_ELEM }, IA_ONE, IRF_GAP_SHAPE },
   { BOP_ANY_ARRAY, "detect",          0, 0, 1, { YS_ELEM }, IA_ONE, 0 },
   { BOP_ANY_ARRAY, "detect",          1, 1, 1, { YS_ELEM }, IA_ONE, IRF_GAP_SHAPE },
   { BOP_ANY_ARRAY, "find_index",      0, 0, 1, { YS_ELEM }, IA_OTHER, 0 },
-  { BOP_ANY_ARRAY, "min_by",          0, 0, 1, { YS_ELEM }, IA_ONE, 0 },
+  { BOP_ANY_ARRAY, "min_by",          0, 0, 1, { YS_ELEM }, IA_ONE, 0, IR_EACH },
   { BOP_ANY_ARRAY, "min_by",          1, 1, 1, { YS_ELEM }, IA_SOME, IRF_GAP_SHAPE },
-  { BOP_ANY_ARRAY, "max_by",          0, 0, 1, { YS_ELEM }, IA_ONE, 0 },
+  { BOP_ANY_ARRAY, "max_by",          0, 0, 1, { YS_ELEM }, IA_ONE, 0, IR_EACH },
   { BOP_ANY_ARRAY, "max_by",          1, 1, 1, { YS_ELEM }, IA_SOME, IRF_GAP_SHAPE },
-  { BOP_ANY_ARRAY, "sort_by",         0, 0, 1, { YS_ELEM }, IA_SOME, 0 },
+  { BOP_ANY_ARRAY, "sort_by",         0, 0, 1, { YS_ELEM }, IA_SOME, 0, IR_EACH },
   { BOP_ANY_ARRAY, "sort_by!",        0, 0, 1, { YS_ELEM }, IA_RECV, 0 },
-  { BOP_ANY_ARRAY, "group_by",        0, 0, 1, { YS_ELEM }, IA_GROUPS, 0 },
-  { BOP_ANY_ARRAY, "partition",       0, 0, 1, { YS_ELEM }, IA_PARTS, 0 },
-  { BOP_ANY_ARRAY, "sum",             0, 1, 1, { YS_ELEM }, IA_OTHER, 0 },
-  { BOP_ANY_ARRAY, "count",           0, 0, 1, { YS_ELEM }, IA_OTHER, 0 },
+  { BOP_ANY_ARRAY, "group_by",        0, 0, 1, { YS_ELEM }, IA_GROUPS, 0, IR_EACH },
+  { BOP_ANY_ARRAY, "partition",       0, 0, 1, { YS_ELEM }, IA_PARTS, 0, IR_EACH },
+  { BOP_ANY_ARRAY, "sum",             0, 1, 1, { YS_ELEM }, IA_OTHER, 0, IR_EACH },
+  { BOP_ANY_ARRAY, "count",           0, 0, 1, { YS_ELEM }, IA_OTHER, 0, IR_EACH },
   { BOP_ANY_ARRAY, "any?",            0, 0, 1, { YS_ELEM }, IA_OTHER, 0 },
   { BOP_ANY_ARRAY, "all?",            0, 0, 1, { YS_ELEM }, IA_OTHER, 0 },
   { BOP_ANY_ARRAY, "none?",           0, 0, 1, { YS_ELEM }, IA_OTHER, 0 },
@@ -4158,7 +4165,7 @@ static const IterRow iter_rows[] = {
   { BOP_ANY_ARRAY, "drop_while",      0, 0, 1, { YS_ELEM }, IA_SOME, 0 },
   { BOP_ANY_ARRAY, "uniq",            0, 0, 1, { YS_ELEM }, IA_SOME, IRF_GAP_FWD },
   { BOP_ANY_ARRAY, "uniq!",           0, 0, 1, { YS_ELEM }, IA_RECV, IRF_GAP_SHAPE | IRF_GAP_FWD },
-  { BOP_ANY_ARRAY, "to_h",            0, 0, 1, { YS_ELEM }, IA_BLOCKVALS, IRF_GAP_SHARE | IRF_GAP_SHAPE },
+  { BOP_ANY_ARRAY, "to_h",            0, 0, 1, { YS_ELEM }, IA_BLOCKVALS, IRF_GAP_SHARE | IRF_GAP_SHAPE, IR_EACH },
   { BOP_ANY_ARRAY, "each_slice",      1, 1, 1, { YS_SUB }, IA_RECV, IRF_GAP_RUN_BOXED | IRF_SHAPE_BOXED },
   { BOP_ANY_ARRAY, "each_cons",       1, 1, 1, { YS_SUB }, IA_RECV, IRF_GAP_RUN_BOXED | IRF_SHAPE_BOXED },
   { BOP_ANY_ARRAY, "combination",     1, 1, 1, { YS_SUB }, IA_RECV, IRF_GAP_FWD | IRF_SHAPE_BOXED },
@@ -4174,10 +4181,10 @@ static const IterRow iter_rows[] = {
   { BOP_ANY_ARRAY, "inject",          0, 0, 2, { YS_MEMO, YS_ELEM }, IA_MEMO, IRF_GAP_SHAPE | IRF_GAP_FWD },
   { BOP_ANY_ARRAY, "reduce",          1, 1, 2, { YS_MEMO, YS_ELEM }, IA_MEMO, IRF_GAP_FWD },
   { BOP_ANY_ARRAY, "reduce",          0, 0, 2, { YS_MEMO, YS_ELEM }, IA_MEMO, IRF_GAP_SHAPE | IRF_GAP_FWD },
-  { BOP_ANY_ARRAY, "each_with_object", 1, 1, 2, { YS_ELEM, YS_MEMO }, IA_MEMO, IRF_GAP_FWD },
-  { BOP_ANY_ARRAY, "each_index",      0, 0, 1, { YS_INDEX }, IA_RECV, IRF_SHAPE_BOXED },
+  { BOP_ANY_ARRAY, "each_with_object", 1, 1, 2, { YS_ELEM, YS_MEMO }, IA_MEMO, IRF_GAP_FWD, IR_EACH },
+  { BOP_ANY_ARRAY, "each_index",      0, 0, 1, { YS_INDEX }, IA_RECV, IRF_SHAPE_BOXED, IR_EACH },
   { BOP_ANY_ARRAY, "fill",            0, 2, 1, { YS_INDEX }, IA_BLOCKVALS_INPLACE, IRF_SHAPE_BOXED },
-  { BOP_ANY_ARRAY, "cycle",           0, 1, 1, { YS_ELEM }, IA_OTHER, IRF_GAP_SHAPE | IRF_GAP_FWD },
+  { BOP_ANY_ARRAY, "cycle",           0, 1, 1, { YS_ELEM }, IA_OTHER, IRF_GAP_SHAPE | IRF_GAP_FWD, IR_MANY },
   { BOP_ANY_ARRAY, "min",             0, 0, 2, { YS_ELEM, YS_ELEM }, IA_ONE, IRF_GAP_SHAPE | IRF_GAP_FWD },
   { BOP_ANY_ARRAY, "min",             1, 1, 2, { YS_ELEM, YS_ELEM }, IA_SOME, IRF_GAP_SHAPE | IRF_GAP_FWD },
   { BOP_ANY_ARRAY, "max",             0, 0, 2, { YS_ELEM, YS_ELEM }, IA_ONE, IRF_GAP_SHAPE | IRF_GAP_FWD },
@@ -4192,16 +4199,16 @@ static const IterRow iter_rows[] = {
   { BOP_ANY_ARRAY, "slice_before",    0, 0, 1, { YS_ELEM }, IA_PARTS, IRF_GAP_SHAPE | IRF_GAP_FWD },
   { BOP_ANY_ARRAY, "slice_after",     0, 0, 1, { YS_ELEM }, IA_PARTS, IRF_GAP_SHAPE | IRF_GAP_FWD },
 
-  { BOP_ANY_HASH, "each",             0, 0, 1, { YS_PAIR }, IA_RECV, 0 },
-  { BOP_ANY_HASH, "each_pair",        0, 0, 1, { YS_PAIR }, IA_RECV, 0 },
+  { BOP_ANY_HASH, "each",             0, 0, 1, { YS_PAIR }, IA_RECV, 0, IR_EACH },
+  { BOP_ANY_HASH, "each_pair",        0, 0, 1, { YS_PAIR }, IA_RECV, 0, IR_EACH },
   { BOP_ANY_HASH, "each_key",         0, 0, 1, { YS_PAIR_KEY }, IA_RECV, IRF_SHAPE_BOXED },
   { BOP_ANY_HASH, "each_value",       0, 0, 1, { YS_PAIR_VAL }, IA_RECV, IRF_SHAPE_BOXED },
-  { BOP_ANY_HASH, "each_with_index",  0, 0, 2, { YS_PAIR, YS_INDEX }, IA_RECV, IRF_GAP_FWD },
-  { BOP_ANY_HASH, "each_entry",       0, 0, 1, { YS_PAIR }, IA_RECV, IRF_GAP_SHARE },
-  { BOP_ANY_HASH, "reverse_each",     0, 0, 1, { YS_PAIR }, IA_RECV, IRF_GAP_SHARE | IRF_GAP_SHAPE },
-  { BOP_ANY_HASH, "map",              0, 0, 1, { YS_PAIR }, IA_BLOCKVALS, 0 },
-  { BOP_ANY_HASH, "collect",          0, 0, 1, { YS_PAIR }, IA_BLOCKVALS, 0 },
-  { BOP_ANY_HASH, "flat_map",         0, 0, 1, { YS_PAIR }, IA_BLOCKVALS, 0 },
+  { BOP_ANY_HASH, "each_with_index",  0, 0, 2, { YS_PAIR, YS_INDEX }, IA_RECV, IRF_GAP_FWD, IR_EACH },
+  { BOP_ANY_HASH, "each_entry",       0, 0, 1, { YS_PAIR }, IA_RECV, IRF_GAP_SHARE, IR_EACH },
+  { BOP_ANY_HASH, "reverse_each",     0, 0, 1, { YS_PAIR }, IA_RECV, IRF_GAP_SHARE | IRF_GAP_SHAPE, IR_EACH },
+  { BOP_ANY_HASH, "map",              0, 0, 1, { YS_PAIR }, IA_BLOCKVALS, 0, IR_EACH },
+  { BOP_ANY_HASH, "collect",          0, 0, 1, { YS_PAIR }, IA_BLOCKVALS, 0, IR_EACH },
+  { BOP_ANY_HASH, "flat_map",         0, 0, 1, { YS_PAIR }, IA_BLOCKVALS, 0, IR_EACH },
   { BOP_ANY_HASH, "collect_concat",   0, 0, 1, { YS_PAIR }, IA_BLOCKVALS, IRF_GAP_SHARE },
   { BOP_ANY_HASH, "filter_map",       0, 0, 1, { YS_PAIR }, IA_BLOCKVALS, 0 },
   { BOP_ANY_HASH, "select",           0, 0, 2, { YS_PAIR_KEY, YS_PAIR_VAL }, IA_SOME, 0 },
@@ -4291,21 +4298,21 @@ static const IterRow iter_rows[] = {
   { TY_TIME_RANGE, "step",        1, 1, 1, { YS_NUM }, IA_RECV, 0 },
   { TY_OBJ_RANGE, "each",         0, 0, 1, { YS_ELEM }, IA_RECV, 0 },
 
-  { TY_INT, "times",   0, 0, 1, { YS_NUM }, IA_RECV, 0 },
+  { TY_INT, "times",   0, 0, 1, { YS_NUM }, IA_RECV, 0, IR_COUNT_RECV },
   { TY_INT, "upto",    1, 1, 1, { YS_NUM }, IA_RECV, 0 },
   { TY_INT, "downto",  1, 1, 1, { YS_NUM }, IA_RECV, 0 },
   { TY_INT, "step",    1, 2, 1, { YS_NUM }, IA_RECV, IRF_GAP_FWD },
   { TY_FLOAT, "step",  1, 2, 1, { YS_NUM }, IA_RECV, 0 },
 
-  { BOP_KERNEL, "loop",  0, 0, 0, { YS_NONE }, IA_OTHER, 0 },
+  { BOP_KERNEL, "loop",  0, 0, 0, { YS_NONE }, IA_OTHER, 0, IR_MANY },
   /* a catch's block is handed its tag: the one given, or a fresh Object */
-  { BOP_KERNEL, "catch", 0, 1, 1, { YS_ARG0 }, IA_BLOCKVAL, 0 },
+  { BOP_KERNEL, "catch", 0, 1, 1, { YS_ARG0 }, IA_BLOCKVAL, 0, IR_ONCE },
 
-  { BOP_ANY_RECV, "tap",        0, 0, 1, { YS_RECV }, IA_RECV, 0 },
-  { BOP_ANY_RECV, "then",       0, 0, 1, { YS_RECV }, IA_BLOCKVAL, 0 },
-  { BOP_ANY_RECV, "yield_self", 0, 0, 1, { YS_RECV }, IA_BLOCKVAL, 0 },
+  { BOP_ANY_RECV, "tap",        0, 0, 1, { YS_RECV }, IA_RECV, 0, IR_ONCE },
+  { BOP_ANY_RECV, "then",       0, 0, 1, { YS_RECV }, IA_BLOCKVAL, 0, IR_ONCE },
+  { BOP_ANY_RECV, "yield_self", 0, 0, 1, { YS_RECV }, IA_BLOCKVAL, 0, IR_ONCE },
   /* Enumerable's, read by the shape desugar on any receiver */
-  { BOP_ANY_RECV, "each_with_index",  0, 0, 2, { YS_ELEM, YS_INDEX }, IA_RECV, IRF_GAP_SHARE },
+  { BOP_ANY_RECV, "each_with_index",  0, 0, 2, { YS_ELEM, YS_INDEX }, IA_RECV, IRF_GAP_SHARE, IR_EACH },
   { BOP_ANY_RECV, "each_with_object", 1, 1, 2, { YS_ELEM, YS_MEMO }, IA_MEMO, 0 },
   { BOP_ANY_RECV, "inject", 1, 1, 2, { YS_MEMO, YS_ELEM }, IA_MEMO, IRF_GAP_SHAPE | IRF_GAP_FWD },
   { BOP_ANY_RECV, "inject", 0, 0, 2, { YS_MEMO, YS_ELEM }, IA_MEMO, IRF_GAP_SHAPE | IRF_GAP_FWD },
@@ -4358,6 +4365,20 @@ const IterRow *iter_row(TyKind fam, const char *name, int argc, unsigned skip) {
 
 int object_iter_runs_now(const char *name) {
   return builtin_object_method_known(name) && iter_row(BOP_ANY_RECV, name, -1, 0) && !is_deferred_block_call(NULL, name);
+}
+
+IterRuns iter_row_runs(TyKind rt, const char *name, int argc) {
+  const IterRow *r = iter_row_of(rt, name, argc);
+  if (!r) return IR_MANY;
+  if (r->runs != IR_ELEMS) return (IterRuns)r->runs;
+  /* every value a step yields is one element's, and no two are: a step per element */
+  int elems = 0;
+  for (int k = 0; k < r->nyield; k++) {
+    if (r->yield[k] == YS_INDEX) continue;
+    if (r->yield[k] != YS_ELEM && r->yield[k] != YS_PAIR && r->yield[k] != YS_PAIR_KEY && r->yield[k] != YS_PAIR_VAL) return IR_MANY;
+    elems++;
+  }
+  return elems == 1 ? IR_ELEMS : IR_MANY;
 }
 
 int iter_row_named(const char *name) {
@@ -4613,6 +4634,7 @@ static const char *iter_row_malformed(const IterRow *r) {
   if (r->flags & ~(IRF_GAP_SHARE | IRF_GAP_SHAPE | IRF_GAP_FWD | IRF_GAP_RUN_BOXED | IRF_SHAPE_BOXED))
     return "an unknown flag";
   if ((r->flags & IRF_GAP_RUN_BOXED) && !sub) return "IRF_GAP_RUN_BOXED on a row yielding no run";
+  if (r->runs > IR_MANY || (r->runs == IR_COUNT_RECV && r->fam != TY_INT)) return "a bad run count";
   if ((r->flags & IRF_SHAPE_BOXED) && r->fam != BOP_ANY_ARRAY && r->fam != BOP_ANY_HASH)
     return "IRF_SHAPE_BOXED on a row neither an Array's nor a Hash's";
   return NULL;

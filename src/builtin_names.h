@@ -73,6 +73,7 @@ int is_symbol_conversion(const char *n); /* to_sym intern: a Symbol made of a va
 int is_builtin_helper_name(const char *n); /* __x but not __x__: a builtins/ file's own helper */
 int is_opaque_reaching_call(const char *n); /* send family, call, new, lambda/proc, freeze, eval, instance_/class_/module_*, *method* */
 int is_async_code_entry(const char *recv, const char *n); /* Thread.new/start/fork, Fiber.new, trap, Signal.trap */
+int is_at_exit_name(const char *n);   /* at_exit: its block runs once the load phase is over, when the program exits */
 int is_deferred_block_call(const char *recv, const char *n); /* proc, Proc.new, define_method, at_exit, Enumerator.new, ...: the block runs later */
 int is_name_reader(const char *n);    /* name to_s inspect: a Class's or Module's name */
 int is_plain_builtin_reader(const char *n); /* name: every builtin with it reads a value */
@@ -129,6 +130,7 @@ int is_len_alias(const char *n);      /* length size */
 int is_length_spelling(const char *n); /* size count empty? */
 int is_difference_spelling(const char *n); /* difference */
 int is_str_each_iter(const char *n);  /* each_char each_line each_byte each_codepoint: String's element iterators */
+int is_str_line_method(const char *name); /* String's lines and each_line */
 int is_freeze_name(const char *n);    /* freeze */
 int is_str_string_yield(const char *n); /* each_char each_line upto chars lines split scrub: String methods whose block takes a String */
 int is_unpack_name(const char *n); /* unpack: a String decoded into values, which a block takes one by one */

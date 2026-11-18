@@ -541,7 +541,6 @@ void comp_free(Compiler *c) {
   yvt_free(c);
   free(c->bsl_gen);
   free(c->bsl_val);
-  if (g_repr_check) repr_channel_free(c);
   pivs_facts_free(c);
   strbuf_arg_index_free(c);
   free(c->vs_head); free(c->vs_site); free(c->vs_var); free(c->vs_next); free(c->vs_kind);
@@ -552,7 +551,9 @@ void comp_free(Compiler *c) {
   c->vs_count = c->vs_cap = 0;
   c->vs_built = 0;
   free(c->cg_parent);
+  free(c->hdr_cp);
   c->cg_parent = NULL;
+  c->hdr_cp = NULL; c->hdr_cp_n = 0;
   c->cg_parent_n = 0;
   free(c->lazy_hoist);
   c->lazy_hoist = NULL;
@@ -1836,9 +1837,96 @@ static int sm_owns_side(const Compiler *c, int s, int class_id, int side) {
   if (side < 2) return sm_owns(c, s, class_id, side);
   return sm_owns(c, s, class_id, 0) || (scope_on_side(&c->scopes[s], 0) && sm_owns(c, s, class_id, 1));
 }
+/* A batch of lookups made while no scope changes (comp_scope_batch_begin):
+   for each (name, side) asked, the scope the reverse scan below answers for
+   every class at once, from one forward walk of the scopes (the highest
+   scope that owns the side of its own class and carries the name). An ask
+   for each class of the program in turn (comp_name_answered: every class's
+   chain, while the index is not frozen) otherwise scanned every scope per
+   class and per ancestor. The batch answers only while the scope count, the
+   moved scopes and ver_built are as they were when it began; any other ask
+   scans. */
+typedef struct { char *name; int side; int *best; } SmbEntry;
+static struct { const Compiler *c; int depth, nscopes, nclasses, ver_built, n, cap; SmbEntry *e; int *slot, nslot; } smb;
+void comp_scope_batch_begin(Compiler *c) {
+  if (smb.depth++ > 0) return;
+  smb.c = c; smb.nscopes = c->nscopes; smb.nclasses = c->nclasses; smb.ver_built = c->ver_built; smb.n = 0;
+}
+void comp_scope_batch_end(void) {
+  if (smb.depth <= 0 || --smb.depth > 0) return;
+  for (int i = 0; i < smb.n; i++) { free(smb.e[i].name); free(smb.e[i].best); }
+  free(smb.slot); smb.slot = NULL; smb.nslot = 0;
+  smb.n = 0; smb.c = NULL;
+}
+static int sm_name_matches(const Compiler *c, int s, const char *name) {
+  return c->scopes[s].name && (sp_streq(c->scopes[s].name, name) ||
+         (!c->ver_built && c->scopes[s].mixin_guarded && sp_streq(comp_scope_user_name(&c->scopes[s]), name)));
+}
+/* The batch's answer for (class_id, name, side), or -2 when the batch does
+   not answer. Side 3 + side is a top-level method's (sm_top_last), whose
+   answer is kept at class slot nclasses. */
+static int sm_batch_lookup(Compiler *c, int class_id, const char *name, int side) {
+  if (smb.depth <= 0 || smb.c != c || mv_n || c->nscopes != smb.nscopes || c->nclasses != smb.nclasses ||
+      c->ver_built != smb.ver_built || class_id < (side >= 3 ? -1 : 0) || class_id >= smb.nclasses) return -2;
+  if (side >= 3) class_id = smb.nclasses;
+  /* (the entries by (name, side): open addressing over twice their count) */
+  if (2 * (smb.n + 1) > smb.nslot) {
+    int ns = smb.nslot ? 2 * smb.nslot : 64;
+    int *sl = malloc(sizeof(int) * (size_t)ns);
+    if (!sl) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int k = 0; k < ns; k++) sl[k] = -1;
+    for (int k = 0; k < smb.n; k++) {
+      unsigned h = (sp_strhash(smb.e[k].name) ^ (unsigned)smb.e[k].side * 2654435761u) & (unsigned)(ns - 1);
+      while (sl[h] >= 0) h = (h + 1) & (unsigned)(ns - 1);
+      sl[h] = k;
+    }
+    free(smb.slot); smb.slot = sl; smb.nslot = ns;
+  }
+  unsigned h = (sp_strhash(name) ^ (unsigned)side * 2654435761u) & (unsigned)(smb.nslot - 1);
+  while (smb.slot[h] >= 0 && !(smb.e[smb.slot[h]].side == side && sp_streq(smb.e[smb.slot[h]].name, name)))
+    h = (h + 1) & (unsigned)(smb.nslot - 1);
+  int i = smb.slot[h];
+  if (i < 0) {
+    i = smb.n;
+    smb.slot[h] = i;
+    if (smb.n == smb.cap) {
+      smb.cap = smb.cap ? 2 * smb.cap : 8;
+      smb.e = realloc(smb.e, sizeof(SmbEntry) * (size_t)smb.cap);
+      if (!smb.e) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    }
+    int *best = malloc(sizeof(int) * (size_t)(smb.nclasses + 1));
+    char *nm = strdup(name);
+    if (!best || !nm) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int k = 0; k <= smb.nclasses; k++) best[k] = -1;
+    /* (ascending, so the last scope that answers a class is the one kept:
+       the reverse scan's first) */
+    for (int s = 0; s < c->nscopes; s++) {
+      if (side >= 3) {
+        if (sm_toplevel(c, s) && !c->scopes[s].is_cmethod == !(side - 3) && c->scopes[s].name &&
+            sp_streq(c->scopes[s].name, name)) best[smb.nclasses] = s;
+        continue;
+      }
+      int cls = c->scopes[s].class_id;
+      if (cls < 0 || cls >= smb.nclasses || !sm_name_matches(c, s, name) || !sm_owns_side(c, s, cls, side)) continue;
+      best[cls] = s;
+    }
+    smb.e[i].name = nm; smb.e[i].side = side; smb.e[i].best = best; smb.n++;
+  }
+  return smb.e[i].best[class_id];
+}
 static int sm_lookup(Compiler *c, int class_id, const char *name, int is_cm) {
   if (!name) return -1;
   if (!sm_frozen) {
+    int b = sm_batch_lookup(c, class_id, name, is_cm);
+    if (b != -2) {
+#ifdef SP_SCOPE_BATCH_CHECK
+      int r = -1;
+      for (int s = c->nscopes - 1; s >= 0 && r < 0; s--)
+        if (sm_owns_side(c, s, class_id, is_cm) && sm_name_matches(c, s, name)) r = s;
+      if (r != b) { fprintf(stderr, "spinel: scope batch answered %d for %d/%s/%d, the scan %d\n", b, class_id, name, is_cm, r); abort(); }
+#endif
+      return b;
+    }
     /* scope shape may still change: scan in reverse so a later (reopened /
        transplanted) definition wins, matching the frozen index's ordering. */
     for (int s = c->nscopes - 1; s >= 0; s--)
@@ -2282,8 +2370,10 @@ int comp_name_answered(Compiler *c, const char *name, int is_cm) {
   if (n >= 0) return n > 0;
   int ans = 0;
   mtab_enter(c);
+  comp_scope_batch_begin(c);   /* (every class's chain asks the same names: one walk of the scopes per name) */
   for (int k = 0; k < c->nclasses && !ans; k++)
     ans = (is_cm ? comp_cmethod_in_chain(c, k, name, NULL) : comp_method_in_chain(c, k, name, NULL)) >= 0;
+  comp_scope_batch_end();
   mtab_leave(c);
   return ans;
 }
@@ -2513,11 +2603,16 @@ int comp_arysub_call(Compiler *c, int id, TyKind rt, TyKind *kind) {
   mtab_pop(c, mt_was);
   if (!builtin) return 0;
   *kind = comp_ary_kind(c, cid);
-  /* A String subclass instance's String is a handle (TY_STRBUF). A call
-     that changes it, or answers it, takes it boxed (the poly String arms
-     work on the handle in place); any other reads a copy of its bytes. */
-  if (comp_ary_is_str(c, cid))
-    *kind = comp_arysub_str_boxed(n) ? TY_POLY : TY_STRING;
+  /* Inherited line methods can return or yield the instance itself. */
+  if (comp_ary_is_str(c, cid)) {
+    int preserves_lines = 0;
+    if (is_str_line_method(n)) {
+      int argc;
+      const int *argv = call_args(c->nt, id, &argc);
+      preserves_lines = string_line_args(c, argc, argv);
+    }
+    *kind = comp_arysub_str_boxed(n) || preserves_lines ? TY_POLY : TY_STRING;
+  }
   return 1;
 }
 /* The builtin-op row flags of call `id` on an Array (#7449): what it answers
@@ -3031,6 +3126,25 @@ int comp_const_undefined(Compiler *c, int v) {
   if (vk == NK_ConstantReadNode)
     return !const_seg_resolves(c, v);
   if (vk == NK_ConstantPathNode) {
+    /* (a path off a value, `base::VERSION`: only the run time knows the class, and a leaf the program defines in
+       several classes does not resolve by its name alone, which the walk below would take as missing) */
+    int root = v;
+    while (nt_kind(nt, root) == NK_ConstantPathNode && nt_ref(nt, root, "parent") >= 0) root = nt_ref(nt, root, "parent");
+    if (nt_kind(nt, root) != NK_ConstantPathNode && nt_kind(nt, root) != NK_ConstantReadNode) {
+      /* (a leaf no class of the program holds is missing on any value: `m::Nope` raises) */
+      const char *leaf = nt_str(nt, v, "name");
+      if (!leaf) return 0;
+      int *cands = NULL, nc = comp_const_tail_cands(c, leaf, &cands);
+      free(cands);
+      if (nc > 0 || comp_const(c, leaf) || comp_is_wellknown_const(leaf) || is_builtin_class_name(leaf) ||
+          is_builtin_module_name(leaf) || is_builtin_exception_name(leaf)) return 0;
+      for (int k = 0; k < c->nclasses; k++) {
+        const char *cn = c->classes[k].name;
+        size_t ln = strlen(leaf), n = cn ? strlen(cn) : 0;
+        if (cn && n >= ln && sp_streq(cn + n - ln, leaf) && (n == ln || cn[n - ln - 1] == '_')) return 0;
+      }
+      return 1;
+    }
     /* a leaf no member of the program class its parent names is missing,
        though a constant of that name lives elsewhere (JSON::Coder) */
     if (const_path_misses_member(c, v)) return 1;
@@ -5344,6 +5458,16 @@ static int comp_method_index_1(Compiler *c, const char *name) {
 static int sm_top_last(Compiler *c, const char *name, int side) {
   if (!name) return -1;
   if (!sm_frozen) {
+    int b = sm_batch_lookup(c, -1, name, 3 + side);
+    if (b != -2) {
+#ifdef SP_SCOPE_BATCH_CHECK
+      int r = -1;
+      for (int s = c->nscopes - 1; s >= 0 && r < 0; s--)
+        if (sm_toplevel(c, s) && !c->scopes[s].is_cmethod == !side && c->scopes[s].name && sp_streq(c->scopes[s].name, name)) r = s;
+      if (r != b) { fprintf(stderr, "spinel: scope batch answered %d for top %s/%d, the scan %d\n", b, name, side, r); abort(); }
+#endif
+      return b;
+    }
     /* in reverse, so a redefinition wins, matching the frozen index */
     for (int s = c->nscopes - 1; s >= 0; s--)
       if (sm_toplevel(c, s) && !c->scopes[s].is_cmethod == !side && c->scopes[s].name &&
@@ -6374,9 +6498,8 @@ int comp_class_anonymous(Compiler *c, int ci) {
 const char *comp_class_base_display_fn(Compiler *c) {
   return c->has_anonymous_classes ? "sp_class_display" : "sp_class_to_s";
 }
-/* A class method to_s / inspect (nm) of class k's own, taking no arguments
-   and answering a String: what prints the class (sp_class_user_to_s and
-   _inspect); -1 when the class has none. The call plan answers it at node
+/* A class method to_s / inspect (nm) for display, or -1 when the class has
+   none. The call plan answers it at node
    site, the class constant a puts prints; -1 for the table behind the run-time
    dispatcher, which no call stands behind. */
 int cls_user_display_mi(Compiler *c, int site, int k, const char *nm) {
@@ -6384,7 +6507,9 @@ int cls_user_display_mi(Compiler *c, int site, int k, const char *nm) {
   int mi = cplan_implied_target(c, ic_operand_host(c, site), site, k, nm, CT_CMETHOD, NULL);
   if (mi < 0) return -1;
   const Scope *s = &c->scopes[mi];
-  if (s->nparams > 0 || s->yields || (s->blk_param && s->blk_param[0]) || (TyKind)s->ret != TY_STRING) return -1;
+  if (!s->reachable || s->yields) return -1;
+  if (is_inspect_name(nm) && (s->nparams > 0 || (s->blk_param && s->blk_param[0]) || (TyKind)s->ret != TY_STRING))
+    return -1;
   return mi;
 }
 int prog_has_cls_user_display(Compiler *c, const char *nm) {

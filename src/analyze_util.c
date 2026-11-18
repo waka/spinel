@@ -491,6 +491,26 @@ LocalVar *comp_const_at(Compiler *c, int node) {
 }
 
 static int const_node_class_index_tree(Compiler *c, int id);
+static int hdr_cp_cmp(const void *a, const void *b) { int x = *(const int *)a, y = *(const int *)b; return (x > y) - (x < y); }
+/* Is id a class or module header's constant_path? */
+static int const_node_names_header(Compiler *c, int id) {
+  const NodeTable *nt = c->nt;
+  /* (the parent map would answer, but it walks the whole table after each edit; the headers are few) */
+  if (!c->hdr_cp || c->hdr_cp_count != nt->count || c->hdr_cp_ver != nt->version || c->hdr_cp_edits != nt->edits) {
+    int ncl = 0, nmo = 0;
+    const int *cl = nt_nodes_of_kind(nt, NK_ClassNode, &ncl);
+    const int *mo = nt_nodes_of_kind(nt, NK_ModuleNode, &nmo);
+    int *v = realloc(c->hdr_cp, sizeof(int) * (size_t)(ncl + nmo + 1));
+    if (!v) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    int n = 0;
+    for (int i = 0; i < ncl; i++) v[n++] = nt_ref(nt, cl[i], "constant_path");
+    for (int i = 0; i < nmo; i++) v[n++] = nt_ref(nt, mo[i], "constant_path");
+    qsort(v, (size_t)n, sizeof(int), hdr_cp_cmp);
+    c->hdr_cp = v; c->hdr_cp_n = n;
+    c->hdr_cp_count = nt->count; c->hdr_cp_ver = nt->version; c->hdr_cp_edits = nt->edits;
+  }
+  return bsearch(&id, c->hdr_cp, (size_t)c->hdr_cp_n, sizeof(int), hdr_cp_cmp) != NULL;
+}
 /* The class or module of the program constant node id names, as the load
    record resolves it: a reference where it stands (elab_class_ref_at), a
    header's own name by its header, a builder's write by the class it opens.
@@ -515,7 +535,7 @@ static int const_node_record_class(Compiler *c, int id, int *core) {
     int k = elab_builder_class(c, id);
     return k >= 0 ? k : comp_class_of_def(c, id);
   }
-  const int *par = comp_parent_map(c);
+  const int *par = const_node_names_header(c, id) ? comp_parent_map(c) : NULL;
   int hp = par ? par[id] : -1;
   if (hp >= 0 && (nt_kind(nt, hp) == NK_ClassNode || nt_kind(nt, hp) == NK_ModuleNode) && nt_ref(nt, hp, "constant_path") == id)
     return elab_header_class(c, hp, NULL, NULL);
@@ -1533,41 +1553,17 @@ int class_coerce_emittable(Compiler *c, int k) {
   if (!ty_is_array(m->ret) && !ty_is_obj_array(m->ret)) return 0;
   return 1;
 }
-/* 1 if class k defines a #to_str whose SHAPE a String comparison can convert
-   through: no parameters, and an answer the String slot can take -- a static
-   String, or one the analysis could only pin to poly (a body reading a poly
-   ivar, or one with a nil branch), whose boxed answer takes the check CRuby
-   applies to the RESULT of #to_str. Like the coerce shape above, this
-   consults neither reachability nor emittability: it is asked by the type
-   rules for #casecmp and by every comparison arm the emitter renders, so the
-   TYPED side agrees at every point in the pipeline. The BOXED side does not
-   ask it and cannot: it reaches #to_str through the generated conversion
-   bridge, which carries only a #to_str whose static return is a String
-   (conv_bridge_callee), so a poly-returning one converts typed and answers
-   "no conversion" boxed. That asymmetry is deliberate -- widening the bridge
-   is its own change -- and it is named again where the bridge is asked, in
-   sp_poly_check_str.
-
-   A parameter of any kind is declined even though CRuby only needs #to_str to
-   be callable with none: `def to_str(x = 1)`, `def to_str(*a)` and
-   `def to_str(k: 1)` all fail the C build at the tree's existing conversion
-   site (`"x" + A.new("y")`, checked on all three), and this rule leaves them
-   where it found them rather than adding a new way in. An
-   `attr_reader :to_str` defines no method scope at all, so the lookup below
-   never sees it. A native class is excluded because the conversion is a
-   direct call to a method this TU compiles. The plan answers it at the call
-   id that converts its operand op. */
+/* Typed String comparison accepts a zero-parameter #to_str returning a
+   String or a boxed value. Inference and the direct comparison emitter
+   share this predicate. Boxed comparisons use the runtime conversion hook.
+   Only classes compiled in this translation unit can supply a direct call. */
 int class_has_to_str_shape(Compiler *c, int site, int op, int k) {
   if (k < 0 || k >= c->nclasses || c->classes[k].is_native_class) return 0;
   int mi = cplan_implied_target(c, site, op, k, "to_str", 0, NULL);
   if (mi < 0) return 0;
   Scope *m = &c->scopes[mi];
-  /* an ALIAS is not this shape yet: the conversion emitter names the call
-     after the protocol (sp_A_to_str) while `alias to_str raw` compiles one
-     function named sp_A_raw, and reachability seeds the implicit protocols by
-     the method's own name, so the aliased body is not emitted at all. Master
-     fails the C build on that pair already (`"x" + A.new("y")`); this rule
-     leaves it exactly where it found it rather than adding a new way in. */
+  /* Reachability seeds implicit protocols by the method's own name. An
+     alias to a differently named body does not establish that body here. */
   if (!sp_streq(m->name, "to_str")) return 0;
   return m->nparams == 0 && m->rest_idx < 0 &&
          (m->ret == TY_STRING || m->ret == TY_POLY);
@@ -6516,23 +6512,16 @@ const char *time_strict_parser_call(Compiler *c, int id) {
   return fn;
 }
 
-/* The program's parent map (an_parent_map), kept on the Compiler as the
-   emitter's is (codegen_parents, the same fields) and rebuilt whenever the
-   node table changed, for an analysis that asks where a node sits on every
-   round. The map is borrowed: the first ask after an edit that changes the
-   table's version or count (a string, a type, a new node, a placement)
-   rebuilds it and frees the one handed out before. A caller that holds it
-   across such an edit reads freed memory once anything asks again: it finds
-   what it needs from the map first and edits after. */
+/* The program's parent map (nt_parents, an_parent_map's), kept on the
+   node table and updated by its edits, for an analysis that asks where a
+   node sits on every round. The map is borrowed: an edit changes it under a
+   caller that holds it, and an edit that replaces it (one that adds a node,
+   swaps or renumbers nodes, or takes a node from the highest of two that
+   hold it: nt_parents) leaves the caller the old one, freed once anything
+   asks again: a caller finds what it needs from the map first and edits
+   after. */
 const int *comp_parent_map(Compiler *c) {
-  const NodeTable *nt = c->nt;
-  if (!c->cg_parent || c->cg_parent_n != nt->count || c->cg_parent_ver != nt->version) {
-    free(c->cg_parent);
-    c->cg_parent = an_parent_map(nt);
-    if (!c->cg_parent) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-    c->cg_parent_n = nt->count; c->cg_parent_ver = nt->version;
-  }
-  return c->cg_parent;
+  return nt_parents((NodeTable *)c->nt);
 }
 
 /* Is node n a statement the next statement follows, so that its value is

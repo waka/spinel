@@ -1422,6 +1422,14 @@ static void prog_warn_missing(Compiler *c, const unsigned char *seen) {
         prog_rescue_runs(nt, nt_ref(nt, b, "rescue_clause")) == 1) continue;
     int r = prog_root_of(c, parent, id);
     const char *file = r >= 0 ? nt_str(nt, r, "file_path") : nt_file_path(nt, (int)nt_int(nt, id, "node_file", 0));
+    /* --strict-require (spin build): a require no file answers is a
+       compile-time refusal, as the inline model's resolve makes it */
+    if (g_strict_require) {
+      fprintf(stderr, "spinel: %s:%lld: cannot load such file -- %s (%s \"%s\")\n",
+              file ? file : "-", nt_int(nt, id, "node_line", 0), nt_str(nt, id, "path"), nt_str(nt, id, "method"),
+              nt_str(nt, id, "path"));
+      exit(1);
+    }
     fprintf(stderr, "warning: %s:%lld: cannot load such file -- %s (the %s raises LoadError when it runs)\n",
             file ? file : "-", nt_int(nt, id, "node_line", 0), nt_str(nt, id, "path"), nt_str(nt, id, "method"));
   }
@@ -1464,6 +1472,17 @@ static void prog_unplace_candidates(Compiler *c, const unsigned char *seen, cons
   free(parent); free(pos);
 }
 
+/* See analyze.h. */
+int prog_node_in_dropped_file(Compiler *c, int node) {
+  const NodeTable *nt = c->nt;
+  if (node < 0 || !prog_graph(c)) return 0;
+  long long fid = nt_int(nt, node, "node_file", -1);
+  if (fid < 0) return 0;
+  for (int f = 1; f < nt_nroots(nt); f++)
+    if (nt_int(nt, nt_root(nt, f), "node_file", -2) == fid) return nt_int(nt, nt_root(nt, f), "file_dropped", 0) != 0;
+  return 0;
+}
+
 void prog_settle_files(Compiler *c) {
   NodeTable *nt = (NodeTable *)c->nt;
   int n = nt_nroots(nt);
@@ -1489,7 +1508,7 @@ void prog_settle_files(Compiler *c) {
   prog_unplace_candidates(c, seen, live);
   for (int f = 1; f < n; f++) {
     int st = live[f] ? -1 : prog_root_stmts(c, f);
-    if (st >= 0) nt_node_set_arr(nt, st, "body", NULL, 0);
+    if (st >= 0) { nt_node_set_arr(nt, st, "body", NULL, 0); nt_node_set_int(nt, nt_root(nt, f), "file_dropped", 1); }
     else if (live[f] && prog_load_by(c, f) < 0 && nsite[f] == 1 && ok[f]) {
       nt_node_set_int(nt, nt_root(nt, f), "load_by", site[f]);
       nt_node_set_int(nt, nt_root(nt, f), "load_stmt", at[f]);

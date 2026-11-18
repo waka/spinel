@@ -634,9 +634,6 @@ int lazy_endpoint_is_infinite(Compiler *c, int right);           /* codegen_call
 int proc_form_source(Compiler *c, int s);                        /* codegen_util.c */
 int scope_is_shadowed(Compiler *c, int s);                       /* codegen_util.c */
 int str_append_chain(Compiler *c, int recv, int *chain, int *base);  /* codegen_util.c */
-int strbuf_bang_tail(Compiler *c, int v);                        /* codegen_stmt.c */
-int strbuf_builtin_tail(Compiler *c, int v);                     /* codegen_stmt.c */
-int strbuf_iter_box_tail(Compiler *c, int v);                    /* codegen_stmt.c */
 int strbuf_route_clamp(Compiler *c, int v, int *ops);           /* codegen_stmt.c */
 int subtree_may_reassign_state(Compiler *c, int id);             /* codegen_call.c */
 int subtree_may_run_proc(Compiler *c, int id);                   /* codegen_call.c */
@@ -815,6 +812,8 @@ int desugar_io_console_modes(Compiler *c);
 int desugar_reader_index_write(Compiler *c);
 int desugar_body_module_eval(Compiler *c);
 int desugar_sclass_hooks(Compiler *c);
+int desugar_toplevel_hooked_mixins(Compiler *c);
+int desugar_socket_constants(Compiler *c);
 int desugar_instance_eval_defs(Compiler *c);
 int desugar_user_send_others(Compiler *c);
 int desugar_missing_method_calls(Compiler *c);
@@ -1368,6 +1367,7 @@ int kwh_arg_param(Compiler *c, Scope *m, int pos_argc);
 
 /* --ext-entry designations (see codegen_internal.h / ext-design.md) */
 extern const char *g_ext_entries;
+void ext_entries_each(void (*f)(const char *cls, const char *meth, void *ud), void *ud);   /* each --ext-entry: Module, method */
 extern const char *g_ext_classes;
 
 /* the class every value of a boxed-value hash slot holds, or -1 (#4846) */
