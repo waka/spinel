@@ -811,20 +811,54 @@ int repr_write_share(const Compiler *c, int node) {
   return 0;
 }
 
-/* --share-strings: the binding a boxed receiver's call v takes for native
-   class k, when it answers the String its object keeps (`native_share ...
-   "answers"`), has that String's handle form and the rule shares the
-   receiver's Strings; else NULL. The dispatch's arm for k returns that
-   handle, which carries the native object's String identity. */
+const char *repr_native_string_symbol(const NativeMethod *m) {
+  return m && m->kind == 0 && m->nargs == 0 && !m->rest && (m->share & NSH_ANSWERS)
+         ? m->share_csym : NULL;
+}
+
+const NativeMethod *repr_native_string_reader(Compiler *c, int node) {
+  const NodeTable *nt = c->nt;
+  if (node < 0) return NULL;
+  NodeKind kind = nt_kind(nt, node);
+  int cid;
+  const char *name;
+  if (kind == NK_CallNode) {
+    int recv = nt_ref(nt, node, "receiver");
+    TyKind rt = recv >= 0 ? comp_ntype(c, recv) : TY_UNKNOWN;
+    if (!ty_is_object(rt)) return NULL;
+    name = nt_str(nt, node, "name");
+    cid = comp_native_answer_class(c, ty_object_class(rt), name);
+  }
+  else if (kind == NK_SuperNode) {
+    const Scope *scope = comp_scope_of(c, node);
+    if (!scope || scope->is_cmethod || scope->class_id < 0) return NULL;
+    cid = c->classes[scope->class_id].nsub_root - 1;
+    if (cid < 0) return NULL;
+    const Scope *site = comp_super_site(c, scope);
+    name = comp_super_name(c, cplan_super_start(c, site), site);
+  }
+  else return NULL;
+  if (cid < 0 || !name) return NULL;
+  int argc = 0;
+  call_args(nt, node, &argc);
+  if (argc != 0) return NULL;
+  int nm = comp_native_method_find(c, cid, name, argc, 0);
+  const NativeMethod *m = nm >= 0 ? &c->native_methods[nm] : NULL;
+  return repr_native_string_symbol(m) ? m : NULL;
+}
+
+/* A selected native arm publishes the binding's existing String handle. */
 const NativeMethod *repr_native_arm_handle(Compiler *c, int v, int k) {
   const NodeTable *nt = c->nt;
   int recv = v >= 0 && nt_kind(nt, v) == NK_CallNode ? nt_ref(nt, v, "receiver") : -1;
-  if (!c->share || recv < 0 || k < 0 || k >= c->nclasses || !c->classes[k].is_native_class ||
+  if (recv < 0 ||
       nt_ref(nt, v, "arguments") >= 0 || nt_ref(nt, v, "block") >= 0)
     return NULL;
-  int nm = comp_native_method_find(c, k, nt_str(nt, v, "name"), 0, 0);
+  const char *name = nt_str(nt, v, "name");
+  int cid = comp_native_binding_class(c, k, name);
+  int nm = cid >= 0 ? comp_native_method_find(c, cid, name, 0, 0) : -1;
   const NativeMethod *m = nm >= 0 ? &c->native_methods[nm] : NULL;
-  return m && (m->share & NSH_ANSWERS) && m->share_csym ? m : NULL;
+  return repr_native_string_symbol(m) ? m : NULL;
 }
 /* Is v a boxed receiver's call whose arm, for each class the receiver can
    hold, is such a native binding (`o.string` where o holds a StringIO or a
@@ -913,6 +947,24 @@ static int repr_env_string_handle(Compiler *c, int v) {
   return argc == 2 && repr_of(c, argv[1]).kind == RK_STRBUF;
 }
 
+/* A once-only iterator whose builtin answer is its String receiver has
+   the receiver handle it held for the block. A break can give it another
+   answer. */
+int repr_string_iterator_handle(Compiler *c, int node) {
+  const NodeTable *nt = c->nt;
+  if (node < 0 || nt_kind(nt, node) != NK_CallNode || call_plain_argc(c, node) != 0)
+    return 0;
+  int recv = nt_ref(nt, node, "receiver"), block = nt_ref(nt, node, "block");
+  if (recv < 0 || nt_kind(nt, block) != NK_BlockNode) return 0;
+  TyKind rt = comp_ntype(c, recv);
+  if (rt != TY_STRING && rt != TY_STRBUF) return 0;
+  const IterRow *row = iter_row_of(rt, view_call_name(c, node), 0);
+  return row && row->runs == IR_ONCE && row->answer == IA_RECV &&
+         row->nyield == 1 && row->yield[0] == YS_RECV &&
+         !call_breaks(c, node) && !cplan_pinned_vis(c, node) &&
+         cplan_user(c, node).dispatch == CP_NONE;
+}
+
 /* A call with a native String result has an object to pass to its caller.
    Reflection keeps its callee's signature. A setter expression selects its
    argument independently of what the invoked method returns. */
@@ -936,11 +988,21 @@ int repr_native_call_handle(Compiler *c, int v) {
     }
   }
   const CallPlan plan = cplan_user(c, v);
+  /* a boxed receiver's call that codegen takes as the builtin, where only a
+     class method has the name (`K.pack` beside `@a.pack("n*")`): the
+     builtin's String, not that method's handle */
+  if (k == NK_CallNode && plan.mi >= 0 && c->scopes[plan.mi].is_cmethod) {
+    int r = nt_ref(nt, v, "receiver");
+    const char *name = nt_str(nt, v, "name");
+    if (r >= 0 && comp_ntype(c, r) == TY_POLY && !user_defines_or_reads(c, name)) return 0;
+  }
   if (plan.dispatch == CP_DIRECT && plan.mi >= 0)
     return repr_method_ret_storage(&c->scopes[plan.mi]) == TY_STRBUF;
-  if (plan.dispatch != CP_SWITCH && plan.dispatch != CP_PER_ARM)
-    return k == NK_CallNode ? repr_boxed_native_handle(c, v)
+  if (plan.dispatch != CP_SWITCH && plan.dispatch != CP_PER_ARM) {
+    if (repr_native_string_reader(c, v)) return 1;
+    return k == NK_CallNode ? repr_string_iterator_handle(c, v) || repr_boxed_native_handle(c, v)
                             : cplan_builtin_handle_row(c, v) || repr_super_native_keeps(c, v);
+  }
   /* The switch has an explicit join even when its target set exceeds
      CPT_MAX. This says nothing about what an unknown arm does with arguments. */
   return repr_call_result_storage(t) == TY_STRBUF;
@@ -1065,29 +1127,25 @@ int repr_string_conversion_operand(Compiler *c, int v) {
          comp_recv_type(c, r) == TY_STRING &&
          (cplan_user(c, v).dispatch == CP_NONE || repr_user_answers_self(c, v)) ? r : -1;
 }
-/* ENV copies its stored bytes, but a store answers its value operand.
-   A boxed operand can still hold plain bytes: an observable alias stays
-   refused. A mutable key held across value evaluation that can change it
-   must carry its handle too. */
+/* A String-typed environment write hands back a String handle. */
 int repr_env_store_operand(Compiler *c, int v) {
   const NodeTable *nt = c->nt;
   if (v < 0 || nt_kind(nt, v) != NK_CallNode) return -1;
-  int r = nt_ref(nt, v, "receiver"), argc = 0;
+  const char *name = nt_str(nt, v, "name");
+  int recv = nt_ref(nt, v, "receiver"), argc;
   const int *argv = call_args(nt, v, &argc);
-  return r >= 0 && env_value_recv(c, r, comp_ntype(c, r)) &&
-         argc == 2 && bop_share_named(BOP_ENV, nt_str(nt, v, "name")) == BSH_LAST &&
-         (repr_of(c, argv[1]).kind != RK_BOXED || share_value_unobserved(c, argv[1])) &&
-         (repr_of(c, argv[0]).handle || share_value_fresh(c, argv[0], 0) || !subtree_has_side_effect(c, argv[1]))
-         ? argv[1] : -1;
+  if (recv < 0 || !name || !is_store_alias(name) || argc != 2 ||
+      !env_value_recv(c, recv, comp_ntype(c, recv))) return -1;
+  TyKind ty = comp_ntype_settled(c, argv[1]);
+  return ty == TY_STRING || ty == TY_STRBUF ? argv[1] : -1;
 }
 /* Does string conversion `node` hand on a handle: the operand it ends in,
    through further conversions, is a boxed value or a route that carries
-   one (strbuf_route_kind, the arms emit_strbuf_value takes the conversion
-   by)? */
+   one through the value emitter? */
 static int repr_conversion_hands_handle(Compiler *c, int node) {
-  int x = repr_string_conversion_operand(c, node), op, more;
+  int x = repr_string_conversion_operand(c, node), more;
   while ((more = x >= 0 ? repr_string_conversion_operand(c, x) : -1) >= 0) x = more;
-  return x >= 0 && (repr_of(c, x).kind == RK_BOXED || strbuf_route_kind(c, x, &op) != SPK_NONE ||
+  return x >= 0 && (repr_of(c, x).kind == RK_BOXED || strbuf_route_carries(c, x, 0) ||
                     strbuf_cond_has_handle_leaf(c, x));
 }
 /* Where the boxed form of a shared-mutable String comes from, as emit_boxed
@@ -1122,7 +1180,7 @@ static int repr_strbuf_src(const Compiler *c, int node, TyKind t) {
     Scope *s = ln ? comp_scope_of(mc, node) : NULL;
     LocalVar *lv = s ? scope_local(s, ln) : NULL;
     if (lv && lv->type == TY_POLY && comp_nilnarrow_stored(c, node) == TY_STRBUF) return RS_SLOT_POLY;
-    return lv && lv->type == TY_STRBUF && lv->str_shared ? RS_HANDLE : RS_NONE;
+    return lv && repr_of_slot(c, lv).handle ? RS_HANDLE : RS_NONE;
   }
   if (t != TY_STRBUF) return RS_NONE;
   if (k == NK_LocalVariableReadNode) {
@@ -1198,8 +1256,8 @@ static int repr_strbuf_src(const Compiler *c, int node, TyKind t) {
 }
 
 /* See repr.h. */
-int repr_handle_apart(Compiler *c, int v, Repr r) {
-  return r.as_ty == TY_STRBUF && (r.strbuf_src == RS_FRESH || strbuf_srange_tail(c, v) >= 0);
+int repr_handle_apart(Repr r) {
+  return r.as_ty == TY_STRBUF && r.strbuf_src == RS_FRESH;
 }
 
 /* The type a node is STORED as, given its cached type t (comp_ntype's
@@ -1276,6 +1334,15 @@ Repr repr_of(const Compiler *c, int node) {
   if (!comp_node_in(c, node)) return r;
   r.ty = comp_ntype_settled(c, node);
   r.as_ty = comp_ntype(c, node);
+  /* A begin with no inferred result still carries a boxed Ruby value.
+     An enclosing statement sequence exposes the same representation. */
+  if (r.as_ty == TY_UNKNOWN) {
+    int value = node;
+    NodeKind kind = nt_kind(c->nt, node);
+    if (kind == NK_ParenthesesNode || kind == NK_StatementsNode)
+      vp_one(c->nt, node, VPS_NONE | VP_PARENS_ONLY, &value);
+    if (nt_kind(c->nt, value) == NK_BeginNode) r.as_ty = TY_POLY;
+  }
   /* the layout first, from the type it is stored as, then the flags:
      GCC 13's store merging at -O2 drops the nil_cold store when
      repr_layout's bitfield stores come after it; setting the layout first
@@ -1599,9 +1666,7 @@ Repr repr_of_slot(const Compiler *c, const LocalVar *lv) {
   if (lv->or_written) r.may_nil = 1;
   /* a pointer slot that can hold nil (repr_may_nil) */
   if (repr_may_nil(lv->type, lv->obj_may_nil)) r.may_nil = 1;
-  /* str_shared refines TY_STRBUF; it can outlive that storage type */
-  if (lv->type == TY_STRBUF && lv->str_shared) r.handle = 1;
-  /* under the rule, that handle is the one it assigned */
+  r.handle = k == RK_STRBUF;
   r.share = r.handle;
   r.elem_nil_marked = (unsigned)repr_elem_nil(r.elem, lv->nullable_int_elem & NIE_MARKED, lv->obj_elem_may_nil);
   r.elem_nil_reach = (unsigned)repr_elem_nil(r.elem, lv->nullable_int_elem & (NIE_MARKED | NIE_REACH), 0);
@@ -1628,19 +1693,8 @@ static void repr_check_block_params(Compiler *c) {
   }
 }
 
-/* A String slot is the handle or bytes, and the rule marks every handle
-   (slot_take_string_handle): no local, global, instance variable or class
-   variable holds TY_STRBUF without the mark, which repr_of_slot reads as bytes. */
+/* Global and member storage still needs the String handle mark. */
 static void repr_check_string_slots(Compiler *c) {
-  for (int si = 0; si < c->nscopes; si++) {
-    Scope *sc = &c->scopes[si];
-    for (int i = 0; i < sc->nlocals; i++) {
-      const LocalVar *lv = &sc->locals[i];
-      if (lv->type == TY_STRBUF && !lv->str_shared)
-        fprintf(stderr, "repr-check: conflict: scope %s local %s: slot string buffer without the handle mark\n",
-                sc->name ? sc->name : "?", lv->name ? lv->name : "?");
-    }
-  }
   for (int g = 0; g < c->ngvars; g++)
     if (c->gvars[g].type == TY_STRBUF && !c->gvars[g].str_shared)
       fprintf(stderr, "repr-check: conflict: global %s: slot string buffer without the handle mark\n",
@@ -1661,9 +1715,6 @@ static void repr_check_string_slots(Compiler *c) {
 void repr_seal(Compiler *c) {
   if (g_repr_check) { repr_check_block_params(c); repr_check_string_slots(c); }
   repr_sealed_flag = 1;
-  /* the String plan (share_plan.c), from the final facts and flags, asked
-     as codegen will ask them: sealed */
-  share_plan_build(c);
 }
 
 
@@ -1944,3 +1995,8 @@ char *repr_dump(const Compiler *c) {
   return out;
 }
 
+int repr_cell_capturable(const Compiler *c, const LocalVar *lv) {
+  return lv->type == TY_INT || lv->type == TY_BOOL || lv->type == TY_SYMBOL || lv->type == TY_UNKNOWN ||
+         lv->type == TY_PROC || lv->type == TY_FLOAT || lv->type == TY_POLY || cell_value_struct(lv->type) != NULL ||
+         (proc_slot_is_ptr(lv->type) && !comp_ty_value_obj((Compiler *)c, lv->type));
+}

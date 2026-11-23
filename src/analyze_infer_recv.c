@@ -563,7 +563,23 @@ int infer_hash_call(Compiler *c, int id, TyKind rt, TyKind *out) {
       if (rt == TY_POLY_POLY_HASH) { *out = rt; return 1; }
       int body = nt_ref(nt, block, "body");
       int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
-      TyKind nkt = bn > 0 ? infer_type(c, bb[bn - 1]) : TY_UNKNOWN;
+      int tail = bn > 0 ? bb[bn - 1] : -1;
+      TyKind nkt = tail >= 0 ? infer_type(c, tail) : TY_UNKNOWN;
+      int reopen = comp_builtin_kind_reopen_mi(c, id, rt, name);
+      int builtin = reopen < 0 || cplan_builtin_call(c, id) || cplan_reopen_runs_builtin(c, id, reopen);
+      if (builtin) {
+        TyKind nx = block_next_value_ty(c, body);
+        if (nx != TY_UNKNOWN) nkt = nkt == TY_UNKNOWN ? nx : ty_unify(nkt, nx);
+        /* A type join can hide a key a typed table cannot hold, such as
+           nil beside Integer. Check the actual block answers before
+           selecting a typed table. */
+        unsigned number_kinds;
+        if (block_store_value_ty(c, body, tail, nkt, nkt, &number_kinds) != nkt ||
+            (nkt == TY_INT && (nullable_int_value(c, tail) || block_next_value_nullable(c, block)))) {
+          *out = TY_POLY_POLY_HASH;
+          return 1;
+        }
+      }
       /* Symbol keys have no scalar-valued hash variant, so keys becoming
          symbols (e.g. transform_keys(&:to_sym)) yield a SymPolyHash regardless
          of the value type. */
@@ -571,7 +587,11 @@ int infer_hash_call(Compiler *c, int id, TyKind rt, TyKind *out) {
       /* a block a parameter hands on (`&block`) has no body here: its keys are of no kind the receiver's gives */
       if (nt_kind(nt, block) == NK_BlockArgumentNode && nkt == TY_UNKNOWN) { *out = TY_POLY_POLY_HASH; return 1; }
       TyKind r = ty_hash_of(nkt, ty_hash_val(rt));
-      { *out = r != TY_UNKNOWN ? r : rt; return 1; }
+      if (r != TY_UNKNOWN) { *out = r; return 1; }
+      /* A known new key may have no layout with the receiver's values.
+         Use the general Hash to keep that key and its original value. */
+      *out = builtin && nkt != TY_UNKNOWN ? TY_POLY_POLY_HASH : rt;
+      return 1;
     }
     if (block >= 0 && sp_streq(name, "transform_values")) {
       if (rt == TY_POLY_POLY_HASH) { *out = rt; return 1; }
@@ -947,9 +967,10 @@ int infer_array_reduce(Compiler *c, int id, TyKind rt, TyKind *out) {
     /* `reduce(nil) { |acc, t| acc.nil? ? t : acc + t }` -- the idiom for a
        fold with no natural identity. The seed says nothing about the
        accumulator except that it starts empty, so the fold is boxed: a
-       TY_NIL accumulator has no C representation at all (#3356). */
+       TY_NIL accumulator has no C representation at all (#3356). So is a
+       seed typed nil that is no written one (a method answering nil). */
     if (!is_sym_op && nt_ref(nt, id, "block") >= 0 &&
-        nt_kind(nt, argv[0]) == NK_NilNode)
+        (nt_kind(nt, argv[0]) == NK_NilNode || infer_type(c, argv[0]) == TY_NIL))
       { *out = TY_POLY; return 1; }
     if (!is_sym_op) {
       TyKind it = infer_type(c, argv[0]);
@@ -1719,6 +1740,19 @@ static int block_yields_int_too(const NodeTable *nt, int blk) {
     if (nt_ref(nt, calls[i], "block") == blk && is_byte_codepoint_each(nt_str(nt, calls[i], "name"))) return 1;
   return 0;
 }
+
+/* A return-type query can revisit the call after its block slot is declared. */
+static void infer_boxed_string_param(Compiler *c, int block) {
+  if (an_read_only_inference()) return;
+  const char *param = block_param_name(c, block, 0);
+  Scope *scope = param ? comp_scope_of(c, block) : NULL;
+  LocalVar *slot = scope ? scope_local(scope, param) : NULL;
+  if (!slot || slot->type == TY_STRING || slot->type == TY_STRBUF) return;
+  TyKind type = slot->type == TY_INT ||
+    (slot->type == TY_POLY && block_yields_int_too(c->nt, block)) ? TY_POLY : TY_STRING;
+  lv_set_type(slot, type);
+}
+
 int poly_lines_args(Compiler *c, int argc, const int *argv) {
   const NodeTable *nt = c->nt;
   int kw = nt_argv_kwh(nt, argv, argc) >= 0;
@@ -2162,13 +2196,7 @@ int infer_poly_call(Compiler *c, int id, TyKind rt, TyKind *out) {
       nt_kind(nt, nt_ref(nt, id, "block")) == NK_BlockNode &&
       (argc == 0 || poly_lines_args(c, argc, argv)) && string_line_args(c, argc, argv) &&
       !an_user_defines_or_reads(c, name)) {
-    int block = nt_ref(nt, id, "block");
-    const char *param = block_param_name(c, block, 0);
-    Scope *scope = param ? comp_scope_of(c, block) : NULL;
-    LocalVar *slot = scope ? scope_local(scope, param) : NULL;
-    if (slot && slot->type != TY_STRING && !(slot->type == TY_STRBUF && slot->str_shared))
-      lv_set_type(slot, slot->type == TY_INT ||
-                        (slot->type == TY_POLY && block_yields_int_too(nt, block)) ? TY_POLY : TY_STRING);
+    infer_boxed_string_param(c, nt_ref(nt, id, "block"));
     *out = TY_POLY;
     return 1;
   }
@@ -2180,12 +2208,7 @@ int infer_poly_call(Compiler *c, int id, TyKind rt, TyKind *out) {
       (sp_streq(name, "each_char") || sp_streq(name, "each_line")) &&
       nt_ref(nt, id, "block") >= 0 && !an_user_defines_or_reads(c, name) &&
       !an_user_defines_or_reads(c, sp_streq(name, "each_char") ? "chars" : "lines")) {
-    int eb = nt_ref(nt, id, "block");
-    const char *ebp = block_param_name(c, eb, 0);
-    Scope *ebs = ebp ? comp_scope_of(c, eb) : NULL;
-    LocalVar *ebl = (ebs && ebp) ? scope_local(ebs, ebp) : NULL;
-    if (ebl && ebl->type != TY_STRING && !(ebl->type == TY_STRBUF && ebl->str_shared))
-      lv_set_type(ebl, ebl->type == TY_INT || (ebl->type == TY_POLY && block_yields_int_too(nt, eb)) ? TY_POLY : TY_STRING);
+    infer_boxed_string_param(c, nt_ref(nt, id, "block"));
     { *out = TY_STRING; return 1; }
   }
   if (recv >= 0 && rt == TY_POLY && argc == 0 && is_byte_codepoint_each(name) &&
@@ -2194,7 +2217,8 @@ int infer_poly_call(Compiler *c, int id, TyKind rt, TyKind *out) {
     const char *ebp = block_param_name(c, eb, 0);
     Scope *ebs = ebp ? comp_scope_of(c, eb) : NULL;
     LocalVar *ebl = (ebs && ebp) ? scope_local(ebs, ebp) : NULL;
-    if (ebl && ebl->type != TY_INT && ebl->type != TY_POLY) lv_set_type(ebl, ebl->type == TY_UNKNOWN ? TY_INT : TY_POLY);
+    if (!an_read_only_inference() && ebl && ebl->type != TY_INT && ebl->type != TY_POLY)
+      lv_set_type(ebl, ebl->type == TY_UNKNOWN ? TY_INT : TY_POLY);
     { *out = TY_STRING; return 1; }
   }
   /* `poly.empty?`: the dispatch carries builtin String / Array / Hash arms, so
@@ -2264,9 +2288,11 @@ int infer_poly_call(Compiler *c, int id, TyKind rt, TyKind *out) {
       !an_user_recv_defines_method(c, name) &&
       (sp_streq(name, "message") || sp_streq(name, "result") ||
        sp_streq(name, "errno") || sp_streq(name, "error_code") ||
+       sp_streq(name, "line") || sp_streq(name, "column") ||
        sp_streq(name, "key") || sp_streq(name, "receiver") ||
        sp_streq(name, "backtrace") || sp_streq(name, "cause") ||
-       sp_streq(name, "full_message") || sp_streq(name, "detailed_message")))
+       sp_streq(name, "full_message") || sp_streq(name, "detailed_message") ||
+       (an_exc_um_reentry(id) && exc_um_only_acc(name))))
     { *out = (sp_streq(name, "message") && !exc_has_nonstring_msg_override(c)) ||
              is_exception_full_message(name) ? TY_STRING : TY_POLY;
       return 1; }

@@ -22,6 +22,17 @@ static const BuiltinClass *builtin_row(const char *n) {
   return r;
 }
 
+/* a Process::RLIMIT_* constant of some platform's CRuby; its value, or the
+   NameError where this platform has none, comes from the run time */
+int process_rlimit_const(const char *n) {
+  static const char *const names[] = {
+    "RLIMIT_AS", "RLIMIT_CORE", "RLIMIT_CPU", "RLIMIT_DATA", "RLIMIT_FSIZE",
+    "RLIMIT_MEMLOCK", "RLIMIT_MSGQUEUE", "RLIMIT_NICE", "RLIMIT_NOFILE",
+    "RLIMIT_NPROC", "RLIMIT_NPTS", "RLIMIT_RSS", "RLIMIT_RTPRIO", "RLIMIT_RTTIME",
+    "RLIMIT_SBSIZE", "RLIMIT_SIGPENDING", "RLIMIT_STACK", NULL };
+  return n && str_in(n, names);
+}
+
 int is_builtin_class_name(const char *n) {
   const BuiltinClass *r = builtin_row(n);
   return r && (r->flags & BC_CLASS);
@@ -370,7 +381,7 @@ int const_path_misses_member(Compiler *c, int id) {
    the inference of a builtin's constant, which asks this: once at a time.) */
 int const_path_reaches_leaf_const(Compiler *c, int id) {
   if (nt_kind(c->nt, id) != NK_ConstantPathNode) return 1;
-  if (const_path_in_closed_builtin(c, id) || const_path_misses_toplevel(c, id)) return 0;
+  if (const_path_in_closed_builtin(c, id) || const_path_misses_toplevel(c, id) || const_path_is_private(c, id)) return 0;
   /* a read the record bound to one member's slot is that member's, though
      its scope be one only the run makes (a C extension's module) */
   if (const_leaf_bound(c, id)) return 1;
@@ -584,6 +595,7 @@ int const_node_class_index(Compiler *c, int id) {
     if (one >= 0) return one;
   }
   int k = const_node_class_index_tree(c, id);
+  if (const_path_builtin_other(c, id, k)) return -1;
   /* the record resolves the name to the builtin (Object holds no constant of
      the program's by it): only a top-level class of that name can be the
      program's reopening of it, not a nested one that shares its leaf
@@ -700,7 +712,22 @@ int const_seg_builtin(Compiler *c, int id) {
   char qn[256];
   snprintf(qn, sizeof qn, "%s::%s", pn, nm);
   if (builtin_const_name(qn)) return 1;
+  /* (Math's constants through a program class that includes Math: Calc::PI) */
+  if ((sp_streq(nm, "PI") || sp_streq(nm, "E")) && comp_const_path_on_math(c, par)) return 1;
   return builtin_const_name(pn) && infer_cext_builtin_constant(c, id);
+}
+/* Is class k, which constant path id finds by its leaf, another class than
+   the builtin the whole path spells: `T::WaitReadable` for `IO::WaitReadable`?
+   A reopening of the builtin (`class Enumerator::Chain`) is the builtin. */
+int const_path_builtin_other(Compiler *c, int id, int k) {
+  const NodeTable *nt = c->nt;
+  if (k < 0 || id < 0 || nt_kind(nt, id) != NK_ConstantPathNode) return 0;
+  int par = nt_ref(nt, id, "parent");
+  const char *pn = par >= 0 && nt_kind(nt, par) == NK_ConstantReadNode ? nt_str(nt, par, "name") : NULL;
+  const char *nm = nt_str(nt, id, "name"), *rn = class_ruby_name(c, k);
+  char qn[256];
+  return pn && nm && snprintf(qn, sizeof qn, "%s::%s", pn, nm) < (int)sizeof qn && builtin_core_class_slot(qn) >= 0 &&
+         !(rn && sp_streq(rn, qn));
 }
 /* Does the program define a class or module whose own name is `leaf`, nested
    in another (Frame::JSON::Encoding)? Inside it, `leaf::X` can name it. */
@@ -807,7 +834,7 @@ static int const_path_write_reaches(Compiler *c, int t, int k) {
   int qi = qn ? const_node_class_index(c, q) : -1;
   if (qi < 0) return 1;
   for (int a = k, d = 0; a >= 0 && a < c->nclasses && d < 64; a = c->classes[a].parent, d++)
-    if (comp_module_includes(c, a, qi, 0)) return 1;
+    if (comp_mixes_in(c, a, qi, 0)) return 1;
   return 0;
 }
 /* The constant writes by the key written (const_key_at), for the tree as
@@ -1025,6 +1052,84 @@ static int builtin_scope_lacks_member(Compiler *c, int seg) {
    constant, which a path through another class or module does not reach
    (CRuby's NameError since 2.5), where the leaf-keyed table answered it.
    A NAME written in any body, or through a path, is left to the table. */
+/* `P::NAME` where P is a class or module of the program and NAME is a
+   constant the nearest class of P's superclass chain that holds it makes
+   private (`private_constant :NAME` in its body, and no `public_constant`
+   of the name beside it): CRuby's NameError, "private constant K::NAME
+   referenced", K the class that holds it. The message is written to `msg`.
+   A lexical read (`NAME` in K's body) and const_get read such a constant;
+   only a read through a scope raises. The declaration is taken as made
+   wherever the read stands: a path read ahead of it in the program's run
+   raises too. */
+static int const_visibility_names(const NodeTable *nt, int call, const char *nm) {
+  int an = 0;
+  const int *av = call_args(nt, call, &an);
+  for (int i = 0; av && i < an; i++) {
+    NodeKind ak = nt_kind(nt, av[i]);
+    const char *s = ak == NK_SymbolNode ? nt_str(nt, av[i], "value") : ak == NK_StringNode ? nt_str(nt, av[i], "content") : NULL;
+    if (s && sp_streq(s, nm)) return 1;
+  }
+  return 0;
+}
+int const_path_private(Compiler *c, int id, char *msg, size_t msg_n) {
+  const NodeTable *nt = c->nt;
+  if (nt_kind(nt, id) != NK_ConstantPathNode || !c->node_cbody) return 0;
+  /* (a path that is `Object.const_get("P::A")` rewritten reads it) */
+  if (nt_int(nt, id, "const_get_read", 0)) return 0;
+  int par = nt_ref(nt, id, "parent");
+  NodeKind pk = par >= 0 ? nt_kind(nt, par) : NK_NilNode;
+  if (pk != NK_ConstantReadNode && pk != NK_ConstantPathNode) return 0;
+  const char *nm = nt_str(nt, id, "name");
+  if (!nm) return 0;
+  /* the program's private_constant calls, read once for a node table: most
+     programs have none, and a path read asks this each time it is emitted */
+  static const NodeTable *seen_nt;
+  static int ncalls, calls[256];
+  if (seen_nt != nt) {
+    seen_nt = nt; ncalls = 0;
+    NT_FOREACH_KIND(nt, NK_CallNode, cid) {
+      const char *cn = nt_str(nt, cid, "name");
+      if (cn && sp_streq(cn, "private_constant") && nt_ref(nt, cid, "receiver") < 0 && ncalls < 256) calls[ncalls++] = cid;
+    }
+  }
+  int named = 0;
+  for (int i = 0; i < ncalls && !named; i++) named = const_visibility_names(nt, calls[i], nm);
+  if (!named) return 0;
+  int ci = const_node_class_index(c, par);
+  for (int k = ci, d = 0; k >= 0 && k < c->nclasses && d < 64; k = c->classes[k].parent, d++) {
+    int priv = 0, pub = 0, holds = 0;
+    for (int i = 0; i < ncalls; i++)
+      if (calls[i] < c->node_cap && c->node_cbody[calls[i]] == k && const_visibility_names(nt, calls[i], nm)) priv = 1;
+    if (priv) {
+      NT_FOREACH_KIND(nt, NK_CallNode, cid) {
+        const char *cn = nt_str(nt, cid, "name");
+        if (cn && sp_streq(cn, "public_constant") && nt_ref(nt, cid, "receiver") < 0 && cid < c->node_cap &&
+            c->node_cbody[cid] == k && const_visibility_names(nt, cid, nm)) pub = 1;
+      }
+      if (!pub) {
+        snprintf(msg, msg_n, "private constant %s::%s referenced", class_ruby_name(c, k), nm);
+        return 1;
+      }
+      return 0;
+    }
+    /* a nearer class that holds the name answers the read with its own */
+    NT_FOREACH_KIND(nt, NK_ConstantWriteNode, wid) {
+      const char *wn = nt_str(nt, wid, "name");
+      if (wn && sp_streq(wn, nm) && wid < c->node_cap && c->node_cbody[wid] == k) holds = 1;
+    }
+    for (int x = 0; x < c->nclasses && !holds; x++) {
+      int dn = c->classes[x].def_node;
+      const char *xn = dn >= 0 ? nt_str(nt, nt_ref(nt, dn, "constant_path"), "name") : NULL;
+      if (xn && sp_streq(xn, nm) && dn < c->node_cap && c->node_cbody[dn] == k) holds = 1;
+    }
+    if (holds) return 0;
+  }
+  return 0;
+}
+int const_path_is_private(Compiler *c, int id) {
+  char msg[512];
+  return const_path_private(c, id, msg, sizeof msg);
+}
 int const_path_misses_toplevel(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
   if (nt_kind(nt, id) != NK_ConstantPathNode || !c->node_cbody) return 0;
@@ -1248,15 +1353,16 @@ const char *an_regex_lit_src(Compiler *c, int nid) {
   }
   return NULL;
 }
-/* The CallNodes of each name, ascending, rebuilt whenever the node table
-   changes (a rename or a new node bumps its version). Passes that asked "the
-   calls named m" walked every call per ask (rubys/roundhouse#72). A caller
-   must still check the node, which a re-point since the build may have
-   changed; the list only narrows the walk. */
+/* The CallNodes of each name, ascending, rebuilt whenever a node the index
+   holds may have changed its type or name (low_touched), and extended over
+   the nodes appended since otherwise. Passes that asked "the calls named m"
+   walked every call per ask (rubys/roundhouse#72). A caller must still check
+   the node, which a re-point since the build may have changed; the list
+   only narrows the walk. */
 static ANameHash g_cn_names;
 static int *g_cn_first, *g_cn_next, *g_cn_last, g_cn_cap;
 static const NodeTable *g_cn_nt;
-static unsigned g_cn_ver, g_cn_clones;
+static unsigned g_cn_ver;
 static int g_cn_cnt = -1;
 static int g_cn_empty = -1;
 /* call `id` onto its name's chain, at the end: the chains are ascending */
@@ -1281,20 +1387,24 @@ static void cn_add(const NodeTable *nt, int id) {
 int an_calls_named_first(Compiler *c, const char *name) {
   const NodeTable *nt = c->nt;
   if (!name) return -1;
-  if (g_cn_nt == nt && nt->count > g_cn_cnt && g_cn_ver != nt->version &&
-      nt->version - g_cn_ver == nt->clone_version - g_cn_clones) {
-    /* Only subtrees were cloned since the build, onto the end of the
-       table: the nodes indexed are as they were, and the clones' calls go
-       onto their chains. make_yield_proc_forms asks for the calls of each
-       yielding method's name and clones between the asks, and each ask
-       rebuilt the index over every call of the program (600k on a Rails
-       program, 85% of a sampled window). */
+  if (g_cn_nt == nt && nt->count >= g_cn_cnt && g_cn_ver != nt->version &&
+      nt->low_mark == g_cn_cnt && !nt->low_touched) {
+    /* No node the index holds changed its type or a string field since
+       the build: only nodes were appended (a clone, a new node and the
+       names set on it), so the indexed calls are as they were, and the new
+       calls go onto their chains. make_yield_proc_forms asks for the calls
+       of each yielding method's name and clones between the asks, and each
+       ask rebuilt the index over every call of the program (600k on a Rails
+       program, 85% of a sampled window); the rebound marks ask once per
+       method an include copies or a mixin statement appends
+       (ie_rebound_marks). */
     int *grown = realloc(g_cn_next, sizeof(int) * (size_t)nt->count);
     if (!grown) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
     g_cn_next = grown;
     for (int id = g_cn_cnt; id < nt->count; id++)
       if (nt_kind(nt, id) == NK_CallNode) cn_add(nt, id);
-    g_cn_ver = nt->version; g_cn_clones = nt->clone_version; g_cn_cnt = nt->count;
+    g_cn_ver = nt->version; g_cn_cnt = nt->count;
+    nt_low_watch((NodeTable *)nt);
   }
   if (g_cn_nt != nt || g_cn_ver != nt->version || g_cn_cnt != nt->count) {
     anh_free(&g_cn_names); memset(&g_cn_names, 0, sizeof g_cn_names);
@@ -1305,12 +1415,41 @@ int an_calls_named_first(Compiler *c, const char *name) {
     g_cn_next = malloc(sizeof(int) * (size_t)(nt->count > 0 ? nt->count : 1));
     if (!g_cn_first || !g_cn_next || !g_cn_last) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
     for (int id = comp_kind_first(c, NK_CallNode); id >= 0; id = comp_kind_next(c, id)) cn_add(nt, id);
-    g_cn_nt = nt; g_cn_ver = nt->version; g_cn_clones = nt->clone_version; g_cn_cnt = nt->count;
+    g_cn_nt = nt; g_cn_ver = nt->version; g_cn_cnt = nt->count;
+    nt_low_watch((NodeTable *)nt);
   }
   int k = anh_find(&g_cn_names, name);
   return k >= 0 ? g_cn_first[k] : -1;
 }
 int an_calls_named_next(int id) { return (id >= 0 && id < g_cn_cnt) ? g_cn_next[id] : -1; }
+/* A Symbol or String argument's text, or NULL. */
+const char *an_literal_name(const NodeTable *nt, int node) {
+  NodeKind k = node >= 0 ? nt_kind(nt, node) : NK_NONE;
+  if (k != NK_SymbolNode && k != NK_StringNode) return NULL;
+  const char *v = nt_str(nt, node, "value");
+  return v ? v : nt_str(nt, node, "unescaped");
+}
+/* Does the program alias method `a` or `b` (NULL for none): an `alias` or an `alias_method` whose old name is one of
+   them, or is no literal name (it may be)? The copy an alias makes keeps the method it found. */
+int an_aliases_name(Compiler *c, const char *a, const char *b) {
+  const NodeTable *nt = c->nt;
+  NT_FOREACH_KIND(nt, NK_AliasMethodNode, id) {
+    const char *o = an_literal_name(nt, nt_ref(nt, id, "old_name"));
+    if (!o || sp_streq(o, a) || (b && sp_streq(o, b))) return 1;
+  }
+  for (int id = an_calls_named_first(c, "alias_method"); id >= 0; id = an_calls_named_next(id)) {
+    int args = nt_ref(nt, id, "arguments"), n = 0;
+    const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &n) : NULL;
+    const char *o = n >= 2 ? an_literal_name(nt, av[1]) : NULL;
+    if (!o || sp_streq(o, a) || (b && sp_streq(o, b))) return 1;
+  }
+  return 0;
+}
+int an_name_reached(Compiler *c, const char *name, int except) {
+  for (int id = an_calls_named_first(c, name); id >= 0; id = an_calls_named_next(id))
+    if (an_written_call(id)) return 1;
+  return elab_name_spelled(c, name, except, 1);
+}
 
 /* Interposes a call named `name` (with arguments args, -1 for none) between
    call id and its receiver (`r.m` becomes `r.name.m`): a desugar's
@@ -4640,9 +4779,12 @@ static int bp_method(Compiler *c, int mi, int *cut) {
   int memo = infer_memo_usable(), own = 0;
   unsigned long ed = infer_memo_edits(c);
   if (memo && m->bp_edits == ed + 1) return m->bp_bits;
-  for (int s = 0; m->is_proc_form && s < c->nscopes; s++)
-    if (!c->scopes[s].is_proc_form && c->scopes[s].def_node == m->def_node && c->scopes[s].class_id == m->class_id &&
-        c->scopes[s].is_cmethod == m->is_cmethod) return bp_method(c, s, cut);
+  /* A proc form takes its block as a proc its caller (a dispatch arm, a
+     Method) hands it, NULL where that call gave no block: either may come,
+     whatever the calls of the method it clones give. Answered from those
+     calls, a clone only ever called blockless there took its forwarded
+     block for absent, and its body's block arm was emitted into the
+     blockless arm's slot (an Array into an Enumerator). */
   if (!m->name || m->is_proc_form) return BP_ANY;
   for (int i = 0; i < g_yvt_depth; i++)
     if (g_yvt_mi[i] == mi) { if (cut) *cut = 1; return BP_ANY; }
@@ -5476,7 +5618,7 @@ static int method_obj_lookup(Compiler *c, int node, int *cls, int *sg) {
   if (node >= 0 && nt_kind(nt, node) == NK_CallNode && is_super_method_name(nt_str(nt, node, "name"))) {
     int imn = method_recv_node(c, nt_ref(nt, node, "receiver"));
     int mi = imn >= 0 ? method_obj_lookup(c, imn, NULL, NULL) : -1;
-    return mi >= 0 ? cplan_super_target(c, -1, &c->scopes[mi], NULL) : -1;
+    return mi >= 0 ? cplan_super_method_target(c, mi) : -1;
   }
   const char *sym = method_sym_arg(c, node);
   if (!sym) return -1;
@@ -5753,6 +5895,46 @@ static int method_nodes_same_target(Compiler *c, int a, int b) {
   return ta >= 0 && ta == method_obj_target_mi(c, b);
 }
 
+/* Does the local `vn` of scope `sc` take a value that no plain write of it
+   states: a parameter's argument, the target of a multiple assignment, a
+   `for`, a `rescue =>` or a pattern, or an operator write (`m &&= other`)?
+   What it holds then no write names. The scope's own writes of the name
+   are read from their index (comp_lvw_first_sc): a walk of the program's
+   targets for each Method local grew with the two multiplied. */
+int subtree_reads_local(const NodeTable *nt, int id, const char *name);
+
+/* Is parameter `vn` of scope `sc` written before anything reads it: by a
+   plain write that is a statement of the body itself, with no read of the
+   name in a default, in a statement before it or in its own value
+   (`def probe(m); m = obj.method(:f); ...`)? Its argument then reaches no
+   read, and the writes say what the local holds. */
+static int param_written_before_read(Compiler *c, Scope *sc, const char *vn) {
+  const NodeTable *nt = c->nt;
+  int body = sc->def_node >= 0 ? nt_ref(nt, sc->def_node, "body") : -1, n = 0;
+  if (body < 0 || nt_kind(nt, body) != NK_StatementsNode ||
+      subtree_reads_local(nt, nt_ref(nt, sc->def_node, "parameters"), vn)) return 0;
+  const int *st = nt_arr(nt, body, "body", &n);
+  for (int i = 0; i < n; i++) {
+    const char *wn = nt_kind(nt, st[i]) == NK_LocalVariableWriteNode ? nt_str(nt, st[i], "name") : NULL;
+    if (wn && sp_streq(wn, vn)) return !subtree_reads_local(nt, nt_ref(nt, st[i], "value"), vn);
+    if (subtree_reads_local(nt, st[i], vn)) return 0;
+  }
+  return 0;
+}
+
+int local_takes_unwritten_value(Compiler *c, Scope *sc, const char *vn) {
+  const NodeTable *nt = c->nt;
+  if (!sc || !vn) return 0;
+  for (int i = 0; i < sc->nparams; i++)
+    if (sc->pnames[i] && sp_streq(sc->pnames[i], vn) && !param_written_before_read(c, sc, vn)) return 1;
+  int si = (int)(sc - c->scopes);
+  for (int w = comp_lvw_first_sc(c, si, vn); w >= 0; w = comp_lvw_next_sc(c, w)) {
+    const char *wn = nt_str(nt, w, "name");
+    if (nt_kind(nt, w) != NK_LocalVariableWriteNode && wn && sp_streq(wn, vn) && comp_scope_of(c, w) == sc) return 1;
+  }
+  return !c->lvws_built;   /* (no index: nothing says the local has no such write) */
+}
+
 /* The `method(:sym)` node a Method-typed expression resolves to: either the
    call itself (inline) or, for a local variable, its assignment in scope. */
 int method_recv_node(Compiler *c, int recv) {
@@ -5811,6 +5993,11 @@ int method_recv_node(Compiler *c, int recv) {
       if (found < 0) found = inner;
       else if (inner != found && !method_nodes_same_target(c, found, inner)) return -1;
     }
+    /* ... and no other value may reach the local: `spare, m = 0, other`,
+       `m &&= other` or a parameter's argument put another Method behind
+       the one node's signature, whose call handed a boxed argument to an
+       Integer parameter unchecked and unconverted */
+    if (found >= 0 && local_takes_unwritten_value(c, sc, vn)) return -1;
     return found;
   }
   return -1;
@@ -6030,12 +6217,45 @@ int method_call_param_shift(Compiler *c, int mn, int mi) {
   return (m->class_id < 0 && !m->is_cmethod && m->nparams > 0 && m->pnames) ? 1 : 0;
 }
 
-/* True when scope `scope_idx` contains an explicit `return`, which needs
-   a return funnel when the method is inlined at its call sites. */
-int scope_has_return(Compiler *c, int scope_idx) {
+static int scope_has_return_scan(Compiler *c, int scope_idx) {
   NT_FOREACH_KIND(c->nt, NK_ReturnNode, id)
     if (c->nscope[id] == scope_idx) return 1;
   return 0;
+}
+
+/* True when scope `scope_idx` contains an explicit `return`, which needs
+   a return funnel when the method is inlined at its call sites. */
+int scope_has_return(Compiler *c, int scope_idx) {
+  if (scope_idx < 0 || scope_idx >= c->nscopes || !comp_scope_index_is_frozen())
+    return scope_has_return_scan(c, scope_idx);
+  unsigned kgen = nt_kind_gen(c->nt, NK_ReturnNode);
+  unsigned sgen = comp_scope_index_gen();
+  if (!c->scope_ret_built || c->scope_ret_kgen != kgen ||
+      c->scope_ret_nscopes != c->nscopes || c->scope_ret_sgen != sgen) {
+    int ns = c->nscopes;
+    unsigned char *has = (unsigned char *)calloc((size_t)(ns > 0 ? ns : 1), 1);
+    if (!has) return scope_has_return_scan(c, scope_idx);
+    NT_FOREACH_KIND(c->nt, NK_ReturnNode, id) {
+      int si = c->nscope[id];
+      if (si >= 0 && si < ns) has[si] = 1;
+    }
+    free(c->scope_ret_has);
+    c->scope_ret_has = has;
+    c->scope_ret_nscopes = ns;
+    c->scope_ret_kgen = kgen;
+    c->scope_ret_sgen = sgen;
+    c->scope_ret_built = 1;
+  }
+  int ans = c->scope_ret_has[scope_idx] ? 1 : 0;
+  if (comp_cache_check_on()) {
+    int ref = scope_has_return_scan(c, scope_idx);
+    if (ans != ref) {
+      fprintf(stderr, "spinel-cache-check: scope_has_return mismatch for scope %d: cached=%d scan=%d\n",
+              scope_idx, ans, ref);
+      abort();
+    }
+  }
+  return ans;
 }
 
 /* Resolve a block-bearing CallNode to an INLINE-ABLE yielding user method:
@@ -7072,22 +7292,29 @@ int loop_may_stop(Compiler *c, int loop_call) {
 }
 
 /* See analyze_internal.h. */
-int respond_to_cells_shape(const NodeTable *nt, int id) {
+int respond_to_literal_shape(const NodeTable *nt, int id) {
   int ac = 0;
   const int *av = nt_kind(nt, id) == NK_CallNode && is_respond_to_name(nt_str(nt, id, "name")) &&
                   nt_ref(nt, id, "block") < 0 ? call_args(nt, id, &ac) : NULL;
-  int recv = av ? nt_ref(nt, id, "receiver") : -1;
-  NodeKind rk = recv >= 0 ? nt_kind(nt, recv) : NK_SelfNode, ak = ac == 2 ? nt_kind(nt, av[1]) : NK_FalseNode;
-  return av && (ac == 1 || ac == 2) && nt_kind(nt, av[0]) == NK_SymbolNode && (ak == NK_TrueNode || ak == NK_FalseNode) &&
-         (rk == NK_SelfNode || rk == NK_ConstantReadNode || rk == NK_ConstantPathNode);
+  NodeKind ak = ac == 2 ? nt_kind(nt, av[1]) : NK_FalseNode;
+  return av && (ac == 1 || ac == 2) && nt_kind(nt, av[0]) == NK_SymbolNode && (ak == NK_TrueNode || ak == NK_FalseNode);
+}
+/* See analyze_internal.h. */
+int respond_to_cells_shape(const NodeTable *nt, int id) {
+  int recv = respond_to_literal_shape(nt, id) ? nt_ref(nt, id, "receiver") : -2;
+  NodeKind rk = recv >= 0 ? nt_kind(nt, recv) : recv == -1 ? NK_SelfNode : NK_NONE;
+  return rk == NK_SelfNode || rk == NK_ConstantReadNode || rk == NK_ConstantPathNode;
 }
 /* See analyze_internal.h. */
 int list_cells_shape(const NodeTable *nt, int id) {
   int ac = 0, recv = nt_kind(nt, id) == NK_CallNode ? nt_ref(nt, id, "receiver") : -1;
-  if (recv < 0 || !is_singleton_method_list(nt_str(nt, id, "name")) || nt_ref(nt, id, "block") >= 0) return 0;
+  const char *nm = recv >= 0 ? nt_str(nt, id, "name") : NULL;
+  int side = !nm ? 0 : is_singleton_method_list(nm) ? 1 : is_instance_method_list(nm) ? 2 : 0;
+  if (!side || nt_ref(nt, id, "block") >= 0) return 0;
   const int *av = call_args(nt, id, &ac);
   NodeKind rk = nt_kind(nt, recv), ak = ac == 1 ? nt_kind(nt, av[0]) : NK_TrueNode;
-  return ac <= 1 && (rk == NK_ConstantReadNode || rk == NK_ConstantPathNode) && (ak == NK_TrueNode || ak == NK_FalseNode);
+  /* (an instance-method list folds only in its `(false)` form, emit_class_own_instance_methods) */
+  return ac <= 1 && (rk == NK_ConstantReadNode || rk == NK_ConstantPathNode) && (ak == NK_FalseNode || (side == 1 && ak == NK_TrueNode)) ? side : 0;
 }
 /* See analyze_internal.h. */
 int capture_cells_shape(const NodeTable *nt, int id) {
@@ -7100,7 +7327,18 @@ int capture_cells_shape(const NodeTable *nt, int id) {
          (rk == NK_SelfNode || rk == NK_ConstantReadNode || rk == NK_ConstantPathNode);
 }
 /* See analyze_internal.h. */
-int respond_to_missing_defined(Compiler *c) { return !an_name_binder_free(c, "respond_to_missing?"); }
+int respond_to_missing_defined(Compiler *c) {
+  /* (asked once for each state of the tree and the tables: a presence reader asks it for each class it may hold) */
+  const NodeTable *nt = c->nt;
+  unsigned tgen = comp_table_gen, shape = comp_class_shape_gen();
+  if (!c->rtm_memo.ans || c->rtm_memo.count != nt->count || c->rtm_memo.version != nt->version || c->rtm_memo.edits != nt->edits ||
+      c->rtm_memo.tgen != tgen || c->rtm_memo.shape != shape || c->rtm_memo.ncls != c->nclasses) {
+    int ans = 1 + !an_name_binder_free(c, "respond_to_missing?");
+    c->rtm_memo.ans = ans; c->rtm_memo.count = nt->count; c->rtm_memo.ncls = c->nclasses; c->rtm_memo.version = nt->version;
+    c->rtm_memo.tgen = tgen; c->rtm_memo.shape = shape; c->rtm_memo.edits = nt->edits;
+  }
+  return c->rtm_memo.ans == 2;
+}
 /* Do def's parameters hold `...` (a ForwardingParameterNode as keyword_rest)? */
 int def_takes_forwarding(const NodeTable *nt, int def) {
   int pn = def >= 0 && nt_kind(nt, def) == NK_DefNode ? nt_ref(nt, def, "parameters") : -1;
@@ -7145,8 +7383,8 @@ static int ext_param_ty_checked(TyKind t) {
 }
 
 /* Whether the list names a definition of that leaf name: as written
-   (`Sub`), or as the last name of a path (`ExtSub::Sub`); `all` names
-   every one. The loose test, for a definition the class table does not
+   (`Sub`), or as the last name of a path (`ExtSub::Sub`, `::Sub`); `all`
+   names every one. The loose test, for a definition the class table does not
    hold yet (ext_listed_descendant); a class of the table is asked by
    ext_class_listed. */
 static int ext_name_listed(const char *name) {
@@ -7157,7 +7395,7 @@ static int ext_name_listed(const char *name) {
     const char *e = strchr(p, ',');
     size_t len = e ? (size_t)(e - p) : strlen(p);
     if (len == n && !strncmp(p, name, n)) return 1;
-    if (len > n + 2 && !strncmp(p + len - n, name, n) && p[len - n - 1] == ':' && p[len - n - 2] == ':') return 1;
+    if (len >= n + 2 && !strncmp(p + len - n, name, n) && p[len - n - 1] == ':' && p[len - n - 2] == ':') return 1;
     if (!e) break;
     p = e + 1;
   }
@@ -7293,7 +7531,12 @@ static int ext_method_shape(Compiler *c, int class_id, int si) {
   if (si <= 0 || si >= c->nscopes || class_id < 0 || class_id >= c->nclasses) return 0;
   Scope *sc = &c->scopes[si];
   if (!sc->name || sc->class_id < 0 || is_initialize_name(sc->name)) return 0;
-  if (sc->replaced || sc->entry != ENTRY_NONE) return 0;
+  /* a hidden copy (a prepend's or an include's behind its version cell,
+     Scope.shadow) is answered through the entry of its name, the guard
+     the table answers by that name (ENTRY_TABLE) or an open history's
+     (ENTRY_NAMED), which is the row (#12224): the copy's own name is the
+     compiler's. A dispatch entry (ENTRY_DISPATCH) answers no name. */
+  if (sc->replaced || sc->shadow || sc->entry == ENTRY_DISPATCH) return 0;
   /* a forwarder stands for the method it calls: that method is public,
      and the class answers the one the forwarder was written beside. A
      forwarder of `new` names its class in the call: the class answers the
@@ -7404,6 +7647,99 @@ static int ext_listed_descendant(Compiler *c, const char *name) {
 int ext_class_def_wanted(Compiler *c, const char *key) {
   if (!g_ext_classes || !*g_ext_classes || !key) return 0;
   return ext_name_listed(key) || ext_listed_descendant(c, key);
+}
+
+/* The module definitions one question of ext_mixin_def_wanted has reached:
+   each one is followed once, so a ring of includes ends. */
+typedef struct { int *defs; int n, cap; } ExtMixinSeen;
+
+/* The definition d takes a module the question follows. Answers 1 when d
+   is a definition a table can hold. A module that is not one joins the
+   definitions to follow. */
+static int ext_mixin_taken_by(Compiler *c, ExtMixinSeen *seen, int d) {
+  const char *key = class_def_key(c, d);
+  if (key && ext_class_def_wanted(c, key)) return 1;
+  if (nt_kind(c->nt, d) != NK_ModuleNode) return 0;
+  for (int i = 0; i < seen->n; i++) if (seen->defs[i] == d) return 0;
+  if (seen->n == seen->cap) {
+    seen->cap = seen->cap ? seen->cap * 2 : 8;
+    seen->defs = realloc(seen->defs, sizeof(int) * (size_t)seen->cap);
+  }
+  seen->defs[seen->n++] = d;
+  return 0;
+}
+
+/* The statements of one body: owner is the class or module definition of
+   the body, or -1 for the top level of a file. `include M` and `prepend M`
+   of the leaf name mix the module into the owner. With a constant as the
+   receiver (`C.include(M)`), they mix it into the definitions of that leaf
+   name. Answers 1 when one of them is a definition a table can hold. */
+static int ext_mixin_in_body(Compiler *c, ExtMixinSeen *seen, int body, int owner, const char *leaf) {
+  const NodeTable *nt = c->nt;
+  if (body < 0 || nt_kind(nt, body) != NK_StatementsNode) return 0;
+  int n = 0;
+  const int *st = nt_arr(nt, body, "body", &n);
+  for (int k = 0; k < n; k++) {
+    if (nt_kind(nt, st[k]) != NK_CallNode) continue;
+    const char *nm = nt_str(nt, st[k], "name");
+    if (!nm || (!sp_streq(nm, "include") && !sp_streq(nm, "prepend"))) continue;
+    int args = nt_ref(nt, st[k], "arguments"), na = 0, mixes = 0;
+    const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &na) : NULL;
+    for (int a = 0; a < na && !mixes; a++) {
+      const char *al = ext_const_leaf(nt, av[a]);
+      mixes = al && sp_streq(al, leaf);
+    }
+    if (!mixes) continue;
+    int recv = nt_ref(nt, st[k], "receiver");
+    if (recv < 0) {
+      if (owner >= 0 && ext_mixin_taken_by(c, seen, owner)) return 1;
+      continue;
+    }
+    const char *rl = ext_const_leaf(nt, recv);
+    if (!rl) continue;
+    static const NodeKind kinds[] = { NK_ClassNode, NK_ModuleNode };
+    for (int w = 0; w < 2; w++) {
+      int found = 0;
+      NT_FOREACH_KIND(nt, kinds[w], e) {
+        const char *el = found ? NULL : ext_const_leaf(nt, class_def_path(nt, e));
+        if (el && sp_streq(el, rl)) found = ext_mixin_taken_by(c, seen, e);
+      }
+      if (found) return 1;
+    }
+  }
+  return 0;
+}
+
+/* Whether the module definition def is mixed into a definition a table can
+   hold: a definition that is wanted itself (ext_class_def_wanted), or a
+   module mixed into one in turn. The mix is an `include M` or a
+   `prepend M` of the leaf name of the module, as a statement of a class
+   body, of a module body or of the top level of a file. The table of the
+   class holds the methods of the module, so its defs get their forwarders
+   too. By the names the source writes, as ext_listed_descendant reads
+   them: two modules of one leaf name are not told apart, and the answer
+   is then yes for both. */
+int ext_mixin_def_wanted(Compiler *c, int def) {
+  const NodeTable *nt = c->nt;
+  if (!g_ext_classes || !*g_ext_classes || def < 0 || nt_kind(nt, def) != NK_ModuleNode) return 0;
+  ExtMixinSeen seen = { 0 };
+  int found = 0;
+  if (ext_mixin_taken_by(c, &seen, def)) return 1;   /* wanted itself */
+  for (int i = 0; i < seen.n && !found; i++) {
+    const char *leaf = ext_const_leaf(nt, class_def_path(nt, seen.defs[i]));
+    if (!leaf) continue;
+    static const NodeKind kinds[] = { NK_ClassNode, NK_ModuleNode };
+    for (int w = 0; w < 2 && !found; w++) {
+      NT_FOREACH_KIND(nt, kinds[w], d) {
+        if (!found) found = ext_mixin_in_body(c, &seen, class_def_body(nt, d), d, leaf);
+      }
+    }
+    NT_FOREACH_KIND(nt, NK_ProgramNode, pg) {
+      if (!found) found = ext_mixin_in_body(c, &seen, nt_ref(nt, pg, "statements"), -1, leaf);
+    }
+  }
+  free(seen.defs);
+  return found;
 }
 
 /* A forwarder of desugar_ext_forwarders is named

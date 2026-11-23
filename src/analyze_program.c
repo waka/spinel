@@ -98,14 +98,24 @@ int prog_load_deferred(const Compiler *c, int f) {
    that LoadNode (state: 0 unknown, 1 being decided, 2 not deferred, 3
    deferred). A file in a cycle of requires, or run by no require, has no
    proof that it runs: deferred. */
+/* The graph file whose tree holds node, or -1. Not the node's node_file
+   itself: that is the #line table's id (879be11b4), which runs past the
+   graph's files once the table holds more names than the graph has files. */
+static int prog_graph_file_of(const NodeTable *nt, int node) {
+  long long fid = nt_int(nt, node, "node_file", -1);
+  for (int f = 0; fid >= 0 && f < nt_nroots(nt); f++)
+    if (nt_int(nt, nt_root(nt, f), "node_file", -2) == fid) return f;
+  return -1;
+}
 static int prog_stamp_deferred(Compiler *c, int f, unsigned char *state) {
   NodeTable *nt = (NodeTable *)c->nt;
-  if (f <= 0) return 0;
+  if (f < 0) return 1;   /* a LoadNode no graph file holds: no proof it runs */
+  if (f == 0) return 0;
   if (state[f] == 1) return 1;
   if (state[f]) return state[f] == 3;
   state[f] = 1;
   int by = prog_load_by(c, f), d = 1;
-  if (by >= 0) d = nt_int(nt, by, "req_deferred", 0) || prog_stamp_deferred(c, (int)nt_int(nt, by, "node_file", 0), state);
+  if (by >= 0) d = nt_int(nt, by, "req_deferred", 0) || prog_stamp_deferred(c, prog_graph_file_of(nt, by), state);
   state[f] = d ? 3 : 2;
   if (d) nt_node_set_int(nt, nt_root(nt, f), "load_deferred", 1);
   return d;
@@ -147,6 +157,14 @@ int prog_load_cand(const NodeTable *nt, int load, int k) {
 }
 int prog_load_open(const NodeTable *nt, int load) {
   return is_load_how_set(nt_str(nt, load, "how")) && nt_int(nt, load, "open", 0);
+}
+/* Is the set of files load may name one file for each word of the `each`
+   or `each_with_index` block over a literal Array of Strings it stands in
+   directly (`%w(a b).each { |f| ... }`), every
+   word naming one (the parse's per_word)? Not a set a path pattern names,
+   whose words are not known. */
+int prog_load_per_word(const NodeTable *nt, int load) {
+  return is_load_how_set(nt_str(nt, load, "how")) && nt_int(nt, load, "per_word", 0);
 }
 /* Does rescue clause `rescue` run, as prog_note_rescues found from the
    requires its begin's body runs: 1 whenever the begin completes, 0 never,
@@ -880,20 +898,44 @@ void prog_refuse_loads(Compiler *c) {
      a class body, an iterator's block, an assignment's value), is placed at
      that require: `load_by` the LoadNode, `load_stmt` the top-level
      statement holding it. The record enters it there, with the require's
-     may, as the inline model splices it. Any other file keeps a region of
-     its own.
+     may, as the inline model splices it. So is one whose other requires
+     are each a top-level `require` statement of the order that runs after
+     the statement holding that one, which surely runs (ELAB_SITE_SURE):
+     the file is loaded by then, and those requires load nothing (a file
+     a class body requires that a later top-level statement requires
+     again). Any other file keeps a region of its own.
    Asked after the folds, ahead of the readers of the program's order. */
-typedef struct { Compiler *c; int stmt, n, open; int *nsite, *site, *at; unsigned char *ok; } ProgSites;
+typedef struct {
+  Compiler *c; int stmt, n, open; int *nsite, *site, *at; unsigned char *ok;
+  /* the requires that are no top-level `require` statement (nest), and the ones that are (top: file, LoadNode) */
+  int *nnest, *nest_site, *nest_at; unsigned char *nest_sure, *spoil;
+  int *top_file, *top_load, ntop, captop;
+} ProgSites;
 static void prog_site_note(void *ud, int load, int in_place) {
   ProgSites *q = ud;
-  for (int k = 0; k < prog_load_ncand(q->c->nt, load); k++) {   /* a set's files: no one site places them */
-    int t = prog_load_cand(q->c->nt, load, k);
-    if (t > 0 && t < q->n) { q->nsite[t]++; q->ok[t] = 0; }
+  const NodeTable *nt = q->c->nt;
+  for (int k = 0; k < prog_load_ncand(nt, load); k++) {   /* a set's files: no one site places them */
+    int t = prog_load_cand(nt, load, k);
+    if (t > 0 && t < q->n) { q->nsite[t]++; q->ok[t] = 0; q->spoil[t] = 1; }
   }
-  q->open |= prog_load_open(q->c->nt, load);
-  int t = (int)nt_int(q->c->nt, load, "target_file", -1);
+  q->open |= prog_load_open(nt, load);
+  int t = (int)nt_int(nt, load, "target_file", -1);
   if (t <= 0 || t >= q->n) return;
-  q->nsite[t]++; q->site[t] = load; q->at[t] = q->stmt; q->ok[t] = (unsigned char)(in_place);
+  q->nsite[t]++; q->site[t] = load; q->at[t] = q->stmt; q->ok[t] = (unsigned char)(in_place & 1);
+  /* (not a `load`, which runs its file again) */
+  const char *m = nt_str(nt, load, "method");
+  if (load == q->stmt && m && (sp_streq(m, "require") || sp_streq(m, "require_relative"))) {
+    if (q->ntop == q->captop) {
+      q->captop = q->captop ? q->captop * 2 : 8;
+      q->top_file = realloc(q->top_file, sizeof(int) * (size_t)q->captop);
+      q->top_load = realloc(q->top_load, sizeof(int) * (size_t)q->captop);
+      if (!q->top_file || !q->top_load) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    }
+    q->top_file[q->ntop] = t; q->top_load[q->ntop++] = load;
+    return;
+  }
+  q->nnest[t]++; q->nest_site[t] = load; q->nest_at[t] = q->stmt;
+  q->nest_sure[t] = (unsigned char)((in_place & 1) && (in_place & ELAB_SITE_SURE));
 }
 /* The top-level statement of a file that holds node id, or -1. */
 static int prog_top_stmt_of(const Compiler *c, const int *parent, int id) {
@@ -951,7 +993,7 @@ static int prog_may_give_hook(const Compiler *c) {
    x.foo` with x an Integer) raises a TypeError, which is not told apart.
    A write of a global CRuby checks or refuses (is_checked_gvar_name) may
    raise, so it is not quiet. */
-static int prog_stmt_quiet(const NodeTable *nt, int st) {
+int prog_stmt_quiet(const NodeTable *nt, int st) {
   switch (nt_kind(nt, st)) {
     case NK_DefNode: case NK_IntegerNode: case NK_FloatNode: case NK_StringNode: case NK_SymbolNode:
     case NK_NilNode: case NK_TrueNode: case NK_FalseNode: case NK_SelfNode: return 1;
@@ -1494,7 +1536,10 @@ void prog_settle_files(Compiler *c) {
   prog_reach(c, seen, live);
   prog_warn_missing(c, seen);
   if (n < 2) { free(seen); free(live); free(ok); free(nsite); free(site); free(at); return; }
-  ProgSites q = { c, -1, n, 0, nsite, site, at, ok };
+  int *nnest = calloc((size_t)n, sizeof(int)), *nest_site = calloc((size_t)n, sizeof(int)), *nest_at = calloc((size_t)n, sizeof(int));
+  unsigned char *nest_sure = calloc((size_t)n, 1), *spoil = calloc((size_t)n, 1);
+  if (!nnest || !nest_site || !nest_at || !nest_sure || !spoil) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  ProgSites q = { c, -1, n, 0, nsite, site, at, ok, nnest, nest_site, nest_at, nest_sure, spoil, NULL, NULL, 0, 0 };
   for (int f = 0; f < n; f++) {
     int st = prog_root_stmts(c, f), m = 0;
     const int *v = st >= 0 && live[f] ? nt_arr(nt, st, "body", &m) : NULL;
@@ -1502,10 +1547,17 @@ void prog_settle_files(Compiler *c) {
   }
   for (int k = 0; k < c->nautoloads; k++) {
     const AutoloadRegistration *a = &c->autoloads[k];
-    if (seen[a->node] && a->file > 0 && a->file < n) { nsite[a->file]++; ok[a->file] = 0; }
+    if (seen[a->node] && a->file > 0 && a->file < n) { nsite[a->file]++; ok[a->file] = 0; spoil[a->file] = 1; }
   }
   if (q.open) memset(ok, 0, (size_t)n);   /* an open require may run any file first */
   prog_unplace_candidates(c, seen, live);
+  int sn = 0, *seq = q.ntop ? prog_top_seq(c, &sn, NULL) : NULL, *pos = NULL;
+  if (seq) {
+    pos = malloc(sizeof(int) * ((size_t)nt->count + 1));
+    if (!pos) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int i = 0; i < nt->count; i++) pos[i] = -1;
+    for (int k = 0; k < sn; k++) pos[seq[k]] = k;
+  }
   for (int f = 1; f < n; f++) {
     int st = live[f] ? -1 : prog_root_stmts(c, f);
     if (st >= 0) { nt_node_set_arr(nt, st, "body", NULL, 0); nt_node_set_int(nt, nt_root(nt, f), "file_dropped", 1); }
@@ -1513,7 +1565,19 @@ void prog_settle_files(Compiler *c) {
       nt_node_set_int(nt, nt_root(nt, f), "load_by", site[f]);
       nt_node_set_int(nt, nt_root(nt, f), "load_stmt", at[f]);
     }
+    else if (live[f] && pos && prog_load_by(c, f) < 0 && !q.open && !spoil[f] && nnest[f] == 1 && nest_sure[f] &&
+             pos[nest_at[f]] >= 0) {
+      int after = 1;
+      for (int k = 0; k < q.ntop && after; k++)
+        if (q.top_file[k] == f) after = pos[q.top_load[k]] > pos[nest_at[f]];
+      if (after) {
+        nt_node_set_int(nt, nt_root(nt, f), "load_by", nest_site[f]);
+        nt_node_set_int(nt, nt_root(nt, f), "load_stmt", nest_at[f]);
+      }
+    }
   }
+  free(seq); free(pos);
+  free(nnest); free(nest_site); free(nest_at); free(nest_sure); free(spoil); free(q.top_file); free(q.top_load);
   unsigned char *state = calloc((size_t)n, 1);
   if (!state) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   for (int f = 1; f < n; f++) prog_stamp_deferred(c, f, state);

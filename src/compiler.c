@@ -515,6 +515,15 @@ void comp_grow_node_arrays(Compiler *c) {
   c->node_cap = n;
 }
 
+int comp_cache_check_on(void) {
+  static int on = -1;
+  if (on < 0) {
+    const char *e = getenv("SPINEL_CACHE_CHECK");
+    on = (e && e[0] && !sp_streq(e, "0")) ? 1 : 0;
+  }
+  return on;
+}
+
 void comp_free(Compiler *c) {
   if (!c) return;
   mtab_report(c);   /* (--method-table-check: the end of the program) */
@@ -529,7 +538,6 @@ void comp_free(Compiler *c) {
   for (int i = 0; i < c->n_cext_classes; i++) free(c->cext_classes[i].path);
   free(c->cext_classes);
   share_facts_free(c);
-  share_plan_free(c);
   dsn_free(c);
   order_facts_free(c);
   free(c->ie_map.cls); free(c->ie_map.nonobj); free(c->ie_map.own); free(c->ie_map.pending);
@@ -576,6 +584,7 @@ void comp_free(Compiler *c) {
   free(c->splat_views); c->splat_views = NULL; c->nsplat_views = 0;
   for (int i = 0; i < c->nver_entries; i++) free(c->ver_entries[i].name);
   free(c->ver_entries); c->ver_entries = NULL; c->nver_entries = 0;
+  free(c->ver_scope_face); c->ver_scope_face = NULL; c->ver_scope_face_n = c->ver_scope_face_ns = 0;
   ver_memo_drop(c);
   for (int i = 0; i < c->nver_late; i++) free(c->ver_late[i].name);
   free(c->ver_late); c->ver_late = NULL; c->nver_late = 0;
@@ -599,10 +608,10 @@ void comp_free(Compiler *c) {
   free(c->ver_vis_call_cell); c->ver_vis_call_cell = NULL; c->ver_vis_call_cap = 0;
   free(c->ver_vis_scope_mark); c->ver_vis_scope_mark = NULL; c->ver_vis_scope_cap = 0;
   free(c->ver_vis_hist_seen); c->ver_vis_hist_seen = NULL; c->ver_vis_hist_cap = 0; c->ver_vis_guard_stamp = 0;
-  for (int i = 0; i < c->nrbp_slots; i++) free(c->rbp_slot_names[i]);
-  free(c->rbp_slot_names); free(c->rbp_slot_lens); c->rbp_slot_names = NULL; c->rbp_slot_lens = NULL; c->nrbp_slots = 0;
+  for (int i = 0; i < c->nrbp_slots; i++) { free(c->rbp_slot_names[i]); free(c->rbp_slot_written[i]); }
+  free(c->rbp_slot_names); free(c->rbp_slot_written); c->rbp_slot_names = NULL; c->rbp_slot_written = NULL; c->nrbp_slots = 0;
   if (c->bp_name) for (unsigned i = 0; i <= c->bp_mask; i++) free(c->bp_name[i]);
-  free(c->bp_name); free(c->bp_len); free(c->bp_blk); c->bp_name = NULL; c->bp_len = NULL; c->bp_blk = NULL; c->bp_mask = 0; c->nbp = 0;
+  free(c->bp_name); free(c->bp_blk); c->bp_name = NULL; c->bp_blk = NULL; c->bp_mask = 0; c->nbp = 0;
   for (int i = 0; i < c->nbp_user; i++) free(c->bp_user[i]);
   free(c->bp_user); c->bp_user = NULL; c->nbp_user = 0; c->bp_user_built = 0;
   for (int i = 0; i < c->ndef_asked; i++) free(c->def_asked[i]);
@@ -610,6 +619,8 @@ void comp_free(Compiler *c) {
   c->pres_names = NULL; c->pres_flags = NULL; c->npres = c->cpres = 0;
   free(c->nil_fact);
   free(c->nil_elem_fact);
+  free(c->scope_may_raise);
+  free(c->node_elide_setjmp);
   free(c->cls_fact); cls_pool_free(c->cls_pool, c->ncls_pool); free(c->cls_bk_sub); free(c->cls_bk_sub_ok); cplan_send_owners_free(c); cplan_memo_free(c);
   free(c->send_param_memo);
   free(c->node_ord); free(c->node_base); free(c->node_pbase);
@@ -624,7 +635,8 @@ void comp_free(Compiler *c) {
     Scope *sc = &c->scopes[s];
     free(sc->name);
     free(sc->shadow_user);
-    for (int i = 0; i < sc->nlocals; i++) free(sc->locals[i].name);
+    free(sc->env_names);
+    for (int i = 0; i < sc->nlocals; i++) { free(sc->locals[i].name); free(sc->locals[i].wname); }
     free(sc->locals);
     free(sc->lidx);
     for (int i = 0; i < sc->nparams; i++) free(sc->pnames[i]);
@@ -653,6 +665,9 @@ void comp_free(Compiler *c) {
     free(c->classes[i].ivar_elem_may_nil);
     for (int j = 0; j < c->classes[i].n_rbs_pin_ivars; j++) free(c->classes[i].rbs_pin_ivars[j]);
     free(c->classes[i].rbs_pin_ivars);
+    for (int j = 0; j < c->classes[i].n_rbs_orig_ivars; j++) free(c->classes[i].rbs_orig_ivars[j]);
+    free(c->classes[i].rbs_orig_ivars);
+    free(c->classes[i].rbs_orig_ivar_types);
     for (int j = 0; j < c->classes[i].nreaders; j++) free(c->classes[i].readers[j]);
     free(c->classes[i].readers);
     for (int j = 0; j < c->classes[i].nown_readers; j++) free(c->classes[i].own_readers[j]);
@@ -699,6 +714,10 @@ void comp_free(Compiler *c) {
   }
   free(c->ffi_sources);
   free(c->nscope);
+  free(c->scope_ret_has);
+  c->scope_ret_has = NULL;
+  c->scope_ret_nscopes = 0;
+  c->scope_ret_built = 0;
   free((unsigned char *)c->str_shadow);
   if (c->stmt_wr_names)
     for (int i = 0; i < c->stmt_wr_cap; i++) free(c->stmt_wr_names[i]);
@@ -796,13 +815,10 @@ void comp_add_gvar_alias(Compiler *c, const char *from, const char *to) {
   c->gvar_alias_to[c->ngvar_aliases]   = strdup(to);
   c->ngvar_aliases++;
 }
-/* Can `A = v` stand as a value (`m(A = v)`): a typed constant whose slot
-   the write leaves holding the value. Not a String constant, whose read
-   would hand back a copy instead of the String the constant holds, nor
-   one set by a guarded Class.new. */
-int comp_const_write_valued(const Compiler *c, const LocalVar *cv) {
-  return cv && cv->type != TY_UNKNOWN && cv->type != TY_STRING && !cv->init_guarded &&
-         repr_slot_kind(c, cv) != RK_STRBUF;
+/* A typed constant write answers the value in its slot. A guarded class
+   builder still has its separate placement rules. */
+int comp_const_write_valued(const LocalVar *cv) {
+  return cv && cv->type != TY_UNKNOWN && !cv->init_guarded;
 }
 /* A `klass::NM` read on a class value names whichever constant the runtime
    class owns: the one keyed "<c_name>__NM", or "<...>__<c_name>__NM" under an
@@ -1064,7 +1080,7 @@ Scope *comp_scope_new(Compiler *c, const char *name, int def_node) {
   s->name = name ? strdup(name) : NULL;
   { s->def_node = def_node; comp_touch_scope(s->idx); }
   { s->body = -1; comp_touch_scope(s->idx); }
-  { s->class_id = -1; comp_touch_scope(s->idx); }
+  { s->class_id = -1; comp_touch_scope_shape(c, s->idx); }
   s->rest_idx = -1;
   s->kwrest_idx = -1;
   *(TyKind *)&s->ret = TY_UNKNOWN;
@@ -1109,6 +1125,7 @@ void slot_rule(Compiler *c, LocalVar *lv, TyKind t, int node, const char *reason
 }
 
 int slot_set(Compiler *c, LocalVar *lv, TyKind merged, TyKind t, int node) {
+  merged = lv_storage_type(lv, merged);
   int held = 0;
   if (!lv->range_held && !c->range_unheld && (t == TY_RANGE || value_may_be_range(c, node))) { lv->range_held = 1; held = 1; }
   if (merged == lv->type) {
@@ -1719,6 +1736,7 @@ void comp_scope_move_unwind(int depth) {
     mv_n--;
     mv_c->scopes[mv_s[mv_n]].class_id = mv_cls[mv_n];
     mv_c->scopes[mv_s[mv_n]].is_cmethod = mv_cm[mv_n];
+    comp_touch_scope_shape(mv_c, mv_s[mv_n]);
   }
 }
 int comp_scope_own_class(const Compiler *c, int s, int *is_cmethod) {
@@ -1845,22 +1863,169 @@ static int sm_owns_side(const Compiler *c, int s, int class_id, int side) {
    chain, while the index is not frozen) otherwise scanned every scope per
    class and per ancestor. The batch answers only while the scope count, the
    moved scopes and ver_built are as they were when it began; any other ask
-   scans. */
-typedef struct { char *name; int side; int *best; } SmbEntry;
-static struct { const Compiler *c; int depth, nscopes, nclasses, ver_built, n, cap; SmbEntry *e; int *slot, nslot; } smb;
+   scans. An answer keeps only the classes a scope answers (a name is
+   defined on few classes): a row of every class per name held names x
+   classes until the batch ended. A name's first ask scans, as an unbatched
+   ask does, and stops at its first hit; its answer is kept for that class,
+   and the walk is made when another class asks the name (a name only its
+   own class asks, a class body's own singleton method, otherwise paid a
+   walk of every scope for one class's answer). */
+typedef struct { char *name; int side, n, built, first_cls, first_ans; int *ans; } SmbEntry;   /* ans: n (class, scope) pairs, by class */
+static struct { const Compiler *c; int depth, nscopes, nclasses, ver_built, n, cap; SmbEntry *e; int *slot, nslot, *tmp, tcap;
+                unsigned *nx_key; int nx_n, nx_built; } smb;
+static int smb_pair_cmp(const void *a, const void *b) {
+  const int *x = a, *y = b;
+  if (x[0] != y[0]) return x[0] < y[0] ? -1 : 1;
+  return (x[1] > y[1]) - (x[1] < y[1]);
+}
 void comp_scope_batch_begin(Compiler *c) {
   if (smb.depth++ > 0) return;
   smb.c = c; smb.nscopes = c->nscopes; smb.nclasses = c->nclasses; smb.ver_built = c->ver_built; smb.n = 0;
 }
 void comp_scope_batch_end(void) {
   if (smb.depth <= 0 || --smb.depth > 0) return;
-  for (int i = 0; i < smb.n; i++) { free(smb.e[i].name); free(smb.e[i].best); }
+  for (int i = 0; i < smb.n; i++) { free(smb.e[i].name); free(smb.e[i].ans); }
   free(smb.slot); smb.slot = NULL; smb.nslot = 0;
+  free(smb.tmp); smb.tmp = NULL; smb.tcap = 0;
+  free(smb.nx_key); smb.nx_key = NULL; smb.nx_n = 0; smb.nx_built = 0;
   smb.n = 0; smb.c = NULL;
 }
 static int sm_name_matches(const Compiler *c, int s, const char *name) {
   return c->scopes[s].name && (sp_streq(c->scopes[s].name, name) ||
          (!c->ver_built && c->scopes[s].mixin_guarded && sp_streq(comp_scope_user_name(&c->scopes[s]), name)));
+}
+/* The reverse scan: the highest scope that answers (class_id, name, side),
+   so a later (reopened / transplanted) definition wins, matching the frozen
+   index's ordering. Side 3 + side asks a top-level method's (sm_top_last). */
+static int sm_scan(Compiler *c, int class_id, const char *name, int side) {
+  for (int s = c->nscopes - 1; s >= 0; s--)
+    if ((NT_WORK(), 0) || side >= 3 ? sm_toplevel(c, s) && !c->scopes[s].is_cmethod == !(side - 3) && c->scopes[s].name &&
+                    sp_streq(c->scopes[s].name, name)
+                  : sm_owns_side(c, s, class_id, side) && sm_name_matches(c, s, name)) return s;
+  return -1;
+}
+/* The scopes by name for sm_scan's asks while the index is not frozen
+   (smx): each scope under every name it has carried, its name and its
+   shadow user name (comp_scope_user_name, which sm_name_matches reads for a
+   mixin-guarded copy), so an ask reads the scopes of its name's bucket and
+   not every scope of the program. A scope is entered when an ask first
+   finds the scope count grown past the ones entered, and again under a new
+   name where it is renamed (comp_scope_note_name; comp_scope_set_shadow
+   for the user name). An entry is a candidate only: the ask checks the
+   scope as sm_scan does (sm_owns_side, sm_name_matches), so a name the
+   scope no longer carries answers nothing. A copy's class, side, entry or
+   move changes no entry: they are read when asked. register_extends asked
+   every scope per lookup of each copy's class methods, which grew with the
+   square of the modules a program extends with (test/scale/module_functions.sh). */
+typedef struct { unsigned h; int s, next; } SmxEnt;
+static struct { const Compiler *c; int upto, nb, n, cap; int *head; SmxEnt *e; } smx;
+static void smx_reset(void) {
+  free(smx.head); free(smx.e);
+  memset(&smx, 0, sizeof smx);
+}
+static void smx_put(unsigned h, int s) {
+  if (smx.n >= smx.cap) {
+    smx.cap = smx.cap ? 2 * smx.cap : 1024;
+    smx.e = realloc(smx.e, sizeof(SmxEnt) * (size_t)smx.cap);
+    if (!smx.e) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
+  if (2 * (smx.n + 1) > smx.nb) {   /* (rehash over twice the entries) */
+    int nb = smx.nb ? 2 * smx.nb : 2048;
+    int *hd = malloc(sizeof(int) * (size_t)nb);
+    if (!hd) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int k = 0; k < nb; k++) hd[k] = -1;
+    for (int k = 0; k < smx.n; k++) { int b = (int)(smx.e[k].h & (unsigned)(nb - 1)); smx.e[k].next = hd[b]; hd[b] = k; }
+    free(smx.head); smx.head = hd; smx.nb = nb;
+  }
+  int b = (int)(h & (unsigned)(smx.nb - 1));
+  smx.e[smx.n] = (SmxEnt){ h, s, smx.head[b] };
+  smx.head[b] = smx.n++;
+}
+/* s under the name of hash h, unless it is there already (a shape write
+   that kept the name enters nothing) */
+static void smx_put_new(unsigned h, int s) {
+  if (smx.nb)
+    for (int k = smx.head[h & (unsigned)(smx.nb - 1)]; k >= 0; k = smx.e[k].next)
+      if (smx.e[k].s == s && smx.e[k].h == h) return;
+  smx_put(h, s);
+}
+static void smx_enter(const Compiler *c, int s) {
+  const Scope *sc = &c->scopes[s];
+  if (sc->name) smx_put_new(sp_strhash(sc->name), s);
+  if (sc->shadow_user && (!sc->name || !sp_streq(sc->shadow_user, sc->name))) smx_put_new(sp_strhash(sc->shadow_user), s);
+}
+static void smx_sync(Compiler *c) {
+  if (smx.c != c || c->nscopes < smx.upto) { smx_reset(); smx.c = c; }
+  for (; smx.upto < c->nscopes; smx.upto++) smx_enter(c, smx.upto);
+}
+/* See compiler.h. */
+void comp_scope_note_name(Compiler *c, int s) {
+  if (smx.c == c && s >= 0 && s < smx.upto) smx_enter(c, s);   /* (a scope not entered yet is entered under its names then) */
+}
+/* sm_scan over the name's entries: the highest scope that answers */
+static int smx_scan(Compiler *c, int class_id, const char *name, int side) {
+  smx_sync(c);
+  if (!smx.nb) return -1;
+  unsigned h = sp_strhash(name);
+  int best = -1;
+  for (int k = smx.head[h & (unsigned)(smx.nb - 1)]; k >= 0; k = smx.e[k].next) {
+    NT_WORK();
+    int s = smx.e[k].s;
+    if (smx.e[k].h != h || s <= best) continue;
+    if (sm_owns_side(c, s, class_id, side) && sm_name_matches(c, s, name)) best = s;
+  }
+  return best;
+}
+/* The batch's scopes by name (nx_key: pairs of a name's hash and a scope,
+   sorted): the scopes a name's walk below can match, its own name or, as
+   sm_name_matches reads it, the user name of a mixin-guarded copy. A
+   name's first ask and its walk read those scopes alone, where each read
+   every scope of the program: a program with a method name per class
+   (`get123`) walked the scopes once per name. */
+static int smb_u_cmp(const void *a, const void *b) {
+  const unsigned *x = a, *y = b;
+  if (x[0] != y[0]) return x[0] < y[0] ? -1 : 1;
+  return (x[1] > y[1]) - (x[1] < y[1]);
+}
+static void smb_names_build(Compiler *c) {
+  smb.nx_built = 1;
+  smb.nx_key = malloc(2 * sizeof(unsigned) * (2 * (size_t)c->nscopes + 1));
+  if (!smb.nx_key) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  int n = 0;
+  for (int s = 0; s < c->nscopes; s++) {
+    const char *nm = c->scopes[s].name;
+    if (!nm) continue;
+    smb.nx_key[2 * n] = sp_strhash(nm); smb.nx_key[2 * n + 1] = (unsigned)s; n++;
+    if (!c->ver_built && c->scopes[s].mixin_guarded) {
+      const char *un = comp_scope_user_name(&c->scopes[s]);
+      if (un && !sp_streq(un, nm)) { smb.nx_key[2 * n] = sp_strhash(un); smb.nx_key[2 * n + 1] = (unsigned)s; n++; }
+    }
+  }
+  if (n > 1) qsort(smb.nx_key, (size_t)n, 2 * sizeof(unsigned), smb_u_cmp);
+  smb.nx_n = n;
+}
+/* the first and one past the last of the name's pairs, by scope ascending */
+static void smb_named(Compiler *c, const char *name, int *lo, int *hi) {
+  if (!smb.nx_built) smb_names_build(c);
+  unsigned h = sp_strhash(name);
+  int a = 0, b = smb.nx_n;
+  while (a < b) { int m = a + (b - a) / 2; if (smb.nx_key[2 * m] < h) a = m + 1; else b = m; }
+  int e = a;
+  while (e < smb.nx_n && smb.nx_key[2 * e] == h) e++;
+  *lo = a; *hi = e;
+}
+/* sm_scan over the name's scopes: the highest that answers */
+static int smb_scan_named(Compiler *c, int class_id, const char *name, int side) {
+  int lo, hi;
+  smb_named(c, name, &lo, &hi);
+  for (int i = hi - 1; i >= lo; i--) {
+    int s = (int)smb.nx_key[2 * i + 1];
+    if (i + 1 < hi && (int)smb.nx_key[2 * (i + 1) + 1] == s) continue;   /* (a scope under both its names) */
+    if (side >= 3 ? sm_toplevel(c, s) && !c->scopes[s].is_cmethod == !(side - 3) && c->scopes[s].name &&
+                    sp_streq(c->scopes[s].name, name)
+                  : sm_owns_side(c, s, class_id, side) && sm_name_matches(c, s, name)) return s;
+  }
+  return -1;
 }
 /* The batch's answer for (class_id, name, side), or -2 when the batch does
    not answer. Side 3 + side is a top-level method's (sm_top_last), whose
@@ -1868,6 +2033,7 @@ static int sm_name_matches(const Compiler *c, int s, const char *name) {
 static int sm_batch_lookup(Compiler *c, int class_id, const char *name, int side) {
   if (smb.depth <= 0 || smb.c != c || mv_n || c->nscopes != smb.nscopes || c->nclasses != smb.nclasses ||
       c->ver_built != smb.ver_built || class_id < (side >= 3 ? -1 : 0) || class_id >= smb.nclasses) return -2;
+  int scan_cls = class_id;
   if (side >= 3) class_id = smb.nclasses;
   /* (the entries by (name, side): open addressing over twice their count) */
   if (2 * (smb.n + 1) > smb.nslot) {
@@ -1894,25 +2060,60 @@ static int sm_batch_lookup(Compiler *c, int class_id, const char *name, int side
       smb.e = realloc(smb.e, sizeof(SmbEntry) * (size_t)smb.cap);
       if (!smb.e) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
     }
-    int *best = malloc(sizeof(int) * (size_t)(smb.nclasses + 1));
     char *nm = strdup(name);
-    if (!best || !nm) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-    for (int k = 0; k <= smb.nclasses; k++) best[k] = -1;
-    /* (ascending, so the last scope that answers a class is the one kept:
-       the reverse scan's first) */
-    for (int s = 0; s < c->nscopes; s++) {
-      if (side >= 3) {
-        if (sm_toplevel(c, s) && !c->scopes[s].is_cmethod == !(side - 3) && c->scopes[s].name &&
-            sp_streq(c->scopes[s].name, name)) best[smb.nclasses] = s;
-        continue;
-      }
-      int cls = c->scopes[s].class_id;
-      if (cls < 0 || cls >= smb.nclasses || !sm_name_matches(c, s, name) || !sm_owns_side(c, s, cls, side)) continue;
-      best[cls] = s;
-    }
-    smb.e[i].name = nm; smb.e[i].side = side; smb.e[i].best = best; smb.n++;
+    if (!nm) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    int r = smb_scan_named(c, scan_cls, name, side);   /* (the first ask scans, the name's scopes) */
+    smb.e[i].name = nm; smb.e[i].side = side; smb.e[i].n = 0; smb.e[i].built = 0; smb.e[i].ans = NULL;
+    smb.e[i].first_cls = class_id; smb.e[i].first_ans = r; smb.n++;
+    return r;
   }
-  return smb.e[i].best[class_id];
+  if (!smb.e[i].built && class_id == smb.e[i].first_cls) return smb.e[i].first_ans;
+  if (!smb.e[i].built) {
+    /* (every scope that answers its class, as (class, scope) pairs) */
+    int m = 0, lo, hi;
+    smb_named(c, name, &lo, &hi);
+    for (int ni = lo; ni < hi; ni++) {
+      int s = (int)smb.nx_key[2 * ni + 1];
+      if (ni > lo && (int)smb.nx_key[2 * (ni - 1) + 1] == s) continue;   /* (a scope under both its names) */
+      int cls;
+      if (side >= 3) {
+        if (!(sm_toplevel(c, s) && !c->scopes[s].is_cmethod == !(side - 3) && c->scopes[s].name &&
+              sp_streq(c->scopes[s].name, name))) continue;
+        cls = smb.nclasses;
+      } else {
+        cls = c->scopes[s].class_id;
+        if (cls < 0 || cls >= smb.nclasses || !sm_name_matches(c, s, name) || !sm_owns_side(c, s, cls, side)) continue;
+      }
+      if (m == smb.tcap) {
+        smb.tcap = smb.tcap ? 2 * smb.tcap : 64;
+        smb.tmp = realloc(smb.tmp, 2 * sizeof(int) * (size_t)smb.tcap);
+        if (!smb.tmp) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+      }
+      smb.tmp[2 * m] = cls; smb.tmp[2 * m + 1] = s; m++;
+    }
+    /* (by class, then scope: of a class's pairs the highest scope is kept,
+       the reverse scan's first) */
+    if (m > 1) qsort(smb.tmp, (size_t)m, 2 * sizeof(int), smb_pair_cmp);
+    int k = 0;
+    for (int j = 0; j < m; j++) {
+      if (j + 1 < m && smb.tmp[2 * (j + 1)] == smb.tmp[2 * j]) continue;
+      smb.tmp[2 * k] = smb.tmp[2 * j]; smb.tmp[2 * k + 1] = smb.tmp[2 * j + 1]; k++;
+    }
+    int *ans = NULL;
+    if (k > 0) {
+      ans = malloc(2 * sizeof(int) * (size_t)k);
+      if (!ans) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+      memcpy(ans, smb.tmp, 2 * sizeof(int) * (size_t)k);
+    }
+    smb.e[i].n = k; smb.e[i].ans = ans; smb.e[i].built = 1;
+  }
+  const int *ans = smb.e[i].ans;
+  for (int lo = 0, hi = smb.e[i].n - 1; lo <= hi; ) {
+    int mid = lo + (hi - lo) / 2;
+    if (ans[2 * mid] == class_id) return ans[2 * mid + 1];
+    if (ans[2 * mid] < class_id) lo = mid + 1; else hi = mid - 1;
+  }
+  return -1;
 }
 static int sm_lookup(Compiler *c, int class_id, const char *name, int is_cm) {
   if (!name) return -1;
@@ -1927,13 +2128,13 @@ static int sm_lookup(Compiler *c, int class_id, const char *name, int is_cm) {
 #endif
       return b;
     }
-    /* scope shape may still change: scan in reverse so a later (reopened /
-       transplanted) definition wins, matching the frozen index's ordering. */
-    for (int s = c->nscopes - 1; s >= 0; s--)
-      if (sm_owns_side(c, s, class_id, is_cm) &&
-          c->scopes[s].name && (sp_streq(c->scopes[s].name, name) ||
-            (!c->ver_built && c->scopes[s].mixin_guarded && sp_streq(comp_scope_user_name(&c->scopes[s]), name)))) return s;
-    return -1;
+    /* scope shape may still change: the scopes of the name (smx) */
+    int r = smx_scan(c, class_id, name, is_cm);
+#ifdef SP_SMX_CHECK
+    int r2 = sm_scan(c, class_id, name, is_cm);
+    if (r != r2) { fprintf(stderr, "spinel: scope name index answered %d for %d/%s/%d, the scan %d\n", r, class_id, name, is_cm, r2); abort(); }
+#endif
+    return r;
   }
   if (sm_nscopes != c->nscopes) sm_build(c);
   if (!sm_buckets) return -1;
@@ -1971,16 +2172,53 @@ int comp_cmethod_in_class(Compiler *c, int class_id, const char *name) {
 static unsigned cmc_shape = 0;
 void comp_class_shape_changed(void) { cmc_shape++; comp_touch_global(); }   /* (a parent link or an alias: every answer may read a chain) */
 unsigned comp_class_shape_gen(void) { return cmc_shape; }
-static char **cmc_name; static unsigned char *cmc_cm; static int **cmc_ans;
+static char **cmc_name; static unsigned char *cmc_cm; static int *cmc_sid;   /* per slot: its id in the answers (cmc_pair) */
 static int **cmc_resp; static int *cmc_nresp;   /* per slot: the responders (comp_name_responders), -1 unbuilt */
 static int cmc_cap = 0, cmc_n = 0;
 static unsigned cmc_epoch;   /* bumped when a slot's index can move: a clear, a growth */
 static const Compiler *cmc_c; static unsigned cmc_gen, cmc_shape_at, cmc_table_at;
 static int cmc_nscopes = -1, cmc_nclasses = -1;
+/* The answers by (slot id, class): the method (or reader found) and the
+   class that defines it. A hash of the pairs asked, where each slot held
+   two ints for every class of the program: a program with a method name
+   per class (`get123` in Widget123) asks a name or two of each class, and
+   the per-class arrays grew as classes x names. */
+typedef struct { int sid, k, mi, dc; } CmcPair;
+static CmcPair *cmc_pair; static int cmc_pcap, cmc_pn;
+static void cmc_pairs_clear(void) { free(cmc_pair); cmc_pair = NULL; cmc_pcap = cmc_pn = 0; }
+static unsigned cmc_phash(int sid, int k) { return ((unsigned)sid * 2654435761u) ^ ((unsigned)k * 2246822519u); }
+/* the answer of class k at slot sid, -2 while unasked (*dc its definer) */
+static int cmc_get(int sid, int k, int *dc) {
+  if (!cmc_pcap) return -2;
+  for (unsigned h = cmc_phash(sid, k) & (unsigned)(cmc_pcap - 1); cmc_pair[h].sid >= 0; h = (h + 1) & (unsigned)(cmc_pcap - 1))
+    if (cmc_pair[h].sid == sid && cmc_pair[h].k == k) { *dc = cmc_pair[h].dc; return cmc_pair[h].mi; }
+  return -2;
+}
+static void cmc_put(int sid, int k, int mi, int dc) {
+  if (cmc_pn * 2 >= cmc_pcap) {
+    CmcPair *op = cmc_pair; int ocap = cmc_pcap;
+    cmc_pcap = ocap ? ocap * 2 : 1024;
+    cmc_pair = malloc(sizeof *cmc_pair * (size_t)cmc_pcap);
+    if (!cmc_pair) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int i = 0; i < cmc_pcap; i++) cmc_pair[i].sid = -1;
+    for (int i = 0; i < ocap; i++) {
+      if (op[i].sid < 0) continue;
+      unsigned h = cmc_phash(op[i].sid, op[i].k) & (unsigned)(cmc_pcap - 1);
+      while (cmc_pair[h].sid >= 0) h = (h + 1) & (unsigned)(cmc_pcap - 1);
+      cmc_pair[h] = op[i];
+    }
+    free(op);
+  }
+  unsigned h = cmc_phash(sid, k) & (unsigned)(cmc_pcap - 1);
+  while (cmc_pair[h].sid >= 0 && !(cmc_pair[h].sid == sid && cmc_pair[h].k == k)) h = (h + 1) & (unsigned)(cmc_pcap - 1);
+  if (cmc_pair[h].sid < 0) cmc_pn++;
+  cmc_pair[h] = (CmcPair){ sid, k, mi, dc };
+}
 static void cmc_clear(void) {
-  for (int i = 0; i < cmc_cap; i++) if (cmc_name && cmc_name[i]) { free(cmc_name[i]); free(cmc_ans[i]); free(cmc_resp[i]); }
-  free(cmc_name); free(cmc_cm); free(cmc_ans); free(cmc_resp); free(cmc_nresp);
-  cmc_name = NULL; cmc_cm = NULL; cmc_ans = NULL; cmc_resp = NULL; cmc_nresp = NULL; cmc_cap = cmc_n = 0;
+  for (int i = 0; i < cmc_cap; i++) if (cmc_name && cmc_name[i]) { free(cmc_name[i]); free(cmc_resp[i]); }
+  free(cmc_name); free(cmc_cm); free(cmc_sid); free(cmc_resp); free(cmc_nresp);
+  cmc_name = NULL; cmc_cm = NULL; cmc_sid = NULL; cmc_resp = NULL; cmc_nresp = NULL; cmc_cap = cmc_n = 0;
+  cmc_pairs_clear();
   cmc_epoch++;
 }
 /* (is_cm is 0 the instance side, 1 the class side, 2 a capture's, and 3 and 4
@@ -1997,21 +2235,21 @@ static int cmc_slot_idx(Compiler *c, const char *name, int is_cm) {
     cmc_nscopes = c->nscopes; cmc_nclasses = c->nclasses;
   }
   if (cmc_n * 2 >= cmc_cap) {
-    int ocap = cmc_cap; char **on = cmc_name; unsigned char *ocm = cmc_cm; int **oa = cmc_ans;
+    int ocap = cmc_cap; char **on = cmc_name; unsigned char *ocm = cmc_cm; int *oa = cmc_sid;
     int **orp = cmc_resp; int *onr = cmc_nresp;
     cmc_cap = ocap ? ocap * 2 : 256;
     cmc_name = calloc((size_t)cmc_cap, sizeof(char *));
     cmc_cm = calloc((size_t)cmc_cap, 1);
-    cmc_ans = calloc((size_t)cmc_cap, sizeof(int *));
+    cmc_sid = calloc((size_t)cmc_cap, sizeof(int));
     cmc_resp = calloc((size_t)cmc_cap, sizeof(int *));
     cmc_nresp = malloc(sizeof(int) * (size_t)cmc_cap);
-    if (!cmc_name || !cmc_cm || !cmc_ans || !cmc_resp || !cmc_nresp) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    if (!cmc_name || !cmc_cm || !cmc_sid || !cmc_resp || !cmc_nresp) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
     for (int i = 0; i < cmc_cap; i++) cmc_nresp[i] = -1;
     for (int i = 0; i < ocap; i++) {
       if (!on[i]) continue;
       unsigned j = (sp_strhash(on[i]) ^ ocm[i]) & (unsigned)(cmc_cap - 1);
       while (cmc_name[j]) j = (j + 1) & (unsigned)(cmc_cap - 1);
-      cmc_name[j] = on[i]; cmc_cm[j] = ocm[i]; cmc_ans[j] = oa[i]; cmc_resp[j] = orp[i]; cmc_nresp[j] = onr[i];
+      cmc_name[j] = on[i]; cmc_cm[j] = ocm[i]; cmc_sid[j] = oa[i]; cmc_resp[j] = orp[i]; cmc_nresp[j] = onr[i];
     }
     free(on); free(ocm); free(oa); free(orp); free(onr);
     cmc_epoch++;
@@ -2036,28 +2274,29 @@ static int cmc_slot_idx(Compiler *c, const char *name, int is_cm) {
     j = (j + 1) & (unsigned)(cmc_cap - 1);
   }
   if (!cmc_name[j]) {
-    int *a = malloc(sizeof(int) * 2 * (size_t)c->nclasses);
     cmc_name[j] = strdup(name);
-    if (!a || !cmc_name[j]) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-    for (int k = 0; k < 2 * c->nclasses; k++) a[k] = -2;
-    cmc_cm[j] = (unsigned char)is_cm; cmc_ans[j] = a; cmc_resp[j] = NULL; cmc_nresp[j] = -1; cmc_n++;
+    if (!cmc_name[j]) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    cmc_cm[j] = (unsigned char)is_cm; cmc_sid[j] = cmc_n; cmc_resp[j] = NULL; cmc_nresp[j] = -1; cmc_n++;
   }
   last[last_at].name = name; last[last_at].cm = is_cm; last[last_at].j = (int)j; last[last_at].epoch = cmc_epoch;
   last_at = (last_at + 1) % CMC_LAST;
   return (int)j;
 }
-/* The answers for (name, is_cm), two ints per class (-2 while unasked), or
-   NULL when the memo cannot be trusted now. */
-static int *cmc_slot(Compiler *c, const char *name, int is_cm) {
+/* The id of (name, is_cm)'s answers (cmc_get, cmc_put), or -1 when the
+   memo cannot be trusted now. */
+static int cmc_slot(Compiler *c, const char *name, int is_cm) {
   int j = cmc_slot_idx(c, name, is_cm);
-  return j < 0 ? NULL : cmc_ans[j];
+  return j < 0 ? -1 : cmc_sid[j];
 }
 static const char *resolve_alias_side(Compiler *c, int class_id, const char *name, int *start_cls, int *builtin, int sg);
 static int chain_lookup(Compiler *c, int class_id, const char *name, int *def_class, int is_cm) {
-  int *a = class_id >= 0 && class_id < c->nclasses ? cmc_slot(c, name, is_cm) : NULL;
-  if (a && a[2 * class_id] != -2) {
-    if (a[2 * class_id] >= 0 && def_class) *def_class = a[2 * class_id + 1];
-    return a[2 * class_id];
+  int sid = class_id >= 0 && class_id < c->nclasses ? cmc_slot(c, name, is_cm) : -1;
+  if (sid >= 0) {
+    int kdc = -1, kmi = cmc_get(sid, class_id, &kdc);
+    if (kmi != -2) {
+      if (kmi >= 0 && def_class) *def_class = kdc;
+      return kmi;
+    }
   }
   int start = class_id, mi = -1, dc = -1, bi = 0;
   const char *rn = resolve_alias_side(c, class_id, name, &start, &bi, is_cm == 1 ? 1 : 2);
@@ -2076,7 +2315,7 @@ static int chain_lookup(Compiler *c, int class_id, const char *name, int *def_cl
     int m = comp_cmethod_in_class(c, cid, rn);
     if (m >= 0 && c->scopes[m].def_node == c->scopes[mi].def_node) { mi = m; dc = cid; break; }
   }
-  if (a) { a[2 * class_id] = mi; a[2 * class_id + 1] = dc; }
+  if (sid >= 0) cmc_put(sid, class_id, mi, dc);
   if (mi >= 0 && def_class) *def_class = dc;
   return mi;
 }
@@ -3879,14 +4118,15 @@ static int accessor_chain_possible(const Compiler *c, int class_id, int writer) 
    inference that asked keeps no per-class dependency on the chain. */
 static int accessor_chain(Compiler *c, int class_id, const char *name, int *def_class, int writer) {
   if (class_id >= 0 && class_id < c->nclasses && !accessor_chain_possible(c, class_id, writer)) return 0;
-  int *a = class_id >= 0 && class_id < c->nclasses ? cmc_slot(c, name, writer ? 4 : 3) : NULL;
-  int found = 0, dc = -1;
-  if (a && a[2 * class_id] != -2) { found = a[2 * class_id]; dc = a[2 * class_id + 1]; }
+  int sid = class_id >= 0 && class_id < c->nclasses ? cmc_slot(c, name, writer ? 4 : 3) : -1;
+  int found = 0, dc = -1, kmi = sid >= 0 ? cmc_get(sid, class_id, &dc) : -2;
+  if (kmi != -2) found = kmi;
   else {
+    dc = -1;
     const char *rn = writer ? name : comp_resolve_alias(c, class_id, name);
     for (int cid = class_id; cid >= 0; cid = c->classes[cid].parent)
       if (writer ? comp_is_writer(&c->classes[cid], rn) : comp_is_reader(&c->classes[cid], rn)) { found = 1; dc = cid; break; }
-    if (a) { a[2 * class_id] = found; a[2 * class_id + 1] = dc; }
+    if (sid >= 0) cmc_put(sid, class_id, found, dc);
   }
   if (found && def_class) *def_class = dc;
   return found;
@@ -3928,7 +4168,7 @@ int comp_writer_in_chain(Compiler *c, int class_id, const char *name, int *def_c
    precedence; neither query reconstructs includes from the node table. */
 /* What the mixin walk looks for: Enumerable, Comparable, or any core module
    (one of those, or a builtin module named by path) */
-enum { MX_ENUM = 0, MX_CMP = 1, MX_CORE = 2, MX_ANSWERS = 3 };   /* MX_ANSWERS: one of them has the name (mixin_here's `name`) ahead of Object */
+enum { MX_ENUM = 0, MX_CMP = 1, MX_CORE = 2, MX_ANSWERS = 3, MX_NAMED = 4 };   /* MX_ANSWERS: one of them has the name (mixin_here's `name`) ahead of Object; MX_NAMED: the builtin module named `name` */
 static int mixin_here(const ClassInfo *ci, int what, const char *name) {
   int en = ci->enum_inc_at || ci->enum_prepended, cm = ci->cmp_inc_at || ci->cmp_prepended;
   if (what == MX_ANSWERS) {
@@ -3937,6 +4177,11 @@ static int mixin_here(const ClassInfo *ci, int what, const char *name) {
         (cm && builtin_answers_ahead_of(core_class_name(CORE_COMPARABLE), name, NULL))) return 1;
     for (int i = 0; i < ci->nincluded_mod_names; i++)
       if (builtin_answers_ahead_of(ci->included_mod_names[i], name, NULL)) return 1;
+    return 0;
+  }
+  if (what == MX_NAMED) {
+    for (int i = 0; i < ci->nincluded_mod_names; i++)
+      if (sp_streq(ci->included_mod_names[i], name)) return 1;
     return 0;
   }
   return what == MX_ENUM ? en : what == MX_CMP ? cm : en || cm || ci->nincluded_mod_names > 0;
@@ -3953,6 +4198,7 @@ static int mixin_reaches_from(Compiler *c, int k, int what, const char *name, un
     int m = ci->included_mods[j];
     /* (a builtin module of the program's classes: Math) */
     if (what == MX_ANSWERS && m >= 0 && m < c->nclasses && c->classes[m].is_builtin_const && builtin_answers_ahead_of(c->classes[m].name, name, NULL)) return 1;
+    if (what == MX_NAMED && m >= 0 && m < c->nclasses && c->classes[m].is_builtin_const && sp_streq(c->classes[m].name, name)) return 1;
     if (m >= 0 && m < c->nclasses && !seen[m] && mixin_reaches_from(c, m, what, name, seen)) return 1;
   }
   return 0;
@@ -4064,6 +4310,26 @@ int comp_chain_core_answers(Compiler *c, int cid, const char *name) {
     if (k == c->classes[k].parent) break;
   }
   return 0;
+}
+/* Is builtin module `mod` (Math) among the ancestors of class cid: included by it, a superclass, or a module either
+   includes, at any depth? `Klass::PI` then reads Math's constant, as a bare PI does inside the class. */
+int comp_chain_includes_core(Compiler *c, int cid, const char *mod) {
+  int n = 0;
+  for (int k = cid; k >= 0 && k < c->nclasses && n < c->nclasses; k = c->classes[k].parent, n++) {
+    if (mixin_reaches(c, k, MX_NAMED, mod)) return 1;
+    if (k == c->classes[k].parent) break;
+  }
+  return 0;
+}
+/* The parent of a constant path names Math, or a program class or module with Math among its ancestors, so the
+   path reads Math's constants (PI, E). */
+int comp_const_path_on_math(Compiler *c, int par_id) {
+  NodeKind k = nt_kind(c->nt, par_id);
+  if (k != NK_ConstantReadNode && k != NK_ConstantPathNode) return 0;
+  const char *nm = nt_str(c->nt, par_id, "name");
+  if (nm && sp_streq(nm, "Math")) return 1;
+  int ci = const_node_class_index(c, par_id);
+  return ci >= 0 && !c->classes[ci].is_builtin_const && comp_chain_includes_core(c, ci, "Math");
 }
 /* Enumerable's methods are behind class `cid`: Enumerable is among its
    ancestors (itself or a superclass includes or prepends it), or an ancestor
@@ -4703,25 +4969,39 @@ int comp_method_overridden(Compiler *c, int cid, const char *name, int cmeth) {
    ascending order, the order the loops it replaces visited them in -- and
    rebuilt only when the class count changes. */
 static int **desc_lists; static int *desc_counts; static int desc_nclasses = -1;
+/* (each class's subclasses by its parent link, made with the lists: a
+   list is the walk down them, sorted, where it read every class's chain) */
+static int *desc_kid_first, *desc_kid_next;
+static int desc_int_cmp(const void *a, const void *b) { return *(const int *)a - *(const int *)b; }
 const int *comp_descendants(Compiler *c, int cid, int *n) {
   if (cid < 0 || cid >= c->nclasses) { *n = 0; return NULL; }
   if (desc_nclasses != c->nclasses) {
     for (int i = 0; i < desc_nclasses; i++) free(desc_lists[i]);
-    free(desc_lists); free(desc_counts);
+    free(desc_lists); free(desc_counts); free(desc_kid_first); free(desc_kid_next);
     desc_lists = calloc((size_t)c->nclasses, sizeof *desc_lists);
     desc_counts = calloc((size_t)c->nclasses, sizeof *desc_counts);
+    desc_kid_first = malloc(sizeof(int) * (size_t)c->nclasses);
+    desc_kid_next = malloc(sizeof(int) * (size_t)c->nclasses);
+    if (!desc_lists || !desc_counts || !desc_kid_first || !desc_kid_next) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int k = 0; k < c->nclasses; k++) desc_kid_first[k] = desc_kid_next[k] = -1;
+    for (int k = c->nclasses - 1; k >= 0; k--) {
+      int p = c->classes[k].parent;
+      if (p >= 0 && p < c->nclasses && p != k) { desc_kid_next[k] = desc_kid_first[p]; desc_kid_first[p] = k; }
+    }
     desc_nclasses = c->nclasses;
   }
   if (!desc_lists[cid]) {
     int *v = NULL, cnt = 0, cap = 0;
-    for (int k = 0; k < c->nclasses; k++) {
-      int is_desc = 0;
-      for (int p = c->classes[k].parent; p >= 0; p = c->classes[p].parent)
-        if (p == cid) { is_desc = 1; break; }
-      if (!is_desc) continue;
+    for (int k = desc_kid_first[cid]; k >= 0; k = desc_kid_next[k]) {
       if (cnt == cap) { cap = cap ? cap * 2 : 8; v = realloc(v, sizeof *v * (size_t)cap); }
       v[cnt++] = k;
     }
+    for (int i = 0; i < cnt && cnt <= c->nclasses; i++)
+      for (int k = desc_kid_first[v[i]]; k >= 0; k = desc_kid_next[k]) {
+        if (cnt == cap) { cap = cap ? cap * 2 : 8; v = realloc(v, sizeof *v * (size_t)cap); }
+        v[cnt++] = k;
+      }
+    if (cnt > 1) qsort(v, (size_t)cnt, sizeof *v, desc_int_cmp);
     if (!v) v = malloc(sizeof *v);   /* a non-NULL sentinel for "computed, empty" */
     desc_lists[cid] = v; desc_counts[cid] = cnt;
   }
@@ -5114,10 +5394,9 @@ int comp_ivar_owner(Compiler *c, int node) {
   return holder_ivar_side(c, node, &cid) ? cid : -1;
 }
 
-/* The variable a site names, by the read kind, name and key the String
-   refusals name a variable by (SaName): a local by its scope, an ivar by its
-   owning class (comp_ivar_owner), a global by its name with aliases resolved
-   (key -1). 0 when node `v` names none of them. */
+/* A site's read kind, name and key. Locals use their scope and instance
+   variables use their owning class. Globals resolve aliases. Globals,
+   constants and class variables use key -1. Returns 0 for other nodes. */
 static int vsite_key(Compiler *c, int v, NodeKind *kind, const char **name, int *key) {
   const NodeTable *nt = c->nt;
   const char *nm = v >= 0 ? key_name(c, v) : NULL;
@@ -5469,10 +5748,7 @@ static int sm_top_last(Compiler *c, const char *name, int side) {
       return b;
     }
     /* in reverse, so a redefinition wins, matching the frozen index */
-    for (int s = c->nscopes - 1; s >= 0; s--)
-      if (sm_toplevel(c, s) && !c->scopes[s].is_cmethod == !side && c->scopes[s].name &&
-          sp_streq(c->scopes[s].name, name)) return s;
-    return -1;
+    return sm_scan(c, -1, name, 3 + side);
   }
   if (sm_nscopes != c->nscopes) sm_build(c);
   if (!sm_buckets) return -1;
@@ -5631,8 +5907,20 @@ static void scope_lidx_build(Scope *s) {
   memset(s->lidx, 0, sizeof(int) * (size_t)cap);
   for (int i = 0; i < s->nlocals; i++) scope_lidx_add(s, i);
 }
+/* A define_method block's scope reads and writes the locals of its definer's def as that def's own (Scope.env_host):
+   the host's Scope, for a name the block closes over, else NULL. Every Scope handed to scope_local is the one
+   c->scopes holds at its idx (the scratch Scope of a desugar is zeroed, with no env_host), so the host sits at the
+   difference of their indexes from it. */
+static Scope *scope_env_owner(Scope *s, const char *name) {
+  if (!s->env_host || !name) return NULL;
+  for (int i = 0; i < s->nenv_names; i++)
+    if (sp_streq(s->env_names[i], name)) return s + (s->env_host - 1 - s->idx);
+  return NULL;
+}
 LocalVar *scope_local(Scope *s, const char *name) {
   IMEMO_DEP_SCOPE(s->idx);
+  Scope *host = scope_env_owner(s, name);
+  if (host) return scope_local(host, name);
   if (s->nlocals >= SCOPE_LIDX_MIN) {
     if (!s->lidx || s->nlocals * 2 > s->lidx_cap) scope_lidx_build(s);
     if (s->lidx) {
@@ -5657,7 +5945,16 @@ void scope_locals_removed(Scope *s) {
   free(s->lidx); s->lidx = NULL; s->lidx_cap = 0;
 }
 
+/* Record the name the program wrote for slot lv: none when it is the slot's own */
+void lv_set_wname(LocalVar *lv, const char *wname) {
+  if (wname == lv->wname) return;
+  free(lv->wname);
+  lv->wname = wname && !sp_streq(wname, lv->name) ? strdup(wname) : NULL;
+}
+
 LocalVar *scope_local_intern(Scope *s, const char *name) {
+  Scope *host = scope_env_owner(s, name);
+  if (host) return scope_local_intern(host, name);
   LocalVar *lv = scope_local(s, name);
   if (lv) return lv;
   if (s->nlocals >= s->clocals) {
@@ -6027,7 +6324,9 @@ void comp_scope_set_shadow(Compiler *c, int si, int kind, const char *user) {
   Scope *s = &c->scopes[si];
   free(s->shadow_user);
   s->shadow = (unsigned char)kind;
+  comp_touch_scope_shape(c, si);
   s->shadow_user = strdup(user);
+  comp_scope_note_name(c, si);
   for (int i = 0; i < c->nshadow_copies; i++)
     if (c->shadow_copies[i] == si) return;
   if (c->nshadow_copies >= c->cshadow_copies) {
@@ -6444,22 +6743,25 @@ int class_recv_is_dynamic(Compiler *c, int recv) {
 }
 
 
-/* Is module m module mod, or does it include mod (through its own includes)? */
-int comp_module_includes(Compiler *c, int m, int mod, int depth) {
-  if (m == mod) return 1;
+/* Is module k module m, or does m (a class or a module) mix it in: include it, or with prepends prepend it too,
+   through m's own mixins? */
+static int comp_mixes_in_at(Compiler *c, int m, int k, int prepends, int depth) {
+  if (m == k) return 1;
   if (m < 0 || m >= c->nclasses || depth > 16) return 0;
-  ClassInfo *mi = &c->classes[m];
-  for (int k = 0; k < mi->nincluded_mods; k++)
-    if (comp_module_includes(c, mi->included_mods[k], mod, depth + 1)) return 1;
+  const ClassInfo *mi = &c->classes[m];
+  for (int i = 0; i < mi->nincluded_mods; i++) if (comp_mixes_in_at(c, mi->included_mods[i], k, prepends, depth + 1)) return 1;
+  for (int i = 0; prepends && i < mi->nprepended_mods; i++)
+    if (comp_mixes_in_at(c, mi->prepended_mods[i], k, prepends, depth + 1)) return 1;
   return 0;
 }
+int comp_mixes_in(Compiler *c, int m, int k, int prepends) { return comp_mixes_in_at(c, m, k, prepends, 0); }
 /* Does module `mod` -- or a module including it -- take part in class `ci`'s
    singleton ancestors, through an `extend` of `ci` or of a superclass? Then
    `ci.is_a?(mod)` is true. */
 int comp_class_singleton_has_module(Compiler *c, int ci, int mod) {
   for (int k = ci, d = 0; k >= 0 && k < c->nclasses && d < 64; k = c->classes[k].parent, d++)
     for (int e = 0; e < c->classes[k].nextended_mods; e++)
-      if (comp_module_includes(c, c->classes[k].extended_mods[e], mod, 0)) return 1;
+      if (comp_mixes_in(c, c->classes[k].extended_mods[e], mod, 0)) return 1;
   return 0;
 }
 /* Does class `ci` or a superclass extend any module? */

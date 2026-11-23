@@ -39,7 +39,7 @@ static inline sp_bool sp_String_is_immutable(sp_String *s) {
 static inline sp_String*sp_String_freeze(sp_String*s){if(s){if(s->temporarily_locked)sp_raise_locked_str();sp_gc_hdr*h=(sp_gc_hdr*)((char*)s-sizeof(sp_gc_hdr));h->frozen=1;}return s;}
 
 /* A mutable String's payload carries the same length-bearing sp_str_hdr that
-   0xfe/0xfc heap strings use, so an escaped const char* is binary-safe (the
+   inline String views use, so an escaped const char* is binary-safe (the
    reader uses sp_str_byte_len, not strlen). Block layout:
    [sp_str_hdr][0xfd marker][data ...][NUL]. s->data points at `data`. The ctor
    and in-place mutators are also reached with bare C string literals (no marker
@@ -47,10 +47,8 @@ static inline sp_String*sp_String_freeze(sp_String*s){if(s){if(s->temporarily_lo
 #define SP_FD_HDR (sizeof(sp_str_hdr)+1)   /* header + marker byte */
 #define SP_FD_OVH (sizeof(sp_str_hdr)+2)   /* header + marker + NUL terminator */
 static inline char *sp_fd_base(const char *data){return (char*)data-SP_FD_HDR;}
-/* The payload's `next` field carries the owning sp_String rather than a heap
-   link: these blocks are malloc'd and never join the string heap, so nothing
-   walks that list, and a container holding the escaped `const char *` has no
-   other way back to the handle. Without it the mark reaches the bytes and
+/* The payload's `next` field points to the owning sp_String. A container
+   holding the escaped `const char *` uses this link to mark the handle. Without it the mark reaches the bytes and
    stops, the handle goes unreferenced, and sp_String_fin frees the bytes the
    container still points at. sp_fd_own publishes it; every path that lays out
    a payload has to call it. */
@@ -206,8 +204,6 @@ static inline void sp_String_append_enc(sp_String*s,const char*t,size_t tl){
 }
 /* the first tl bytes of t: the append form of an interpolation (emit_interp_append) */
 static inline void sp_String_append_n(sp_String*s,const char*t,size_t tl){if (SP_UNLIKELY(!s)) sp_nil_recv("<<"); if (!t)return;if(sp_String_is_immutable(s)){sp_raise_frozen_str(s->data);return;}sp_String_append_enc(s,t,tl);sp_fd_append_len(s,t,(int64_t)tl);}
-/* append_as_bytes preserves the handle's encoding as well as embedded NULs. */
-static inline void sp_String_append_bytes(sp_String*s,const char*t){if (SP_UNLIKELY(!s)) sp_nil_recv("<<"); if (!t)return;if(sp_String_is_immutable(s)){sp_raise_frozen_str(s->data);return;}sp_fd_append_len(s,t,(int64_t)sp_str_byte_len(t));}
 static inline void sp_String_append_bin(sp_String*s,const char*t){
   if (SP_UNLIKELY(!s)) sp_nil_recv("<<"); if (!t)return;
   if(sp_String_is_immutable(s)){sp_raise_frozen_str(s->data);return;}
@@ -385,23 +381,17 @@ static inline const char*sp_String_cstr(sp_String*s){return s->data;}
 static inline const char*sp_String_cstr_nil(sp_String*s){return s?s->data:NULL;}
 static inline int64_t sp_String_length(sp_String*s){return s->len;}
 
-/* A String no other name holds, boxed for something that keeps the box:
-   boxes a mutable heap String as a new handle over its bytes,
-   which sp_String_new_fresh copies before it allocates, so every copy of
-   the box names the one String. So is an unfrozen static one (0xff, a
-   folded interpolation's bytes): it stands for a new String, which a
-   mutation through the box changes (`a = ["#{v}?"]; a[0] << "!"`). A
-   frozen String is boxed as itself, as nothing can change it and its
-   identity is its bytes'; so is any String otherwise (sp_box_str). */
+/* Borrow the handle in a checked String result when the caller reads bytes. */
+static inline sp_String *sp_obj_to_str_handle(int cls_id, void *object) {
+  int found;
+  sp_RbVal value = sp_obj_to_str_fn(cls_id, object, &found);
+  return value.tag == SP_TAG_NIL ? NULL : (sp_String *)value.v.p;
+}
+
+/* Box a managed String, using the owner of its live payload or the
+   static handle of a frozen literal when it already has one. */
 static inline sp_RbVal sp_box_str_new(const char *v) {
-  if (v) {
-    unsigned char m = ((const unsigned char *)v)[-1];
-    if (m == 0xfe || m == 0xfc || m == 0xff) return sp_box_obj(sp_String_new_fresh(v), SP_BUILTIN_STRBUF);
-    /* the runtime's empty answer is static, but stands for the new empty
-       String the call made (`"" * 2`): nil.to_s's frozen one is not this */
-    if (v == sp_str_empty) return sp_box_obj(sp_String_new_fresh(v), SP_BUILTIN_STRBUF);
-  }
-  return sp_box_str(v);
+  return sp_box_nullable_obj(sp_String_new_shared(v), SP_BUILTIN_STRBUF);
 }
 
 /* sp_box_str_new for a String that may be nil (NULL): the nil box, else the new String's handle box */
@@ -412,8 +402,7 @@ static inline sp_RbVal sp_box_nullable_str_new(const char *v) { return v ? sp_bo
    a new handle over a copy of them, which an append through any copy of the
    box changes. */
 static inline sp_RbVal sp_box_str_fresh(const char *v) {
-  if (v) return sp_box_obj(sp_String_new_fresh(v), SP_BUILTIN_STRBUF);
-  return sp_box_str(v);
+  return v ? sp_box_obj(sp_String_new_fresh(v), SP_BUILTIN_STRBUF) : sp_box_nil();
 }
 
 /* encode! on a handle, given the String encode answered for it (lib/sp_cold.c) */
@@ -421,8 +410,9 @@ void sp_String_encode_into(sp_String *h, const char *t);
 /* Cold in-place mutators (compiled once in lib/sp_string.c). */
 void sp_String_prepend(sp_String*s,const char*t);
 void sp_String_insert(sp_String*s,int64_t idx,const char*t);
-void sp_String_splice_chars(sp_String *s, sp_int from, sp_int n, const char *val, int range_form, int keep_enc);
+void sp_String_splice_chars(sp_String *s, sp_int from, sp_int n, const char *val, int single_byte, int keep_enc);
 void sp_String_splice_bytes(sp_String *s, sp_int start, sp_int len, const char *val, sp_int vstart, sp_int vlen, int keep_enc);
+void sp_String_splice_match(sp_String *s, sp_int start, sp_int len, const char *val);
 void sp_String_replace(sp_String*s,const char*t);
 sp_String*sp_String_dup(sp_String*s);
 #endif /* SP_STRING_H */

@@ -31,6 +31,7 @@
 #include "decide.h"
 #include "method_table_check.h"
 #include "order_plan.h"
+#include "pre_const.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,6 +45,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <dirent.h>
+#include <spawn.h>
 #include "timing.h"
 
 extern int g_no_root_elision;
@@ -501,6 +503,8 @@ static void usage(void) {
     "  --force     overwrite an -o path (with -c) or a --decisions-log path\n"
     "              that spinel did not write\n"
     "  -I DIR      Add a feature search root for `require \"name\"` (like ruby -I)\n"
+    "  -D NAME[=VALUE]  Define a compile-time constant (NAME=true without =VALUE)\n"
+    "              for constant-branch pruning before require resolution and inference\n"
     "  --strict-require  Refuse an unresolvable require instead of warning\n"
     "  --emit-rbs  Dump inferred type signatures as RBS (-> app.rbs), no binary\n"
     "  --emit-types Dump per-position inferred types + diagnostics as JSON\n"
@@ -563,6 +567,9 @@ static void usage(void) {
     "  --rbs DIR   Seed analyzer with RBS signatures from DIR (advisory)\n"
     "  --no-inline-rbs  Ignore inline RBS comments (`#: ...`, `# @rbs ...`)\n"
     "              in the program (default: apply them; docs/inline-rbs.md)\n"
+    "  --strict-rbs  Refuse at compile time any call site, assignment, return, or\n"
+    "              inherited layout that drops, widens, or contradicts an RBS\n"
+    "              signature pin instead of degrading or raising TypeError at run time\n"
     "  --int-overflow=MODE  Int +/-/* overflow handling (default: raise)\n"
     "  --no-bigint No value may be a Bignum: loop accumulators stay Integer and\n"
     "              raise on overflow, a value that could only be a Bignum is a\n"
@@ -571,16 +578,18 @@ static void usage(void) {
     "  --dump-ast  Print the text AST and exit (debug)\n"
     "  --dump-load-graph  Print the files the program loads and what each require\n"
     "              resolves to, and exit (debug)\n"
-    "  --load-model=MODEL  inline (default): required files are spliced in;\n"
-    "              graph: each file is its own root and a require a load node\n"
-    "              (a require that is a top-level statement, for now)\n"
+    "  --load-model=MODEL  graph (default): each file is its own root and a\n"
+    "              require a load node; inline: required files are spliced in\n"
     "  --dump-value-positions  Print the value positions of each method body and of\n"
     "              the program, and exit (debug)\n"
     "  --check-value-pos  Check the value-position iterator's limits and exit (debug)\n"
     "  --dump-implied-calls  Print the methods CRuby calls for each node of the program\n"
     "              that its text does not name, and exit (debug)\n"
     "  --method-table-check  Print the reads of the static method tables made outside\n"
-    "              call_target, and the answers that are the table's last definition (debug)\n");
+    "              call_target, and the answers that are the table's last definition (debug)\n\n"
+    "Environment:\n"
+    "  SPINEL_SKIP_BUILD_IF=SCRIPT  Before building from a Ruby file, run the shell script\n"
+    "              with the Ruby source and generated C paths. Exit 0 skips the build.\n");
 }
 
 /* --dump-ast (1), --dump-value-positions (2), --check-value-pos (3),
@@ -600,8 +609,8 @@ static int table_mode_of(const char *a) {
    build` has always compiled this way through SPINEL_STRICT_REQUIRE, and `spin
    flags` needs to hand the same gate to a caller driving the compiler itself
    (#4105). `--load-model=inline|graph` picks how required files are loaded:
-   spliced into one program (the default), or each kept as its own root with
-   a load node per require (#9898; requires that are top-level statements, for now). 1 when `a`
+   each kept as its own root with a load node per require (the default), or
+   spliced into one program. 1 when `a`
    is one of them. */
 static int parse_flag(const char *a) {
   if (sp_streq(a, "--strict-require")) return g_strict_require_cli = 1;
@@ -889,6 +898,25 @@ static int cc_native_build(const char *cmd, size_t src_at, size_t src_end, const
   return cc_rc;
 }
 
+/* A result-cache consumer can recognize a previous run from the C before
+   the native build starts. Only its explicit success skips the build: a
+   missing script, cache miss or interrupted child leaves cc in charge. */
+static int skip_native_build(const char *source, const char *c_path) {
+  const char *check = getenv("SPINEL_SKIP_BUILD_IF");
+  if (!check || !*check || access(check, R_OK) != 0) return 0;
+  extern char **environ;
+  /* Pass paths as argv, including on native Windows where CreateProcess
+     cannot run a file by its shebang. The runner has a POSIX shell. */
+  char *args[] = { "sh", "--", (char *)check, (char *)source, (char *)c_path, NULL };
+  pid_t pid;
+  if (posix_spawnp(&pid, "sh", NULL, NULL, args, environ) != 0) return 0;
+  int status;
+  while (waitpid(pid, &status, 0) < 0) {
+    if (errno != EINTR) return 0;
+  }
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
 /* A pointer of the wrong type in generated code is a miscompile, not a style
    question: it reads one struct through another's layout, which segfaults or
    answers garbage (a Symbol key dereferenced as a char *, #3975; an Integer
@@ -910,6 +938,117 @@ static void miscompile_errors(Str *cmd) {
    never starts with '-'. A missing one stops the run, where taking the
    next flag as the value lost that flag and failed later for a reason that
    named nothing. */
+/* Parse `-D NAME[=VALUE]` / `-DNAME[=VALUE]` into pre_const's table.
+   Returns 1 if consumed, 0 if not a -D option, -1 on error (reported). */
+static int define_opt(int argc, char **argv, int *i) {
+  const char *a = argv[*i], *spec = NULL;
+  if (sp_streq(a, "-D")) {
+    if (*i + 1 >= argc) { fprintf(stderr, "spinel: -D needs NAME or NAME=VALUE\n"); return -1; }
+    spec = argv[++(*i)];
+  }
+  else if (!strncmp(a, "-D", 2) && a[2]) spec = a + 2;
+  else return 0;
+  char err[256];
+  if (!sp_pre_define_cli(spec, err, sizeof err)) {
+    fprintf(stderr, "spinel: %s\n", err);
+    return -1;
+  }
+  (*i)++;
+  return 1;
+}
+
+/* Probe target pointer width, i386 flag, and RUBY_PLATFORM (matching
+   lib/spinel_rt.h's SP_RUBY_ARCH "-" SP_RUBY_OS) before sp_parse_file runs. */
+static const char *probe_target_platform(const char *cc_cmd, int target_wasi,
+                                         int *target_int_bits, int *target_i386) {
+  if (target_wasi) {
+    *target_int_bits = 32;
+    sp_pre_set_target_platform("wasm32-wasi");
+    return "";
+  }
+  const char *cc_width_flag = "";
+  const char *arch = NULL, *os = NULL;
+  if (!sp_streq(cc_cmd, "cc") || sizeof(void *) == 4) {
+    int x64 = 0, arm64 = 0, is_i386 = 0, arm = 0, wasm32 = 0;
+    int wasi = 0, lin = 0, apple = 0, fbsd = 0, obsd = 0, win32 = 0;
+    char ccq[1024];
+#ifdef _WIN32
+    snprintf(ccq, sizeof ccq, "%s -E -dM -x c NUL 2>NUL", cc_cmd);
+#else
+    snprintf(ccq, sizeof ccq, "%s -E -dM -x c /dev/null 2>/dev/null", cc_cmd);
+#endif
+    FILE *fp = popen(ccq, "r");
+    if (fp) {
+      char line[512];
+      while (fgets(line, sizeof line, fp)) {
+        static const char k[] = "#define __SIZEOF_POINTER__ ";
+        if (!strncmp(line, k, sizeof k - 1)) { int b = atoi(line + sizeof k - 1) * 8; if (b == 32 || b == 64) *target_int_bits = b; }
+        else if (!strncmp(line, "#define __x86_64__ ", 19) || !strncmp(line, "#define _M_X64 ", 15)) x64 = 1;
+        else if (!strncmp(line, "#define __aarch64__ ", 20) || !strncmp(line, "#define _M_ARM64 ", 17)) arm64 = 1;
+        else if (!strncmp(line, "#define __i386__ ", 17) || !strncmp(line, "#define _M_IX86 ", 16)) { is_i386 = 1; *target_i386 = 1; }
+        else if (!strncmp(line, "#define __arm__ ", 16)) arm = 1;
+        else if (!strncmp(line, "#define __wasm32__ ", 19)) wasm32 = 1;
+        else if (!strncmp(line, "#define __wasi__ ", 17)) wasi = 1;
+        else if (!strncmp(line, "#define __linux__ ", 18)) lin = 1;
+        else if (!strncmp(line, "#define __APPLE__ ", 18)) apple = 1;
+        else if (!strncmp(line, "#define __FreeBSD__ ", 20)) fbsd = 1;
+        else if (!strncmp(line, "#define __OpenBSD__ ", 20)) obsd = 1;
+        else if (!strncmp(line, "#define _WIN32 ", 15)) win32 = 1;
+      }
+      pclose(fp);
+    }
+    if (sp_streq(cc_cmd, "cc") && *target_int_bits == 64) {
+      cc_width_flag = "-m32 ";
+      *target_int_bits = 32;
+#if defined(__i386__)
+      *target_i386 = 1;
+#endif
+      if (x64) { x64 = 0; is_i386 = 1; }
+    }
+    arch = (x64 && win32) ? "x64" : x64 ? "x86_64" : arm64 ? "aarch64" : is_i386 ? "i686" : arm ? "arm" : wasm32 ? "wasm32" : "unknown";
+    os = wasi ? "wasi" : lin ? "linux" : apple ? "darwin" : fbsd ? "freebsd" : obsd ? "openbsd" : win32 ? "mingw-ucrt" : "unknown";
+  }
+  else {
+#if defined(__i386__)
+    *target_i386 = 1;
+#endif
+#if (defined(__x86_64__) || defined(_M_X64)) && defined(_WIN32)
+    arch = "x64";
+#elif defined(__x86_64__) || defined(_M_X64)
+    arch = "x86_64";
+#elif defined(__aarch64__) || defined(_M_ARM64)
+    arch = "aarch64";
+#elif defined(__i386__) || defined(_M_IX86)
+    arch = "i686";
+#elif defined(__arm__)
+    arch = "arm";
+#elif defined(__wasm32__)
+    arch = "wasm32";
+#else
+    arch = "unknown";
+#endif
+#if defined(__wasi__)
+    os = "wasi";
+#elif defined(__linux__)
+    os = "linux";
+#elif defined(__APPLE__)
+    os = "darwin";
+#elif defined(__FreeBSD__)
+    os = "freebsd";
+#elif defined(__OpenBSD__)
+    os = "openbsd";
+#elif defined(_WIN32)
+    os = "mingw-ucrt";
+#else
+    os = "unknown";
+#endif
+  }
+  char plat[64];
+  snprintf(plat, sizeof plat, "%s-%s", arch, os);
+  sp_pre_set_target_platform(plat);
+  return cc_width_flag;
+}
+
 static const char *ext_option_value(int argc, char **argv, int *i, const char *flag) {
   if (*i + 1 >= argc || argv[*i + 1][0] == '-') {
     fprintf(stderr, "spinel: %s needs a value\n", flag);
@@ -1007,6 +1146,7 @@ int main(int argc, char **argv) {
     else if (!strncmp(a, "--rbs=", 6))    { rbs_dir = a + 6; i++; }
     else if (sp_streq(a, "--rbs"))         { if (++i < argc) rbs_dir = argv[i]; i++; }
     else if (sp_streq(a, "--no-inline-rbs")) { sp_inline_rbs_enabled = 0; i++; }
+    else if (sp_streq(a, "--strict-rbs"))  { g_opt_strict_rbs = 1; i++; }
     else if (sp_streq(a, "--disable=frozen-string-literal") ||
              sp_streq(a, "--disable-frozen-string-literal")) {
       fprintf(stderr, "spinel: --disable=frozen-string-literal is not "
@@ -1073,6 +1213,7 @@ int main(int argc, char **argv) {
     else if (sp_streq(a, "--timing"))      { set_env("SP_TIMING", "1"); i++; }
     else if (sp_streq(a, "-I"))            { if (++i < argc) sp_add_feature_root(argv[i]); i++; }
     else if (!strncmp(a, "-I", 2) && a[2]) { sp_add_feature_root(a + 2); i++; }
+    else if (a[0] == '-' && a[1] == 'D')   { if (define_opt(argc, argv, &i) < 0) return 1; }
     else if (sp_streq(a, "-S"))            { stdout_mode = 1; i++; }
     /* every String slot is the handle, the only representation: the
        option that chose it is accepted and ignored */
@@ -1322,40 +1463,13 @@ int main(int argc, char **argv) {
     if (!sdk || !*sdk) sdk = getenv("WASI_SDK_PATH");
     if (!sdk || !*sdk) sdk = "/opt/wasi-sdk";
     snprintf(wasi_cc, sizeof wasi_cc, "%s/bin/clang", sdk);
-    if (!file_exists(wasi_cc)) {
+    if (file_exists(wasi_cc)) cc_cmd = wasi_cc;
+    else if (!(c_only && !print_build) && !stdout_mode && !dump_ast && !emit_rbs && !emit_types && !emit_symbol_map) {
       fprintf(stderr, "spinel: --target=wasm32-wasi needs the wasi-sdk: %s is not there (set WASI_SDK to where it is)\n", wasi_cc);
       return 1;
     }
-    cc_cmd = wasi_cc;
   }
-  /* A 32-bit spinel on a 64-bit host (`make CC='cc -m32'`) ships a 32-bit
-     runtime archive beside itself, and the default `cc` there is 64-bit: the
-     program is told -m32, so the toolchain it saw is the one it uses. */
-  const char *cc_width_flag = "";
-  if (!sp_streq(cc_cmd, "cc") || sizeof(void *) == 4) {
-    char ccq[1024];
-    snprintf(ccq, sizeof ccq, "%s -E -dM -x c /dev/null 2>/dev/null", cc_cmd);
-    FILE *fp = popen(ccq, "r");
-    if (fp) {
-      char line[512];
-      while (fgets(line, sizeof line, fp)) {
-        static const char k[] = "#define __SIZEOF_POINTER__ ";
-        if (!strncmp(line, k, sizeof k - 1)) { int b = atoi(line + sizeof k - 1) * 8; if (b == 32 || b == 64) sp_target_int_bits = b; }
-        if (!strncmp(line, "#define __i386__ ", 17)) target_i386 = 1;
-      }
-      pclose(fp);
-    }
-    if (sp_streq(cc_cmd, "cc") && sp_target_int_bits == 64) {
-      cc_width_flag = "-m32 ";
-      sp_target_int_bits = 32;
-#if defined(__i386__)
-      target_i386 = 1;
-#endif
-    }
-  }
-#if defined(__i386__)
-  else target_i386 = 1;
-#endif
+  const char *cc_width_flag = probe_target_platform(cc_cmd, target_wasi, &sp_target_int_bits, &target_i386);
   double tm_front = sp_timing_now();
   NodeTable *nt = sp_parse_file(source, argv[0]);
   if (eval_path[0]) remove(eval_path);
@@ -1483,6 +1597,12 @@ int main(int argc, char **argv) {
     if (!print_build) { free(csrc); return 0; }
   }
 
+  if (!eval_used && !run_mode && !c_only && !print_build && skip_native_build(source, c_path)) {
+    remove(c_path);
+    free(csrc);
+    return 0;
+  }
+
   /* ---------- link: cc <generated C> -> native binary ---------- */
   char lib_dir[4096];
   resolve_lib_dir(argv[0], lib_dir, sizeof lib_dir);
@@ -1588,6 +1708,19 @@ int main(int argc, char **argv) {
      0 means unlimited in both -- in each compiler's own spelling; an unknown
      -f flag is an error, not a warning (#4152). */
   s_add(&cmd, cc_is_clang(cc_cmd) ? "-ferror-limit=0 " : "-fmax-errors=0 ");
+  /* gcc's preprocessor keeps where each piece of a system header macro's
+     expansion came from, and -E writes that down: every NULL (or stdout, or
+     INT64_MAX) a line of the generated C expands gets a line marker into
+     the header and back, and the rest of the line is padded with spaces to
+     the column it stood in. A whole Ruby statement is one C line, so a
+     line holding a few hundred NULLs came out of -E megabytes long, and a
+     large program's preprocessed unit for the split build (cc_split_build,
+     unit_cache.c) was tens of GB. Asked not to track macro expansions, gcc
+     writes the expansion in place, as clang does; only the notes a
+     diagnostic adds about the macro an expression came from go with it. The
+     flag is gcc's alone (clang refuses it), so it is asked for where the -f
+     spellings above are. */
+  if (!cc_is_clang(cc_cmd)) s_add(&cmd, "-ftrack-macro-expansion=0 ");
   /* clang stops parsing at 256 nested brackets ("bracket nesting level
      exceeded maximum of 256"), a guard of its own stack against
      pathological input. The generated C nests a statement expression per

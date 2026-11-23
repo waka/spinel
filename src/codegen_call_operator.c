@@ -161,7 +161,7 @@ static int poly_cmp_reopen_test(Compiler *c, int id, int recv, const char *v, ch
     { CORE_INTEGER, "%s.tag == SP_TAG_INT || %s.tag == SP_TAG_BIGINT" },
     { CORE_FLOAT,   "%s.tag == SP_TAG_FLT" },
     { CORE_NUMERIC, "%s.tag == SP_TAG_INT || %s.tag == SP_TAG_BIGINT || %s.tag == SP_TAG_FLT" },
-    { CORE_STRING,  "%s.tag == SP_TAG_STR" },
+    { CORE_STRING,  "sp_rbval_is_string(%s)" },
     { CORE_SYMBOL,  "%s.tag == SP_TAG_SYM" },
     { CORE_TRUECLASS,  "(%s.tag == SP_TAG_BOOL && %s.v.i)" },
     { CORE_FALSECLASS, "(%s.tag == SP_TAG_BOOL && !%s.v.i)" },
@@ -169,7 +169,10 @@ static int poly_cmp_reopen_test(Compiler *c, int id, int recv, const char *v, ch
   size_t n = 0; out[0] = '\0';
   for (size_t i = 0; i < sizeof owners / sizeof owners[0]; i++) {
     int k = comp_core_class(c, owners[i].cls);
-    if (k < 0 || cplan_implied_target(c, id, recv, k, "<=>", CIT_TABLE, NULL) < 0) continue;
+    if (k < 0) continue;
+    int mi = owners[i].cls == CORE_STRING ? call_target(c, id, k, "<=>", 0, NULL)
+                                          : cplan_implied_target(c, id, recv, k, "<=>", CIT_TABLE, NULL);
+    if (mi < 0) continue;
     char one[200];
     snprintf(one, sizeof one, owners[i].tags, v, v, v);
     n += (size_t)snprintf(out + n, n < cap ? cap - n : 0, "%s(%s)", n ? " || " : "", one);
@@ -516,6 +519,7 @@ int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
      Promote to a bigint shift. */
   if (recv >= 0 && argc == 1 && sp_streq(name, "<<") && rt == TY_INT &&
       repr_of(c, id).big) {
+    if (emit_bigint_shift_lit(c, id, b)) return 1;   /* both sides literal */
     buf_puts(b, "sp_bigint_shl(sp_bigint_new_int(");
     emit_expr(c, recv, b);
     buf_puts(b, "), ");
@@ -549,7 +553,7 @@ int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       buf_printf(b, "; SP_GC_ROOT(_t%d); sp_Bigint *_t%d = ", tbl, tbr);
       if (a0r.big) emit_expr(c, argv[0], b);
       else if (a0r.kind == RK_BOXED) { buf_puts(b, "sp_poly_as_bigint("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
-      else { buf_puts(b, "sp_bigint_new_int("); emit_int_expr(c, argv[0], b); buf_puts(b, ")"); }
+      else if (!emit_bigint_lit(c, argv[0], b)) { buf_puts(b, "sp_bigint_new_int("); emit_int_expr(c, argv[0], b); buf_puts(b, ")"); }
       buf_printf(b, "; SP_GC_ROOT(_t%d); sp_bigint_%s(_t%d, _t%d); })", tbr, fn, tbl, tbr);
     }
     return 1;
@@ -772,10 +776,10 @@ int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       oint_lift_open(c, id, TY_INT, b);
       buf_printf(b, "({ int _t%d = sp_bigint_cmp(", tc);
       if (lrt == TY_BIGINT) emit_expr(c, recv, b);
-      else { buf_puts(b, "sp_bigint_new_int("); emit_expr(c, recv, b); buf_puts(b, ")"); }
+      else if (!emit_bigint_lit(c, recv, b)) { buf_puts(b, "sp_bigint_new_int("); emit_expr(c, recv, b); buf_puts(b, ")"); }
       buf_puts(b, ", ");
       if (latr.big) emit_expr(c, argv[0], b);
-      else { buf_puts(b, "sp_bigint_new_int("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+      else if (!emit_bigint_lit(c, argv[0], b)) { buf_puts(b, "sp_bigint_new_int("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
       buf_printf(b, "); (sp_int)((_t%d > 0) - (_t%d < 0)); })", tc, tc);
       oint_lift_close(c, id, b);
       return 1;
@@ -1284,6 +1288,13 @@ int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       }
     }
     if (rt == TY_UNKNOWN) return emit_untyped_recv_cmp(c, name, recv, argv[0], b);
+    /* a nil receiver whose call the plan proves raises (nil has no `<`):
+       the general call's missing-method gate, as for arithmetic
+       (emit_array_arith_call) */
+    if (recv >= 0 && repr_of(c, recv).as_ty == TY_NIL) {
+      char own[128];
+      if (cplan_unrouted(c, id, own, sizeof own, NULL) == CU_RAISES) return 0;
+    }
     unsupported(c, id, "comparison");
   }
 
@@ -1373,7 +1384,7 @@ int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
          class: its own class name is the one to compare */
       buf_printf(b, "(_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_EXCEPTION && _t%d.v.p) ? "
                     "strcmp(((sp_Exception *)_t%d.v.p)->cls_name, sp_class_to_s(_t%d)) == 0 : "
-                    "sp_poly_get_class(_t%d).cls_id == _t%d.cls_id; })", t, t, t, t, k, t, k);
+                    "sp_class_eq(sp_poly_get_class(_t%d), _t%d); })", t, t, t, t, k, t, k);
     else
       buf_printf(b, "sp_poly_is_a(_t%d, _t%d); })", t, k);
     if (boxed_ans) buf_puts(b, ")");
@@ -1773,13 +1784,17 @@ int emit_call_operator_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
     const char *keyct = hrr.key == TY_SYMBOL ? "sp_sym"
                       : hrr.key == TY_STRING ? "const char *" : "sp_RbVal";
     const char *kbox = hrr.key == TY_SYMBOL ? "sp_box_sym(_key)"
-                     : hrr.key == TY_STRING ? "sp_box_str(_key)" : "_key";
+                     : hrr.key == TY_STRING ? "sp_box_str_new(_key)" : "_key";
     const char *dn2 = uid_new();
     buf_printf(&g_procs,
       "static sp_RbVal _sp_hash_dproc_%s(sp_%sHash *_self_h, %s _key, void *_dproc_self) {\n"
+      "  SP_GC_ROOT(_self_h);\n"
+      "  SP_GC_ROOT(_dproc_self);\n"
+      "  sp_RbVal _boxed_key = %s;\n"
+      "  SP_GC_ROOT_RBVAL(_boxed_key);\n"
       "  return sp_penum_call2((sp_Proc *)_dproc_self,"
-      " sp_box_nullable_obj((void *)_self_h, %s), %s);\n}\n",
-      dn2, hn2, keyct, hash_box_cls(hrt), kbox);
+      " sp_box_nullable_obj((void *)_self_h, %s), _boxed_key);\n}\n",
+      dn2, hn2, keyct, kbox, hash_box_cls(hrt));
     int th2 = ++g_tmp, tp2 = ++g_tmp;
     buf_printf(b, "({ sp_%sHash *_t%d = ", hn2, th2); emit_expr(c, recv, b);
     buf_printf(b, "; sp_Proc *_t%d = ", tp2); emit_expr(c, argv[0], b);

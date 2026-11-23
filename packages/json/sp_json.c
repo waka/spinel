@@ -11,11 +11,13 @@
 #include <string.h>
 #include <stdlib.h>           /* strtoll, strtod */
 #include <errno.h>            /* ERANGE past int64 */
+#include <limits.h>           /* INT_MAX (jp_raise) */
 #include <math.h>             /* isinf, isnan */
 #include <float.h>            /* FLT_EVAL_METHOD (jp_float_exact) */
 #include <stdio.h>            /* snprintf (sp_json_float) */
 sp_Bigint *sp_bigint_new_str(const char *s, int base);   /* the runtime archive (sp_bigint.c) */
 const char *sp_poly_to_s(sp_RbVal v);                   /* the runtime archive (sp_poly_cold.c) */
+const char *sp_str_inspect(const char *s);              /* the runtime archive (sp_str_cold.c) */
 
 /* A 0xff-marked rodata literal, so sp_str_byte_len reads its length correctly
    (matches spinel_rt.h's SPL). Used for the fixed tokens true/false/null. */
@@ -322,15 +324,14 @@ static void jb_int(jbuf *b, sp_int n) {
    raise, throw, or return past the walk: the buffer moves to the heap first,
    as before any user code. */
 static void sp_json_key_b(jbuf *b, sp_RbVal k) {
-  /* the usual keys straight into the buffer, as sp_json_key would write them */
-  sp_RbVal ks = sp_rbval_str(k);
-  switch (ks.tag) {
-    case SP_TAG_STR: jb_rstr(b, ks.v.s); return;
-    case SP_TAG_SYM: jb_sym(b, (sp_sym)ks.v.i); return;
-    case SP_TAG_INT: jb_c(b, '"'); jb_int(b, ks.v.i); jb_c(b, '"'); return;
+  /* the usual keys straight into the buffer, without calling #to_s */
+  if (sp_rbval_is_string(k)) { jb_rstr(b, sp_rbval_string_bytes(k)); return; }
+  switch (k.tag) {
+    case SP_TAG_SYM: jb_sym(b, (sp_sym)k.v.i); return;
+    case SP_TAG_INT: jb_c(b, '"'); jb_int(b, k.v.i); jb_c(b, '"'); return;
     default: break;
   }
-  if (ks.tag == SP_TAG_BOOL) { jb_str(b, ks.v.b ? "true" : "false"); return; }
+  if (k.tag == SP_TAG_BOOL) { jb_str(b, k.v.b ? "true" : "false"); return; }
   /* any other key is its #to_s, as CRuby's json generates it: a Float, nil,
      an Array, an object of the program's own. It is written through this
      buffer, so the walk's options escape it too, and rooted while the buffer
@@ -371,9 +372,7 @@ static void sp_json_obj_text_b(jbuf *b, sp_RbVal v) {
     int found = 0;
     sp_RbVal r = sp_obj_to_s_fn(v.cls_id, v.v.p, &found);
     if (found) {
-      const char *us = r.tag == SP_TAG_STR ? r.v.s
-                     : r.tag == SP_TAG_OBJ && r.cls_id == SP_BUILTIN_STRBUF && r.v.p ? sp_String_cstr((sp_String *)r.v.p)
-                     : NULL;
+      const char *us = sp_rbval_is_string(r) ? sp_rbval_string_bytes(r) : NULL;
       if (!us) {
         const char *tn = r.tag == SP_TAG_NIL ? "nil" : r.tag == SP_TAG_BOOL ? (r.v.b ? "true" : "false")
                        : r.tag == SP_TAG_INT || r.tag == SP_TAG_BIGINT ? "Integer" : r.tag == SP_TAG_FLT ? "Float"
@@ -480,7 +479,7 @@ static const char *sp_json_float(double d) {
 
 /* Everything but a container: the leaf arms, answering one GC string. */
 static const char *sp_json_scalar_o(sp_RbVal v, int allow_nan) {
-  v = sp_rbval_str(v);
+  if (sp_rbval_is_string(v)) return sp_json_rstr(sp_rbval_string_bytes(v));
   switch (v.tag) {
     case SP_TAG_INT:  return sp_int_to_s(v.v.i);
     case SP_TAG_BIGINT: return sp_bigint_to_s((sp_Bigint *)v.v.p);
@@ -496,7 +495,6 @@ static const char *sp_json_scalar_o(sp_RbVal v, int allow_nan) {
       return sp_json_float(v.v.f);
     case SP_TAG_BOOL: return v.v.b ? JSPL("true") : JSPL("false");
     case SP_TAG_NIL:  return JSPL("null");
-    case SP_TAG_STR:  return sp_json_rstr(v.v.s);
     case SP_TAG_SYM:  return sp_json_sym((sp_sym)v.v.i);
     default: return JSPL("null");
   }
@@ -513,7 +511,7 @@ static void sp_json_val_b(jbuf *b, sp_RbVal v, int depth);
    that does not parse -- leave this frame without coming back to it, so the
    walk moves the buffer to the collector before it calls any of that code. */
 const char *sp_json_val(sp_RbVal v) {
-  if (v.tag != SP_TAG_OBJ) return sp_json_scalar(v);
+  if (v.tag != SP_TAG_OBJ && !(v.tag == SP_TAG_SYM && sp_obj_to_json_fn)) return sp_json_scalar(v);
   SP_GC_ROOT_RBVAL(v);   /* see sp_json_pretty below */
   char stk[JB_STACK_N]; jbuf b; JB_ON_STACK(b, stk);
   SP_GC_ROOT_STR(b.heap);
@@ -524,7 +522,7 @@ const char *sp_json_val(sp_RbVal v) {
    but the caller's LIMIT (0 for none; past it, ArgumentError "exceed depth
    limit"), and NaN / Infinity written out */
 const char *sp_json_dump(sp_RbVal v, sp_int limit) {
-  if (v.tag != SP_TAG_OBJ) return sp_json_scalar_o(v, 1);
+  if (v.tag != SP_TAG_OBJ && !(v.tag == SP_TAG_SYM && sp_obj_to_json_fn)) return sp_json_scalar_o(v, 1);
   SP_GC_ROOT_RBVAL(v);
   char stk[JB_STACK_N]; jbuf b; JB_ON_STACK(b, stk);
   b.dump = 1;
@@ -538,7 +536,7 @@ const char *sp_json_dump(sp_RbVal v, sp_int limit) {
    for the collector -- a dozen per small object; the rest (a Bigint,
    NaN and the Infinities, which raise or are dump's) as before. */
 static void sp_json_leaf_b(jbuf *b, sp_RbVal v) {
-  v = sp_rbval_str(v);
+  if (sp_rbval_is_string(v)) { jb_rstr(b, sp_rbval_string_bytes(v)); return; }
   switch (v.tag) {
     case SP_TAG_INT: jb_int(b, v.v.i); return;
     case SP_TAG_FLT:
@@ -547,8 +545,16 @@ static void sp_json_leaf_b(jbuf *b, sp_RbVal v) {
          walk's buffer is released first, as for its other raises */
       if (!b->dump && !b->allow_nan) jb_release(b);
       break;
-    case SP_TAG_STR: jb_rstr(b, v.v.s); return;
-    case SP_TAG_SYM: jb_sym(b, (sp_sym)v.v.i); return;
+    case SP_TAG_SYM:
+      /* a reopened Symbol's own #to_json, which CRuby's json calls (it
+         writes only Integer, Float, String, nil, true and false itself);
+         the hook answers NULL where the program has none */
+      if (sp_obj_to_json_fn) {
+        jb_to_heap(b);   /* the user's method may raise, throw, or return past us */
+        const char *uj = sp_obj_to_json_fn(v);
+        if (uj) { jb_gcs(b, uj, (size_t)sp_str_byte_len(uj)); return; }
+      }
+      jb_sym(b, (sp_sym)v.v.i); return;
     case SP_TAG_BOOL: if (v.v.b) jb_add(b, "true", 4); else jb_add(b, "false", 5); return;
     case SP_TAG_NIL: jb_add(b, "null", 4); return;
     default: break;
@@ -632,11 +638,10 @@ static void sp_json_indent(jbuf *b, int depth) {
 }
 
 static void sp_json_pretty_val(jbuf *b, sp_RbVal v, int depth) {
-  if (b->raw) {
-    /* a String of a re-read document (held as its handle or not) straight
-       into this buffer, unchecked */
-    sp_RbVal sv = sp_rbval_str(v);
-    if (sv.tag == SP_TAG_STR) { jb_rstr(b, sv.v.s); return; }
+  if (b->raw && sp_rbval_is_string(v)) {
+    /* A String of a re-read document goes straight into the buffer. */
+    jb_rstr(b, sp_rbval_string_bytes(v));
+    return;
   }
   if (v.tag == SP_TAG_OBJ) {
     int kind = sp_json_kind_fn ? sp_json_kind_fn(v) : 0;
@@ -767,30 +772,91 @@ typedef struct {
   const char *p, *end;
   const char *start;
   int allow_duplicate_key;
+  /* JSON.parse's allow_nan, allow_trailing_comma and
+     allow_control_characters */
+  int allow_nan, allow_trailing_comma, allow_control_characters;
   sp_int max_nesting;           /* zero disables the nesting check */
   int in_array;                 /* arrays open around the read */
   int nkeys; jkey keys[JP_KEYS];   /* by length, then bytes */
   sp_RbVal *held;               /* the cached keys, kept alive for the parse */
 } jrd;
 
-static SP_NORETURN void jp_err(const char *msg) {
-  sp_raise_cls("JSON::ParserError", msg);
-}
-static const char *jp_position(jrd *j, const char *at) {
-  int line = 1, column = 1;
-  for (const char *p = j->start; p < at; p++) {
-    if (*p == '\n') { line++; column = 1; }
-    else column++;
+/* A parse error says what json 2.18.0's parser (the gate's reference, Ruby
+   4.0.9) says, at the place it says it (raise_parse_error there): the
+   message, then with `frag` the input from `at` (below), then the line and
+   column of `at`, which the error's #line and #column answer too.
+   - The column counts the bytes back from `at`, itself included, to the
+     newline before it; the line counts the newlines before that one. So the
+     line is one short past the first line, and an error on a newline is at
+     column 0. `at` may be the end, or one past it (a string ending in a
+     backslash), and counts as a byte there that is not a newline.
+   - The input is "EOF" at the end. Elsewhere it is up to 32 bytes, up to
+     the first NUL, newline, space, tab or CR, quoted, less a last character
+     past ASCII (complete or not, as json 2.18.0 cuts it). When the byte at
+     `at` is itself one of those five, it is the rest of the input up to its
+     first NUL, unquoted. */
+static SP_NORETURN void jp_raise(jrd *j, const char *at, const char *msg, int frag) {
+  ptrdiff_t i = at - j->start, n = j->end - j->start;
+  long column = 0, line = 1;
+  while (i >= 0) {
+    int nl = i < n && j->start[i] == '\n';
+    i--;
+    if (nl) break;
+    column++;
   }
-  /* json 2.18.0's backward scan omits the nearest newline from the line count. */
-  if (line > 1) line--;
-  return sp_sprintf(" at line %d column %d", line, column);
+  for (; i >= 0; i--) if (j->start[i] == '\n') line++;
+  /* the fragment is written into the message itself, by its length: the
+     unquoted rest of a long input is not copied once more on the way */
+  const char *body = "", *quote = "";
+  size_t len = 0;
+  if (frag) {
+    if (at >= j->end) { body = "EOF"; len = 3; }
+    else {
+      size_t left = (size_t)(j->end - at);
+      while (len < 32 && len < left) {
+        char c = at[len];
+        if (!c || c == '\n' || c == ' ' || c == '\t' || c == '\r') break;
+        len++;
+      }
+      if (len) {
+        /* at[len - 1] is json 2.18.0's buffer[len] */
+        while (len && (unsigned char)at[len - 1] >= 0x80 && (unsigned char)at[len - 1] < 0xC0) len--;
+        if (len && (unsigned char)at[len - 1] >= 0xC0) len--;
+        quote = "'";
+      }
+      else {
+        const char *z = memchr(at, 0, left);
+        len = z ? (size_t)(z - at) : left;
+      }
+      body = at;
+    }
+  }
+  if (len > INT_MAX) len = INT_MAX;
+  const char *m = sp_sprintf("%s%s%.*s%s at line %ld column %ld", msg, quote, (int)len, body, quote, line, column);
+  sp_raise_parse_error("JSON::ParserError", m, line, column);
 }
+/* Whitespace, and the comments json 2.18.0 takes by default between tokens
+   (`// ...` to the end of the line, `/ * ... * /`). */
 static void jp_ws(jrd *j) {
   while (j->p < j->end) {
     char c = *j->p;
-    if (c == ' ' || c == '\t' || c == '\n' || c == '\r') j->p++;
-    else break;
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { j->p++; continue; }
+    if (c != '/') break;
+    const char *start = j->p++;
+    if (j->p < j->end && *j->p == '/') {
+      const char *nl = memchr(j->p, '\n', (size_t)(j->end - j->p));
+      j->p = nl ? nl + 1 : j->end;
+    }
+    else if (j->p < j->end && *j->p == '*') {
+      j->p++;
+      for (;;) {
+        const char *star = memchr(j->p, '*', (size_t)(j->end - j->p));
+        if (!star) jp_raise(j, start, "unterminated comment, expected closing '*/'", 0);
+        j->p = star + 1;
+        if (j->p < j->end && *j->p == '/') { j->p++; break; }
+      }
+    }
+    else jp_raise(j, start, "unexpected token ", 1);
   }
 }
 static sp_RbVal jp_value(jrd *j, int depth);
@@ -804,18 +870,18 @@ static void jp_check_nesting(jrd *j, int depth) {
     sp_raise_cls("SystemStackError", "stack level too deep");
 }
 
-static void jp_hex4(jrd *j, jbuf *b, unsigned *out) {
-  if (j->end - j->p < 4) { free(b->p); jp_err("incomplete \\u escape"); }
-  unsigned cp = 0;
+/* The four hex digits at `h` (the input holds them), or -1. */
+static long jp_hex4(const char *h) {
+  long cp = 0;
   for (int i = 0; i < 4; i++) {
-    char h = *j->p++;
+    char c = h[i];
     cp <<= 4;
-    if (h >= '0' && h <= '9') cp |= (unsigned)(h - '0');
-    else if (h >= 'a' && h <= 'f') cp |= (unsigned)(h - 'a' + 10);
-    else if (h >= 'A' && h <= 'F') cp |= (unsigned)(h - 'A' + 10);
-    else { free(b->p); jp_err("invalid \\u hex digit"); }
+    if (c >= '0' && c <= '9') cp |= c - '0';
+    else if (c >= 'a' && c <= 'f') cp |= c - 'a' + 10;
+    else if (c >= 'A' && c <= 'F') cp |= c - 'A' + 10;
+    else return -1;
   }
-  *out = cp;
+  return cp;
 }
 static void jp_utf8(jbuf *b, unsigned cp) {
   if (cp < 0x80) jb_c(b, (char)cp);
@@ -823,56 +889,82 @@ static void jp_utf8(jbuf *b, unsigned cp) {
   else if (cp < 0x10000) { jb_c(b, (char)(0xE0 | (cp >> 12))); jb_c(b, (char)(0x80 | ((cp >> 6) & 0x3F))); jb_c(b, (char)(0x80 | (cp & 0x3F))); }
   else { jb_c(b, (char)(0xF0 | (cp >> 18))); jb_c(b, (char)(0x80 | ((cp >> 12) & 0x3F))); jb_c(b, (char)(0x80 | ((cp >> 6) & 0x3F))); jb_c(b, (char)(0x80 | (cp & 0x3F))); }
 }
-/* Parse a "..." string (cursor at the opening quote) into a GC string. */
+/* Parse a "..." string (cursor at the opening quote) into a GC string.
+   As in json 2.18.0, the string's end is found first (a backslash skips the
+   byte after it; a control character or the end of the input is the error
+   there), and only then are its escapes read, so a bad escape before an
+   unterminated string is not the error. An error in an escape is placed
+   where json 2.18.0 places it: a \u cut short by the string's end, and a
+   high surrogate without its low one, at the start of the run of plain
+   bytes before it (`seg`); a bad hex digit and anything else at its
+   backslash.
+   allow_control_characters takes a raw control character as itself. A
+   backslash before one is still an error: json 2.18.0 answers the run before
+   it twice there (`"a\<TAB>"` reads as `aa\<TAB>`), which json 2.19 fixed by
+   raising an invalid escape; this follows 2.19. */
 static const char *jp_string(jrd *j) {
-  if (j->p >= j->end || *j->p != '"') jp_err("expected a string");
-  j->p++;
+  const char *s = j->p + 1, *q = s;
+  int escaped = 0;
+  while (q < j->end && *q != '"') {
+    if (*q == '\\') { escaped = 1; q += 2; continue; }
+    if ((unsigned char)*q < 0x20 && !j->allow_control_characters)
+      jp_raise(j, q, "invalid ASCII control character in string: ", 1);
+    q++;
+  }
+  if (q >= j->end) jp_raise(j, q, "unexpected end of input, expected closing \"", 0);
+  j->p = q + 1;
   /* the common string has no escape: its bytes are the input's, copied once
      into a string of their length, where a byte-at-a-time buffer grew by
-     realloc and was copied again. An escape or a control character leaves
-     the scan to the loop below, from the string's start. */
-  const char *q = j->p;
-  while (q < j->end && *q != '"' && *q != '\\' && (unsigned char)*q >= 0x20) q++;
-  if (q < j->end && *q == '"') {
-    size_t n = (size_t)(q - j->p);
+     realloc and was copied again */
+  if (!escaped) {
+    size_t n = (size_t)(q - s);
     char *r = sp_str_alloc(n);
-    memcpy(r, j->p, n);
+    memcpy(r, s, n);
     sp_str_set_len(r, n);
-    j->p = q + 1;
     return r;
   }
   jbuf b; memset(&b, 0, sizeof b);
-  while (j->p < j->end && *j->p != '"') {
-    char c = *j->p++;
-    /* RFC 8259 s7: control chars U+0000..U+001F must be escaped */
-    if ((unsigned char)c < 0x20) { free(b.p); jp_err("unescaped control character in string"); }
-    if (c != '\\') { jb_c(&b, c); continue; }
-    if (j->p >= j->end) { free(b.p); jp_err("unterminated escape"); }
-    char e = *j->p++;
-    switch (e) {
-      case '"': jb_c(&b, '"'); break;   case '\\': jb_c(&b, '\\'); break;
-      case '/': jb_c(&b, '/'); break;   case 'n': jb_c(&b, '\n'); break;
-      case 't': jb_c(&b, '\t'); break;  case 'r': jb_c(&b, '\r'); break;
-      case 'b': jb_c(&b, '\b'); break;  case 'f': jb_c(&b, '\f'); break;
+#define JP_STR_RAISE(at, msg) do { free(b.p); jp_raise(j, (at), (msg), 1); } while (0)
+  const char *seg = s, *e = s;
+  while (e < q) {
+    if (*e != '\\') { jb_c(&b, *e++); continue; }
+    char x = e[1];   /* the scan above skipped it, so it is before q */
+    switch (x) {
+      /* json 2.18.0 copies a '"' or '/' as the start of the next run */
+      case '"': case '/': jb_c(&b, x); seg = e + 1; e += 2; continue;
+      case '\\': jb_c(&b, '\\'); break;
+      case 'n': jb_c(&b, '\n'); break;  case 't': jb_c(&b, '\t'); break;
+      case 'r': jb_c(&b, '\r'); break;  case 'b': jb_c(&b, '\b'); break;
+      case 'f': jb_c(&b, '\f'); break;
       case 'u': {
-        unsigned cp; jp_hex4(j, &b, &cp);
+        if (q - e < 6) JP_STR_RAISE(seg, "incomplete unicode character escape sequence at ");
+        long cp = jp_hex4(e + 2);
+        if (cp < 0) JP_STR_RAISE(e, "incomplete unicode character escape sequence at ");
         /* a high surrogate needs a low one after it, as CRuby's parser has
            it ("\ud800x" and "\ud800A" raise); a lone low surrogate is
            written as its bytes, as there */
         if (cp >= 0xD800 && cp <= 0xDBFF) {
-          if (j->end - j->p < 2 || j->p[0] != '\\' || j->p[1] != 'u') { free(b.p); jp_err("incomplete surrogate pair"); }
-          j->p += 2; unsigned lo; jp_hex4(j, &b, &lo);
-          if (lo < 0xDC00 || lo > 0xDFFF) { free(b.p); jp_err("invalid surrogate pair"); }
+          if (q - e < 12 || e[6] != '\\' || e[7] != 'u') JP_STR_RAISE(seg, "incomplete surrogate pair at ");
+          long lo = jp_hex4(e + 8);
+          if (lo < 0) JP_STR_RAISE(e + 6, "incomplete unicode character escape sequence at ");
+          if (lo < 0xDC00 || lo > 0xDFFF) JP_STR_RAISE(seg, "invalid surrogate pair at ");
           cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+          e += 6;
         }
-        jp_utf8(&b, cp);
+        jp_utf8(&b, (unsigned)cp);
+        e += 4;
         break;
       }
-      default: free(b.p); jp_err("invalid escape");
+      default:
+        if (j->allow_control_characters) JP_STR_RAISE(e, "invalid escape character in string: ");
+        if (x == '\n') JP_STR_RAISE(e, "Invalid unescaped newline character (\\n) in string: ");
+        if ((unsigned char)x < 0x20) JP_STR_RAISE(e, "invalid ASCII control character in string: ");
+        JP_STR_RAISE(e, "invalid escape character in string: ");
     }
+    e += 2;
+    seg = e;
   }
-  if (j->p >= j->end) { free(b.p); jp_err("unterminated string"); }
-  j->p++;  /* closing quote */
+#undef JP_STR_RAISE
   return jb_finish(&b);
 }
 /* An object's key: the frozen key the Hash stores as is, made from the
@@ -881,7 +973,6 @@ static const char *jp_string(jrd *j) {
    array. A key with an escape or a control character is read as a String,
    which the Hash copies. */
 static const char *jp_key(jrd *j) {
-  if (j->p >= j->end || *j->p != '"') jp_err("expected a string");
   const char *s = j->p + 1, *q = s;
   while (q < j->end && *q != '"' && *q != '\\' && (unsigned char)*q >= 0x20) q++;
   if (q >= j->end || *q != '"') return jp_string(j);
@@ -901,8 +992,9 @@ static const char *jp_key(jrd *j) {
   if (j->nkeys < JP_KEYS && j->held->tag == SP_TAG_NIL) *j->held = sp_box_poly_array(sp_PolyArray_new());
   const char *k = sp_hash_key_from_bytes(s, n, 0);
   if (j->nkeys < JP_KEYS) {
-    SP_GC_ROOT_STR(k);
-    sp_PolyArray_push((sp_PolyArray *)j->held->v.p, sp_box_str(k));
+    sp_String *owner = sp_str_fd_owner(k);
+    SP_GC_ROOT(owner);
+    sp_PolyArray_push((sp_PolyArray *)j->held->v.p, sp_box_obj(owner, SP_BUILTIN_STRBUF));
     memmove(&j->keys[lo + 1], &j->keys[lo], sizeof(jkey) * (size_t)(j->nkeys - lo));
     j->keys[lo].key = k; j->keys[lo].len = n;
     j->nkeys++;
@@ -952,15 +1044,11 @@ static sp_RbVal jp_number(jrd *j) {
   int is_float = 0;
   if (j->p < j->end && *j->p == '-') j->p++;
   const char *ds = j->p;
-  /* integer part (RFC 8259 s6): a lone 0, or 1-9 then digits -- no leading zeros */
-  if (j->p < j->end && *j->p == '0') {
-    j->p++;
-    if (j->p < j->end && *j->p >= '0' && *j->p <= '9') jp_err("leading zero in number");
-  }
-  else {
-    while (j->p < j->end && *j->p >= '0' && *j->p <= '9') j->p++;
-    if (j->p == ds) jp_err("expected a digit in number");
-  }
+  /* integer part (RFC 8259 s6): a lone 0, or 1-9 then digits -- no leading
+     zeros. Every malformed number is json 2.18.0's "invalid number" at its
+     start, its sign included. */
+  while (j->p < j->end && *j->p >= '0' && *j->p <= '9') j->p++;
+  if (j->p == ds || (*ds == '0' && j->p - ds > 1)) jp_raise(j, start, "invalid number: ", 1);
   /* the integer digits end at de; the fraction's and the exponent's are
      empty (at de) without one */
   const char *de = j->p, *fs = de, *fe = de, *es = de, *ee = de;
@@ -970,7 +1058,7 @@ static sp_RbVal jp_number(jrd *j) {
     is_float = 1; j->p++;
     fs = j->p;
     while (j->p < j->end && *j->p >= '0' && *j->p <= '9') j->p++;
-    if (j->p == fs) jp_err("expected a digit after '.'");
+    if (j->p == fs) jp_raise(j, start, "invalid number: ", 1);
     fe = j->p;
   }
   /* exponent: e/E, optional sign, then at least one digit */
@@ -979,11 +1067,10 @@ static sp_RbVal jp_number(jrd *j) {
     if (j->p < j->end && (*j->p == '+' || *j->p == '-')) xneg = *j->p++ == '-';
     es = j->p;
     while (j->p < j->end && *j->p >= '0' && *j->p <= '9') j->p++;
-    if (j->p == es) jp_err("expected a digit in exponent");
+    if (j->p == es) jp_raise(j, start, "invalid number: ", 1);
     ee = j->p;
   }
   size_t n = (size_t)(j->p - start);
-  if (n == 0) jp_err("invalid number");
   /* an Integer of at most 18 digits cannot pass int64: its value is read
      straight off the input, with no copy for strtoll */
   if (!is_float && n - (*start == '-') <= 18) {
@@ -1000,7 +1087,7 @@ static sp_RbVal jp_number(jrd *j) {
      for an integer longer than that, which is a Bignum and has no limit */
   char stk[64];
   char *tmp = n < sizeof stk ? stk : (char *)malloc(n + 1);
-  if (!tmp) jp_err("invalid number");
+  if (!tmp) sp_raise_cls("NoMemoryError", "failed to allocate memory");
   memcpy(tmp, start, n); tmp[n] = 0;
   sp_RbVal r;
   if (is_float) r = sp_box_float(strtod(tmp, NULL));
@@ -1029,17 +1116,23 @@ static sp_RbVal jp_array(jrd *j, int depth) {
     j->in_array--;
     sp_PolyArray_push((sp_PolyArray *)box.v.p, v);
     jp_ws(j);
-    if (j->p >= j->end) jp_err("unterminated array");
-    if (*j->p == ',') { j->p++; continue; }
-    if (*j->p == ']') { j->p++; break; }
-    jp_err("expected ',' or ']' in array");
+    if (j->p < j->end && *j->p == ',') {
+      j->p++;
+      if (j->allow_trailing_comma) {
+        jp_ws(j);
+        if (j->p < j->end && *j->p == ']') { j->p++; break; }
+      }
+      continue;
+    }
+    if (j->p < j->end && *j->p == ']') { j->p++; break; }
+    jp_raise(j, j->p, "expected ',' or ']' after array value", 0);
   }
   return box;
 }
 static void jp_duplicate(jrd *j, const char *at, const char *key) {
-  const char *name = sp_poly_inspect_fn(sp_box_str(key)); SP_GC_ROOT_STR(name);
-  const char *position = jp_position(j, at); SP_GC_ROOT_STR(position);
-  jp_err(sp_sprintf("duplicate key %s%s", name, position));
+  const char *name = sp_str_inspect(key); SP_GC_ROOT_STR(name);
+  const char *msg = sp_sprintf("duplicate key %s", name); SP_GC_ROOT_STR(msg);
+  jp_raise(j, at, msg, 0);
 }
 static sp_RbVal jp_object(jrd *j, int depth) {
   const char *start = j->p;
@@ -1050,41 +1143,66 @@ static sp_RbVal jp_object(jrd *j, int depth) {
   jp_ws(j);
   if (j->p < j->end && *j->p == '}') { j->p++; return box; }
   jp_check_nesting(j, depth);
-  for (;;) {
-    jp_ws(j);
+  /* json 2.18.0 words the first key's errors without the colon after "got" */
+  for (int first = 1;; first = 0) {
+    if (j->p >= j->end || *j->p != '"')
+      jp_raise(j, j->p, first ? "expected object key, got " : "expected object key, got: ", 1);
     const char *key = jp_key(j);
     SP_GC_ROOT_STR(key);   /* survive the value parse; the hash stores the ptr */
     jp_ws(j);
-    if (j->p >= j->end || *j->p != ':') jp_err("expected ':' in object");
+    if (j->p >= j->end || *j->p != ':') {
+      if (first) jp_raise(j, j->p, "expected ':' after object key", 0);
+      jp_raise(j, j->p, "expected ':' after object key, got: ", 1);
+    }
     j->p++;
     sp_RbVal v = jp_value(j, depth + 1);
     sp_int before = sp_json_len_fn(box);
     sp_json_hash_set_fn(box, key, v);
     if (!j->allow_duplicate_key && !duplicate && before == sp_json_len_fn(box)) duplicate = key;
     jp_ws(j);
-    if (j->p >= j->end) jp_err("unterminated object");
-    if (*j->p == ',') { j->p++; continue; }
-    if (*j->p == '}') { j->p++; break; }
-    jp_err("expected ',' or '}' in object");
+    if (j->p < j->end && *j->p == ',') {
+      j->p++; jp_ws(j);
+      if (j->allow_trailing_comma && j->p < j->end && *j->p == '}') { j->p++; break; }
+      continue;
+    }
+    if (j->p < j->end && *j->p == '}') { j->p++; break; }
+    jp_raise(j, j->p, "expected ',' or '}' after object value, got: ", 1);
   }
   if (duplicate) jp_duplicate(j, start, duplicate);
   return box;
 }
 static sp_RbVal jp_value(jrd *j, int depth) {
   jp_ws(j);
-  if (j->p >= j->end) jp_err("unexpected end of input");
+  /* where a value is expected, json 2.18.0 reads a NUL byte as the end */
+  if (j->p >= j->end || !*j->p) jp_raise(j, j->p, "unexpected end of input", 0);
   char c = *j->p;
   if (c == '{') return jp_object(j, depth);
   if (c == '[') return jp_array(j, depth);
   if (c == '"') return sp_box_str_new(jp_string(j));
-  if (c == 't') { if (j->end - j->p >= 4 && !memcmp(j->p, "true", 4))  { j->p += 4; return sp_box_bool(1); } jp_err("expected 'true'"); }
-  if (c == 'f') { if (j->end - j->p >= 5 && !memcmp(j->p, "false", 5)) { j->p += 5; return sp_box_bool(0); } jp_err("expected 'false'"); }
-  if (c == 'n') { if (j->end - j->p >= 4 && !memcmp(j->p, "null", 4))  { j->p += 4; return sp_box_nil(); } jp_err("expected 'null'"); }
+  if (c == 't') { if (j->end - j->p >= 4 && !memcmp(j->p, "true", 4))  { j->p += 4; return sp_box_bool(1); } jp_raise(j, j->p, "unexpected token ", 1); }
+  if (c == 'f') { if (j->end - j->p >= 5 && !memcmp(j->p, "false", 5)) { j->p += 5; return sp_box_bool(0); } jp_raise(j, j->p, "unexpected token ", 1); }
+  if (c == 'n') { if (j->end - j->p >= 4 && !memcmp(j->p, "null", 4))  { j->p += 4; return sp_box_nil(); } jp_raise(j, j->p, "unexpected token ", 1); }
+  /* NaN and the infinities are words of their own: refused as tokens, or
+     with allow_nan the Floats, read as a whole word only ("NaNx" leaves the
+     x to what follows) */
+  if (c == 'N') {
+    if (j->allow_nan && j->end - j->p >= 3 && !memcmp(j->p, "NaN", 3)) { j->p += 3; return sp_box_float(NAN); }
+    jp_raise(j, j->p, "unexpected token ", 1);
+  }
+  if (c == 'I') {
+    if (j->allow_nan && j->end - j->p >= 8 && !memcmp(j->p, "Infinity", 8)) { j->p += 8; return sp_box_float(INFINITY); }
+    jp_raise(j, j->p, "unexpected token ", 1);
+  }
+  if (c == '-' && j->end - j->p >= 9 && !memcmp(j->p + 1, "Infinity", 8)) {
+    if (j->allow_nan) { j->p += 9; return sp_box_float(-INFINITY); }
+    jp_raise(j, j->p, "unexpected token ", 1);
+  }
   if (c == '-' || (c >= '0' && c <= '9')) return jp_number(j);
-  jp_err("unexpected character");
+  jp_raise(j, j->p, "unexpected character: ", 1);
 }
 
-sp_RbVal sp_json_parse_duplicates(const char *s, sp_int max_nesting, int allow_duplicate_key) {
+sp_RbVal sp_json_parse_with(const char *s, sp_int max_nesting, int allow_duplicate_key,
+                            int allow_nan, int allow_trailing_comma, int allow_control_characters) {
   /* The reader walks `s` in place while the parse allocates every container
      and string it builds, so the input has to stay rooted for the whole walk:
      a caller passing it straight in (`JSON.parse File.read path`) holds it in
@@ -1097,17 +1215,20 @@ sp_RbVal sp_json_parse_duplicates(const char *s, sp_int max_nesting, int allow_d
   jrd j;
   j.max_nesting = max_nesting;
   j.allow_duplicate_key = allow_duplicate_key;
+  j.allow_nan = allow_nan;
+  j.allow_trailing_comma = allow_trailing_comma;
+  j.allow_control_characters = allow_control_characters;
   j.in_array = 0; j.nkeys = 0; j.held = &held;
   j.p = s ? s : "";
   j.start = j.p;
   j.end = j.p + (s ? sp_str_byte_len(s) : 0);
   sp_RbVal v = jp_value(&j, 0);
   jp_ws(&j);
-  if (j.p != j.end) jp_err("unexpected trailing characters");
+  if (j.p != j.end) jp_raise(&j, j.p, "unexpected token at end of stream ", 1);
   return v;
 }
 sp_RbVal sp_json_parse_limit(const char *s, sp_int max_nesting) {
-  return sp_json_parse_duplicates(s, max_nesting, 1);
+  return sp_json_parse_with(s, max_nesting, 1, 0, 0, 0);
 }
 
 sp_RbVal sp_json_parse(const char *s) { return sp_json_parse_limit(s, SP_JSON_MAX_NESTING); }

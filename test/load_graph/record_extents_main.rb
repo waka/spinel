@@ -3,12 +3,12 @@
 # start (from), the statement after which it has certainly run (sure), the
 # most runs it has (count) and whether it runs at a time the syntax does not
 # tell (kept). A method nothing calls never runs; one called once at the top
-# level starts and is sure at that call; one called in a loop or under a
-# rescue runs many times and is sure only where the call is. A block of
-# 0.times runs no time, of 1.times and of a one-element literal's each once,
-# of 3.times many; a stored lambda runs when the program calls it, an at_exit
-# body after the load phase, and a file required in a method, which no load
-# point places, from the statement that calls the method.
+# level (also main's) starts and is sure at that call; one called in a loop or
+# under a rescue runs many times and is sure only where the call is. A block
+# of 0.times runs no time, of 1.times and of a one-element literal's each
+# once, of 3.times many; a stored lambda runs when the program calls it, an
+# at_exit body after the load phase, and a file required in a method, which
+# no load point places, from (and sure at) the statement that calls it.
 # A call that runs only under a condition inside its statement (`c && K.a`, a
 # ternary, a modifier if, a case arm) is not sure at it, nor is a block of one
 # (`c && 1.times {}`); an iterator that may skip its block (uniq, sort_by!,
@@ -91,3 +91,25 @@ oa.x ||= H.e
 hk = { k: 1 }
 hk[:k] &&= H.f
 p nav1, nav2, dfn, hh, beg, oa.x, hk
+# A lambda or proc held in a constant or a local starts at the first call
+# that invokes it: one nothing invokes never runs, one invoked by one call
+# that runs once runs once, and one read other than as an invoke's receiver
+# (`arity`) starts where it is made.
+class LC
+  NEVER = -> { 1 }
+  ONCE = lambda { 2 }
+  TWICE = proc { 3 }
+  SEEN = -> { 4 }
+end
+p LC::ONCE.call, LC::TWICE.(), LC::TWICE[], LC::SEEN.arity
+ll = -> { 6 }
+p ll.call
+# A define_method or define_singleton_method body starts at the first call
+# of the method it makes, and one whose method nothing calls never runs.
+class DM
+  define_singleton_method(:later) { 7 }
+  define_singleton_method(:unused) { 8 }
+  define_method(:inst) { 9 }
+end
+p :between
+p DM.later, DM.new.inst

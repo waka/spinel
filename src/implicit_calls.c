@@ -150,6 +150,17 @@ static int ic_calls(Compiler *c, int id, IcSink *s, IcMode mode) {
       if (s->roles & BCR_ARG) ic_push(s, "to_int", id, BCR_ARG, 0, NULL);
       return s->n;
     }
+    /* ENV writes convert their two arguments through to_str. ENV is a
+       singleton value, so the core class callback rows have no row for it. */
+    if (nk == NK_CallNode && is_store_alias(name) && call_plain_argc(c, id) == 2) {
+      int recv = nt_ref(nt, id, "receiver");
+      int env = c->ic && c->ic->typed ? env_value_recv(c, recv, comp_ntype(c, recv))
+                : nt_kind(nt, recv) == NK_ConstantReadNode && is_env_const(nt_str(nt, recv, "name"));
+      if (env) {
+        if (s->roles & BCR_ARG) ic_push(s, "to_str", id, BCR_ARG, 0, NULL);
+        return s->n;
+      }
+    }
     /* a method a C extension defines receives values the extension's C code
        calls CRuby's protocol methods on (rb_num2long asks for to_int, and so
        on) and sends names it computes: any callback name, as for a core name
@@ -371,7 +382,12 @@ int ic_operand_may_hold(Compiler *c, const IcCall *k) {
   switch (k->role) {
   case BCR_ARG:
   case BCR_CLASS:
-    for (int i = 0; i < an; i++) if (ic_may_be_object(c, av[i], k->name)) return 1;
+    for (int i = 0; i < an; i++) {
+      int arg = av[i];
+      if (nt_kind(nt, arg) == NK_SplatNode) {
+        if (ic_may_hold_elems(c, nt_ref(nt, arg, "expression"), k->name)) return 1;
+      } else if (ic_may_be_object(c, arg, k->name)) return 1;
+    }
     return 0;
   case BCR_ELEM:
     if (recv < 0 || ic_may_hold_elems(c, recv, k->name)) return 1;

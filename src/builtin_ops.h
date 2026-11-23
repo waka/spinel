@@ -208,6 +208,7 @@ typedef enum {
   BOPE_IVAR_REFLECTION,   /* reflection on a builtin value without ivar slots */
   BOPE_FLOAT_RATIONALIZE,
   BOPE_STRING_SCAN_CHECKED,
+  BOPE_STRING_UNPACK,
   /* String#[]=, #insert, #clear and #slice!, which change the receiver's
      String in place through its handle (codegen_call_string.c, stage 7) */
   BOPE_STRING_ASET,
@@ -215,9 +216,11 @@ typedef enum {
   BOPE_STRING_CLEAR,
   BOPE_STRING_SLICE,
   BOPE_STRING_BYTESPLICE,
+  BOPE_STRING_APPEND_AS_BYTES,
   BOPE_STRING_DEDUP,     /* String#dedup: -@ under the name a nil receiver is raised with */
   BOPE_STRING_SCRUB_BLOCK, /* String#scrub with a block */
   BOPE_STRING_LINES,       /* String#lines without a block */
+  BOPE_STRING_CASECMP,
   BOPE_BOXED_ARRAY_COUNT, /* a count-taking Enumerable read through a box */
   BOPE_BOXED_ARRAY_ONLY,  /* a boxed Array read that requires an Array */
   BOPE_BOXED_ARRAY_OR_RANGE, /* a boxed read that accepts Array and Range */
@@ -379,6 +382,9 @@ typedef struct BuiltinOp {
    build, so the row answers for its own class only and the lookup does not
    hand it down the singleton chain. */
 #define BOPF_OWN_CLASS 16384
+/* The emitter accepts the full Ruby operand list, including a spread or
+   a fixed count beyond BOP_ARGC_ANY. A boxed arm can reuse held operands. */
+#define BOPF_ARGV 32768
 
 /* A row's recv may name a family of kinds rather than one; a caller looks
    the family up with the family's value. Not a TyKind any value has. */
@@ -811,7 +817,8 @@ int iter_row_named(const char *name);
 int object_iter_runs_now(const char *name);
 /* The iterator row a call with a block reads on a receiver of kind rt:
    any receiver's (tap, then, each_with_object), else its family's (an
-   Array's, a Hash's, a Range's, ...), or NULL. */
+   Array's, a Hash's, a Range's, ...), or NULL. A call with no receiver is
+   asked as kind BOP_KERNEL: Kernel's rows (catch, loop). */
 const IterRow *iter_row_of(TyKind rt, const char *name, int argc);
 /* What the row of `name` on a receiver of kind rt says of how often it runs
    its block: IR_EACH, IR_ONCE, IR_COUNT_RECV, IR_ELEMS for a row that steps

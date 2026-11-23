@@ -192,7 +192,7 @@ static int emit_exc_detailed_options(Compiler *c, int id, int recv, int argc, co
   buf_printf(b, "const char *_msg%d = %s(_e%d); ", te,
              exc_has_user_msg_override(c) ? "sp_user_exc_message" : "sp_exc_message", te);
   int boxed = repr_of(c, id).kind == RK_BOXED;
-  if (boxed) buf_puts(b, "sp_box_str(");
+  if (boxed) buf_puts(b, "sp_box_str_new(");
   buf_printf(b, "_h%d ? sp_exc_detailed_highlight(_e%d, _msg%d) : "
                 "sp_exc_detailed_text(_e%d, _msg%d)", th, te, te, te, te);
   buf_puts(b, boxed ? "); })" : "; })");
@@ -220,6 +220,10 @@ const char *isa_exc_class_name(Compiler *c, int arg, char *buf, size_t bufsz) {
   return buf;
 }
 
+/* the call emit_call_exception_arms re-enters on the boxed exception
+   (exc_user_method_name), -1 outside it */
+static int exc_um_skip = -1;
+int exc_um_reentered(int id) { return id >= 0 && id == exc_um_skip; }
 int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv) {
   if (recv >= 0 && is_exception_message(name) && (argc || nt_ref(nt, id, "block") >= 0) &&
       repr_of(c, recv).exc && exc_has_user_msg_override(c) && emit_exc_bound_send(c, id, recv, b)) return 1;
@@ -312,7 +316,8 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
       { int tfm = ++g_tmp;
         Buf rbm = expr_buf(c, recv);
         emit_indent(g_pre, g_indent);
-        buf_printf(g_pre, "sp_Exception *_t%d = (sp_Exception *)(%s);\n", tfm, rbm.p ? rbm.p : "");
+        buf_printf(g_pre, "sp_Exception *_t%d = (sp_Exception *)(%s); SP_GC_ROOT(_t%d);\n",
+                   tfm, rbm.p ? rbm.p : "", tfm);
         free(rbm.p);
         const char *mfn = exc_has_user_msg_override(c) ? "sp_user_exc_message" : "sp_exc_message";
         if (sp_streq(name, "full_message"))
@@ -483,10 +488,12 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
       nt_ref(nt, id, "block") < 0 &&
       (sp_streq(name, "message") || sp_streq(name, "result") ||
        sp_streq(name, "errno") || sp_streq(name, "error_code") ||
+       sp_streq(name, "line") || sp_streq(name, "column") ||
        sp_streq(name, "key") || sp_streq(name, "receiver") ||
        sp_streq(name, "args") || sp_streq(name, "private_call?") ||
        sp_streq(name, "backtrace") || sp_streq(name, "cause") ||
-       is_exception_full_message(name)) &&
+       is_exception_full_message(name) ||
+       (exc_um_skip == id && exc_um_only_acc(name))) &&
       repr_of(c, recv).as_ty == TY_POLY) {
     int pu = user_defines_or_reads(c, name) || cls_value_owns_name(c, id, name);
     if (!pu || g_poly_builtin_arm) {
@@ -511,9 +518,9 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
         int t = ++g_tmp;
         buf_printf(b, "({ sp_RbVal _t%d = ", t);
         emit_expr(c, recv, b);
-        buf_printf(b, "; sp_Exception *_e%d = (_t%d.tag == SP_TAG_OBJ && _t%d.v.p && "
+        buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_Exception *_e%d = (_t%d.tag == SP_TAG_OBJ && _t%d.v.p && "
                       "(_t%d.cls_id == SP_BUILTIN_EXCEPTION || sp_is_exc_subclass_cls(_t%d.cls_id)))"
-                      " ? (sp_Exception *)_t%d.v.p : NULL; ", t, t, t, t, t, t);
+                      " ? (sp_Exception *)_t%d.v.p : NULL; ", t, t, t, t, t, t, t);
         if (sp_streq(name, "full_message"))
           buf_printf(b, "_e%d ? sp_exc_full_text(_e%d, sp_user_exc_message(_e%d))",
                      t, t, t);
@@ -549,8 +556,7 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
      parameter it is passed to): the call re-enters with the receiver boxed
      as the exception it is, and the poly dispatch keys it by its user class,
      raising NoMethodError for any exception whose class lacks the method */
-  static int exc_um_skip = -1;   /* the call being re-entered below */
-  if (recv >= 0 && exc_um_skip != id && comp_ntype(c, recv) == TY_EXCEPTION && exc_user_method_name(c, name, argc)) {
+  if (recv >= 0 && exc_um_skip != id && comp_ntype(c, recv) == TY_EXCEPTION && exc_user_method_name(c, id, name, argc)) {
     int tv = ++g_tmp;
     buf_printf(b, "({ sp_RbVal _t%d = sp_box_nullable_obj((void *)(", tv);
     emit_expr(c, recv, b);
@@ -723,6 +729,8 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
     }
     if (sp_streq(name, "full_message")) {
       int t = hoist_exc_recv(c, recv);
+      emit_indent(g_pre, g_indent);
+      buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", t);
       const char *mfn = exc_has_user_msg_override(c) ? "sp_user_exc_message" : "sp_exc_message";
       buf_printf(b, "sp_exc_full_text(_t%d, %s(_t%d))", t, mfn, t);
       return 1;
@@ -730,6 +738,8 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
     /* detailed_message without keywords -> "message (ClassName)" */
     if (sp_streq(name, "detailed_message")) {
       int t = hoist_exc_recv(c, recv);
+      emit_indent(g_pre, g_indent);
+      buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", t);
       const char *mfn = exc_has_user_msg_override(c) ? "sp_user_exc_message" : "sp_exc_message";
       buf_printf(b, "sp_exc_detailed_text(_t%d, %s(_t%d))", t, mfn, t);
       return 1;
@@ -1064,12 +1074,22 @@ static int emit_call_raise_arms_in(Compiler *c, int id, Buf *b, const NodeTable 
            initialize builds the errno text (SystemCallError.new itself
            wants a message and raises ArgumentError) */
         if ((xc >= 0 && class_is_syserr(c, xc)) || (xc < 0 && is_syserr_family_name(effn))) {
-          if (sp_streq(effn, "SystemCallError"))
+          int sri = xc < 0 ? syserr_reinit_initialize(c, id, effn) : -1, srt = 0;
+          if (sri >= 0) {
+            /* a reopening above SystemCallError runs on the built message */
+            buf_puts(b, raise_fn("sp_raise_exc"));
+            syserr_reinit_open(&srt, b);
+            if (sp_streq(effn, "SystemCallError")) buf_puts(b, "sp_syserr_new_v(0, NULL)");
+            else buf_printf(b, "sp_exc_new(\"%s\", sp_syserr_msg_a(\"%s\", 0, NULL))", effn, effn);
+            syserr_reinit_close(c, sri, srt, b);
+            buf_puts(b, ")");
+          }
+          else if (sp_streq(effn, "SystemCallError"))
             buf_printf(b, "%ssp_syserr_new_v(0, NULL))", raise_fn("sp_raise_exc"));
           else
             buf_printf(b, "%s\"%s\", sp_syserr_msg_a(\"%s\", 0, NULL))", raise_fn("sp_raise_cls"), effn, effn);
         }
-        else buf_printf(b, "%s\"%s\", (&(\"\\xff\")[1]))", raise_fn("sp_raise_cls"), effn);
+        else buf_printf(b, "%s\"%s\", (&(\"\\xff\")[1]))", raise_fn("sp_raise_cls_u"), effn);   /* (the program's raise: sp_raise_cls_u records no key or receiver on a KeyError or NameError) */
       }
     }
     else if (ac >= 2 && nt_type(nt, av[0]) &&
@@ -1149,35 +1169,41 @@ static int emit_call_raise_arms_in(Compiler *c, int id, Buf *b, const NodeTable 
         /* `raise Errno::ENOENT, "x"` is Errno::ENOENT.new("x"): the errno
            text, " - x" (SystemCallError.new("x") an unknown error) */
         else if ((xc >= 0 && class_is_syserr(c, xc)) || (xc < 0 && is_syserr_family_name(effn))) {
+          int sri = xc < 0 ? syserr_reinit_initialize(c, id, effn) : -1, srt = 0;
           if (sp_streq(effn, "SystemCallError")) {
             buf_puts(b, raise_fn("sp_raise_exc"));
+            if (sri >= 0) syserr_reinit_open(&srt, b);
             emit_syserr_call(c, id, "sp_syserr_new_v", "", 1, &av[1], b);
+            if (sri >= 0) syserr_reinit_close(c, sri, srt, b);
             buf_puts(b, ")");
           }
           else {
             char lead[192]; snprintf(lead, sizeof lead, "\"%s\", ", effn);
-            buf_printf(b, "%s\"%s\", ", raise_fn("sp_raise_cls"), effn);
-            emit_syserr_call(c, id, "sp_syserr_msg_a", lead, 1, &av[1], b);
+            if (sri >= 0) {
+              buf_puts(b, raise_fn("sp_raise_exc"));
+              syserr_reinit_open(&srt, b);
+              buf_printf(b, "sp_exc_new(\"%s\", ", effn);
+              emit_syserr_call(c, id, "sp_syserr_msg_a", lead, 1, &av[1], b);
+              buf_puts(b, ")");
+              syserr_reinit_close(c, sri, srt, b);
+            }
+            else {
+              buf_printf(b, "%s\"%s\", ", raise_fn("sp_raise_cls"), effn);
+              emit_syserr_call(c, id, "sp_syserr_msg_a", lead, 1, &av[1], b);
+            }
             buf_puts(b, ")");
           }
         }
         else {
           /* an explicitly given message is kept even when empty, unlike the
              class-only form, which falls back to the class name (#3711) */
-          Buf mh; memset(&mh, 0, sizeof mh);
-          int mk;
-          if (comp_ntype(c, av[1]) == TY_STRING && exc_msg_hold(c, av[1], b, &mh, &mk)) {
-            /* the exception is built here, holding the handle, as the
-               rescue would build it (sp_exc_new_for_catch) */
-            buf_printf(b, "%s(sp_Exception *)sp_exc_attach_msg(sp_exc_new_for_catch(\"%s\", "
-                          "sp_exc_msg_given(%s", raise_fn("sp_raise_exc"), effn, "SP_STR_B(");
-            emit_expr(c, av[1], b);
-            buf_printf(b, "%s)), %s))", ")", mh.p);
-            exc_msg_release(b, mk);
-            free(mh.p);
+          if (comp_ntype(c, av[1]) == TY_STRING && exc_msg_holds(c, av[1])) {
+            buf_printf(b, "%s\"%s\", ", raise_fn("sp_raise_cls_handle"), effn);
+            emit_str_form_handle(c, av[1], b);
+            buf_puts(b, ")");
           }
           else if (comp_ntype(c, av[1]) == TY_STRING) {
-            buf_printf(b, "%s\"%s\", sp_exc_msg_given(%s", raise_fn("sp_raise_cls"), effn, "SP_STR_B(");
+            buf_printf(b, "%s\"%s\", sp_exc_msg_given(%s", raise_fn("sp_raise_cls_u"), effn, "SP_STR_B(");
             emit_expr(c, av[1], b);
             buf_puts(b, ")))");
           }
@@ -1186,7 +1212,7 @@ static int emit_call_raise_arms_in(Compiler *c, int id, Buf *b, const NodeTable 
             int rt2 = ++g_tmp;
             buf_printf(b, "({ sp_RbVal _t%d = ", rt2); emit_boxed(c, av[1], b);
             buf_printf(b, "; %s\"%s\", _t%d.tag == SP_TAG_NIL ? (&(\"\\xff\")[1])"
-                          " : sp_exc_msg_given(sp_poly_to_s(_t%d))); })", raise_fn("sp_raise_cls"), effn, rt2, rt2);
+                          " : sp_exc_msg_given(sp_poly_to_s(_t%d))); })", raise_fn("sp_raise_cls_u"), effn, rt2, rt2);
           }
         }
       }
@@ -1231,8 +1257,6 @@ static int emit_call_raise_arms_in(Compiler *c, int id, Buf *b, const NodeTable 
       else if (at == TY_STRING) {
         /* `raise "msg"` raises RuntimeError with the message, holding a
            shared String's handle (exc_msg_handle) */
-        Buf mh; memset(&mh, 0, sizeof mh);
-        int mk;
         /* `raise "msg"` is `raise RuntimeError, "msg"`: a RuntimeError
            reopening's own initialize runs on it, as that form's does
            (emit_exc_reopen_construct). Raised by name, it skipped the
@@ -1247,13 +1271,10 @@ static int emit_call_raise_arms_in(Compiler *c, int id, Buf *b, const NodeTable 
           /* A reader's box keeps its shared field as the message. */
           buf_puts(b, raise_fn("sp_raise_poly")); emit_boxed(c, av[0], b); buf_puts(b, ")");
         }
-        else if (exc_msg_hold(c, av[0], b, &mh, &mk)) {
-          buf_printf(b, "%s(sp_Exception *)sp_exc_attach_msg(sp_exc_new_for_catch(\"RuntimeError\", "
-                      "sp_exc_msg_given(%s", raise_fn("sp_raise_exc"), "SP_STR_B(");
-          emit_expr(c, av[0], b);
-          buf_printf(b, "%s)), %s))", ")", mh.p);
-          exc_msg_release(b, mk);
-          free(mh.p);
+        else if (exc_msg_holds(c, av[0])) {
+          buf_printf(b, "%s\"RuntimeError\", ", raise_fn("sp_raise_cls_handle"));
+          emit_str_form_handle(c, av[0], b);
+          buf_puts(b, ")");
         }
         else { buf_puts(b, raise_fn("sp_raise")); buf_puts(b, "sp_exc_msg_given(SP_STR_B("); emit_expr(c, av[0], b); buf_puts(b, ")))"); }
       }
@@ -1290,16 +1311,12 @@ static int emit_call_raise_arms_in(Compiler *c, int id, Buf *b, const NodeTable 
 int exc_msg_handle(Compiler *c, int arg, Buf *b) {
   return arg >= 0 && strbuf_var_handle(c, arg, b);
 }
-/* ...and so does a message that is any other String value the plan hands
-   over as its handle (a reader's or a method's answer, a conversion, a
-   conditional): exc_msg_handle for a variable, else the handle held in a
-   temp the statement expression opened in b binds, which the message's
-   bytes read and the exception holds, so the value is evaluated once. 1
-   with *mh the handle's text, and *mark the bound node's mark when b was
-   opened (-1 otherwise); exc_msg_release closes it after the exception. */
+/* A String message uses its object. Keep the value rooted until the
+   constructor records it, and bind its bytes only where they are read. */
 int exc_msg_holds(Compiler *c, int arg) {
-  return arg >= 0 && comp_ntype(c, arg) == TY_STRING &&
-         share_plan_of(c, arg, SPR_TAKE, NULL).form == SPF_HANDLE;
+  if (arg < 0) return 0;
+  Repr r = repr_of(c, arg);
+  return r.as_ty == TY_STRING || r.kind == RK_STRBUF;
 }
 int exc_msg_hold(Compiler *c, int arg, Buf *b, Buf *mh, int *mark) {
   *mark = -1;

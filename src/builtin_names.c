@@ -107,7 +107,7 @@ int fresh_array_builtin_name(const char *nm) {
   static const char *const fresh[] = {
     "map", "collect", "flat_map", "collect_concat", "filter_map", "select", "filter",
     "reject", "sort", "sort_by", "reverse", "uniq", "compact", "flatten", "zip",
-    "split", "chars", "bytes", "lines", "scan", "keys", "values", "dup",
+    "split", "chars", "bytes", "unpack", "lines", "scan", "keys", "values", "dup",
     "take", "drop", "take_while", "drop_while", "rotate", "shuffle", "divmod",
     "+", "-", "*", "&", "|", NULL };
   return nm && str_in(nm, fresh);
@@ -484,6 +484,16 @@ int is_identity_query(const char *n) {
   return sp_streq(n, "equal?") || sp_streq(n, "object_id") || sp_streq(n, "__id__") || sp_streq(n, "frozen?");
 }
 
+/* Fixed arity of a boxed String reader's builtin fallback in a general send. */
+int string_boxed_reader_arity(const char *n) {
+  if (is_len_alias(n) || sp_streq(n, "empty?")) return 0;
+  if (is_spaceship_name(n) || sp_streq(n, "unpack1")) return 1;
+  return -1;
+}
+int is_string_boxed_reader(const char *n) {
+  return string_boxed_reader_arity(n) >= 0;
+}
+
 int is_len_alias(const char *n) {
   return sp_streq(n, "length") || sp_streq(n, "size");
 }
@@ -576,6 +586,16 @@ int is_reflective_access(const char *n) {
          sp_streq(n, "class_variable_get") || sp_streq(n, "class_variable_set") ||
          sp_streq(n, "const_get") || sp_streq(n, "const_set") || sp_streq(n, "remove_instance_variable") ||
          sp_streq(n, "remove_class_variable") || sp_streq(n, "remove_const");
+}
+/* The names that let a program set an instance variable it does not spell,
+   or one of an object it does not name: instance_variable_set, a block run
+   with another self (instance_eval, instance_exec, define_singleton_method),
+   and Marshal, YAML and Psych, which load objects with their ivars set
+   (ivar_never_set_in) */
+int is_unspelled_ivar_writer(const char *n) {
+  return n && (sp_streq(n, "instance_variable_set") || is_instance_eval_family(n) ||
+               sp_streq(n, "define_singleton_method") || sp_streq(n, "Marshal") ||
+               sp_streq(n, "YAML") || sp_streq(n, "Psych"));
 }
 /* The methods whose CRuby answer turns on the name they are given: a
    NameError for one not allowed as a name of its kind, or for one that is
@@ -825,9 +845,11 @@ int is_method_owner_query(const char *n) {
 
 int is_instance_method_name(const char *n) { return n && (sp_streq(n, "instance_method") || sp_streq(n, "public_instance_method")); }
 /* public_instance_method, public_method: the lookups that take public methods only */
-int is_public_method_lookup(const char *n) { return n && (sp_streq(n, "public_instance_method") || sp_streq(n, "public_method")); }
+const char PUBLIC_METHOD_NAME[] = "public_method";
+int is_public_method_lookup(const char *n) { return n && (sp_streq(n, "public_instance_method") || sp_streq(n, PUBLIC_METHOD_NAME)); }
 /* method, public_method: a Method of the receiver's own method by name */
-int is_bound_method_maker(const char *n) { return n && (sp_streq(n, "method") || sp_streq(n, "public_method")); }
+const char METHOD_NAME[] = "method";
+int is_bound_method_maker(const char *n) { return n && (sp_streq(n, METHOD_NAME) || sp_streq(n, PUBLIC_METHOD_NAME)); }
 /* super_method: the Method of the same method one step up its owner's chain */
 int is_super_method_name(const char *n) { return n && sp_streq(n, "super_method"); }
 int is_method_object_maker(const char *n) {
@@ -839,6 +861,10 @@ int is_constant_or_object_reflection(const char *n) {
   return sp_streq(n, "const_get") || sp_streq(n, "const_source_location") || sp_streq(n, "nesting") ||
          sp_streq(n, "attached_object") || sp_streq(n, "each_object") || sp_streq(n, "eval") ||
          sp_streq(n, "binding");
+}
+
+int is_const_reaching_name(const char *n) {
+  return n && (is_constant_or_object_reflection(n) || is_constants_list_name(n) || is_const_table_def_name(n) || is_remove_const_name(n));
 }
 
 int is_const_set_name(const char *n) {
@@ -1121,8 +1147,12 @@ int is_io_wait(const char *n) {
   return sp_streq(n, "wait_readable") || sp_streq(n, "wait_writable") || sp_streq(n, "wait_priority");
 }
 
+int is_io_syswrite(const char *n) {
+  return sp_streq(n, "syswrite");
+}
+
 int is_io_write(const char *n) {
-  return sp_streq(n, "write") || sp_streq(n, "syswrite");
+  return sp_streq(n, "write") || is_io_syswrite(n);
 }
 
 int is_path_reader(const char *n) {
@@ -1178,8 +1208,12 @@ int is_select_reject(const char *n) {
   return sp_streq(n, "select") || sp_streq(n, "reject") || sp_streq(n, "filter");
 }
 
+int is_casecmp_predicate(const char *n) {
+  return sp_streq(n, "casecmp?");
+}
+
 int is_casecmp_family(const char *n) {
-  return sp_streq(n, "casecmp") || sp_streq(n, "casecmp?");
+  return sp_streq(n, "casecmp") || is_casecmp_predicate(n);
 }
 
 int str_int_promotes(const char *n, int argc) {
@@ -1840,6 +1874,7 @@ static const struct { const char *name; const char *owners[4]; } gated_exc_acc[]
   {"signo", {"SignalException"}}, {"signm", {"SignalException"}},
   {"name", {"NameError"}}, {"errno", {"SystemCallError"}},
   {"error_code", {"Socket::ResolutionError"}}, {"result", {"StopIteration"}},
+  {"line", {"JSON::ParserError"}}, {"column", {"JSON::ParserError"}},
 };
 const char *const *gated_exception_accessor_owners(const char *n) {
   if (!n) return NULL;
@@ -1917,6 +1952,13 @@ int is_nil_method(const char *n) {
 }
 
 int is_io_read(const char *n) { return n && sp_streq(n, "read"); }
+int is_io_sysread(const char *n) { return sp_streq(n, "sysread"); }
+int io_output_buffer_pos(const char *n) {
+  if (!n) return -1;
+  if (sp_streq(n, "pread")) return 2;
+  if (is_io_read(n) || is_io_sysread(n) || sp_streq(n, "readpartial") || sp_streq(n, "read_nonblock")) return 1;
+  return -1;
+}
 int is_positional_io(const char *n) {
   return sp_streq(n, "pread") || sp_streq(n, "pwrite");
 }
@@ -2116,6 +2158,35 @@ int builtin_object_method_known(const char *m) {
   return builtin_object_method_owner(m) != NULL;
 }
 
+/* Is m a method a Class instance answers from Module or Class (private, attr_accessor, define_method,
+   instance_methods...), and no object's? Class undefines some of Module's (module_function, refine,
+   append_features, prepend_features, extend_object), which a class does not answer. */
+int builtin_module_method_known(const char *m) {
+  const char *own = NULL;
+  return m && core_method_vis("Class", m, 1, &own) > 0 && own && (sp_streq(own, "Module") || sp_streq(own, "Class")) &&
+         !builtin_object_method_known(m);
+}
+
+/* Is nm one of Object's public or private instance methods (Kernel's
+   private ones too, kernel_private_method): one an object answers before a
+   define_method replaces it? builtin_object_method_known asks only the
+   public ones the owner facts list. */
+int is_object_method_name(const char *nm) {
+  static const char *const names[] = {
+    "!", "!=", "!~", "<=>", "==", "===", "__callee__", "__dir__", "__id__", "__method__",
+    "__send__", "`", "class", "clone", "define_singleton_method", "display", "dup", "enum_for",
+    "eql?", "equal?", "extend", "freeze", "frozen?", "hash", "initialize", "initialize_clone",
+    "initialize_copy", "initialize_dup", "inspect", "instance_eval", "instance_exec",
+    "instance_of?", "instance_variable_defined?", "instance_variable_get",
+    "instance_variable_set", "instance_variables", "is_a?", "itself", "kind_of?", "method",
+    "method_missing", "methods", "nil?", "object_id", "private_methods", "protected_methods",
+    "public_method", "public_methods", "public_send", "remove_instance_variable", "respond_to?",
+    "respond_to_missing?", "send", "singleton_class", "singleton_method",
+    "singleton_method_added", "singleton_method_removed", "singleton_method_undefined",
+    "singleton_methods", "tap", "then", "to_enum", "to_s", "yield_self", NULL };
+  return nm && (builtin_name_in(nm, names) || kernel_private_method(nm));
+}
+
 /* The builtin class or module that defines instance method m of cls (one
    of the classes the arity facts list their own methods for), as
    Method#owner names it: cls for one of its own (CRuby's
@@ -2238,7 +2309,8 @@ int builtin_every_object_answers(const char *m, int cmeth) {
    Class's or Module's (core_singleton_methods.inc, written by
    tools/gen_method_names.rb) */
 #define CSM(k, m) { k, m },
-static const struct { const char *cls, *m; } core_singleton_methods[] = {
+typedef struct { const char *cls, *m; } CoreSingletonRow;
+static const CoreSingletonRow core_singleton_methods[] = {
 #include "core_singleton_methods.inc"
   { NULL, NULL }
 };
@@ -2246,10 +2318,24 @@ static const struct { const char *cls, *m; } core_singleton_methods[] = {
 /* Does the core class or module cls answer m as a value (File.join,
    Kernel.trap) with a public method of CRuby's? cls "Class#" or "Module#"
    asks about every class or module (class_eval, attr_reader). */
+static int csm_cmp(const void *a, const void *b) {
+  const CoreSingletonRow *x = a, *y = b;
+  int d = strcmp(x->cls, y->cls);
+  return d ? d : strcmp(x->m, y->m);
+}
+/* (a binary search over the rows, sorted at the first ask: a call on a class value asked it of every row, a twentieth of a large program's compile) */
 int core_class_value_answers(const char *cls, const char *m) {
-  for (int i = 0; cls && m && core_singleton_methods[i].cls; i++)
-    if (!strcmp(core_singleton_methods[i].cls, cls) && !strcmp(core_singleton_methods[i].m, m)) return 1;
-  return 0;
+  enum { N = sizeof core_singleton_methods / sizeof core_singleton_methods[0] - 1 };
+  static CoreSingletonRow rows[N];
+  static int sorted;
+  if (!cls || !m) return 0;
+  if (!sorted) {
+    memcpy(rows, core_singleton_methods, sizeof rows);
+    qsort(rows, N, sizeof rows[0], csm_cmp);
+    sorted = 1;
+  }
+  CoreSingletonRow key = { cls, m };
+  return bsearch(&key, rows, N, sizeof rows[0], csm_cmp) != NULL;
 }
 /* Does the builtin class of cls_id id (class_builtin_parent's answer), or
    a builtin class above it, answer m with a method of its own (with
@@ -2547,6 +2633,16 @@ int builtin_id_below_object_answers(int id, const char *m) {
   for (int i = 0; id && (r = builtin_class_at(i)) && r->id != id; i++) {}
   return r && builtin_answers_ahead_of(r->name, m, "Object");
 }
+/* does the lookup from the builtin class with run-time id `id` (-116 for Object) find instance method m, of any
+   visibility, in a library the program has: one a visibility word in a program class under it names
+   (`private :puts`, Kernel's)? An undefine on the way (Complex#floor) ends the lookup with none */
+int builtin_id_has_instance_method(int id, const char *m) {
+  const BuiltinClass *r = NULL;
+  for (int i = 0; id && (r = builtin_class_at(i)) && r->id != id; i++) {}
+  const BuiltinMethodTable *t = r && m ? bmt_find(r->name) : NULL;
+  unsigned must = bmt_loaded();
+  return t && (t->flags & must) && bmt_ancestors_have(t, m, 0, must, 0, NULL, NULL) > 0;
+}
 
 /* See builtin_names.h. The ancestors are the tables' (the class's own methods' owners ahead of Object and the
    modules it includes). A class with no table, or a slot with no name, is unknown: below anything. */
@@ -2767,8 +2863,9 @@ int is_class_name_name(const char *n) { return n && sp_streq(n, "name"); }
 
 int is_alias_method_name(const char *n) { return n && sp_streq(n, "alias_method"); }
 
+const char DEFINE_METHOD_NAME[] = "define_method";
 int is_define_method_name(const char *n) {
-  return n && sp_streq(n, "define_method");
+  return n && sp_streq(n, DEFINE_METHOD_NAME);
 }
 int is_define_singleton_method_name(const char *n) { return n && sp_streq(n, "define_singleton_method"); }
 /* Kernel#singleton_class */
@@ -2815,6 +2912,10 @@ int method_defined_vis_mask(const char *n) {
   if (sp_streq(n, "public_method_defined?")) return 1;
   if (sp_streq(n, "protected_method_defined?")) return 2;
   return sp_streq(n, "private_method_defined?") ? 4 : 0;
+}
+/* respond_to? or a *method_defined? query: whether one method by name is there */
+int is_method_presence_name_query(const char *n) {
+  return is_respond_to_name(n) || is_method_defined_query(n);
 }
 int is_undef_method_name(const char *n) { return n && sp_streq(n, "undef_method"); }
 int is_remove_method_name(const char *n) { return n && sp_streq(n, "remove_method"); }
@@ -3254,6 +3355,11 @@ int is_attr_decl_reader(const char *n) {
 int is_attr_decl_writer(const char *n) {
   return n && (is_attr_writer_family(n) || sp_streq(n, "attribute") || sp_streq(n, "attributes"));
 }
+/* A call that may declare a writer: the writer declarations, and `attr`
+   (whose `attr :x, true` form is one) */
+int is_attr_may_write(const char *n) {
+  return n && (is_attr_decl_writer(n) || sp_streq(n, "attr"));
+}
 /* The class-body declarations that run no code of the class's own: a
    visibility change (of instance methods, class methods or constants), an
    attribute, a mixin, an alias, or a method undefined or removed */
@@ -3422,4 +3528,78 @@ int kernel_private_method(const char *name) {
 int is_block_value_dropped_iter(const char *n) {
   return is_block_loop_method(n) || is_each_walk(n) || is_each_window(n) || is_str_each_iter(n) ||
          is_hash_key_value_each(n) || sp_streq(n, "each_pair") || sp_streq(n, "each_with_object");
+}
+
+/* The Class/Module surface every class object carries, `new` included (a
+   MODULE object answers everything here except `new`, which its callers gate).
+   One list, so a core class object and a user one answer alike (#3494). */
+/* Class's public instance methods beyond Object's, from ruby 4.0.1 */
+static const char *const cls_uni[] = {
+  "new", "allocate", "attached_object", "subclasses", "superclass",
+  "<", "<=", ">", ">=", "alias_method", "ancestors", "attr", "attr_accessor",
+  "attr_reader", "attr_writer", "autoload", "autoload?", "class_eval", "class_exec",
+  "class_variable_defined?", "class_variable_get", "class_variable_set",
+  "class_variables", "const_defined?", "const_get", "const_missing", "const_set",
+  "const_source_location", "constants", "define_method", "deprecate_constant",
+  "include", "include?", "included_modules", "instance_method", "instance_methods",
+  "method_defined?", "module_eval", "module_exec", "name", "prepend",
+  "private_class_method", "private_constant", "private_instance_methods",
+  "private_method_defined?", "protected_instance_methods", "protected_method_defined?",
+  "public_class_method", "public_constant", "public_instance_method",
+  "public_instance_methods", "public_method_defined?", "refinements",
+  "remove_class_variable", "remove_method", "set_temporary_name", "singleton_class?",
+  "undef_method", "undefined_instance_methods", NULL };
+int class_object_universal_method(const char *qm) {
+  for (int u = 0; cls_uni[u]; u++) if (sp_streq(qm, cls_uni[u])) return 1;
+  return 0;
+}
+/* ...the i-th of them, NULL past the last (the run-time helper's list, emit_class_value_responds_helper) */
+const char *class_object_universal_name(int i) {
+  return cls_uni[i];
+}
+/* The ones a module object does not have: they are Class's own. */
+int class_only_method(const char *qm) {
+  return sp_streq(qm, "new") || sp_streq(qm, "allocate") || sp_streq(qm, "attached_object") ||
+         sp_streq(qm, "subclasses") || sp_streq(qm, "superclass");
+}
+/* Class's or Module's private instance methods beyond Object's, which a
+   class object answers only to respond_to?(name, true). Not
+   ruby2_keywords, which spinel refuses (docs/limitations.md): code guarded
+   by respond_to?(:ruby2_keywords, true) skips it. */
+int class_object_private_method(const char *qm, int is_module) {
+  static const char *const both[] = {
+    "const_added", "extended", "included", "method_added", "method_removed",
+    "method_undefined", "prepended", "private", "protected", "public", "remove_const",
+    "using", NULL };
+  static const char *const module_only[] = {
+    "append_features", "extend_object", "module_function", "prepend_features", "refine", NULL };
+  for (int u = 0; both[u]; u++) if (sp_streq(qm, both[u])) return 1;
+  if (!is_module) return sp_streq(qm, "inherited");
+  for (int u = 0; module_only[u]; u++) if (sp_streq(qm, module_only[u])) return 1;
+  return 0;
+}
+/* Does a class object (a module's when is_module) answer `qm` with one of
+   Class's or Module's own methods, public or private: what a bare call in
+   its body or in one of its class methods reaches? */
+int class_object_answers_builtin(const char *qm, int is_module) {
+  if (class_object_universal_method(qm)) return !(is_module && class_only_method(qm));
+  return class_object_private_method(qm, is_module);
+}
+/* Does a class object (a module's when is_module; an Exception class's when exc; a Struct's or Data's
+   class when record is 1 or 2) answer respond_to?(qm) with one of its builtin class methods? */
+int class_object_builtin_responds(const char *qm, int is_module, int exc, int record) {
+  /* A module's `module_function` methods are recorded class-level, the
+     program's (cplan_class_responds). Its plain `def m` are instance methods,
+     which the module object itself does NOT respond to -- answering true for
+     those made `Greeter.respond_to?(:greet)` disagree with CRuby (#3467). */
+  /* builtin Class/Module methods every class object inherits; a module
+     lacks Class's own (`new`, `superclass`, ...) */
+  if (class_object_universal_method(qm)) return !(is_module && class_only_method(qm));
+  /* Exception's class-level `exception` */
+  if (is_exception_ctor_name(qm) && exc) return 1;
+  /* A Struct or Data CLASS object answers its record class's own builtins
+     (is_record_class_cmethod: `members`, a Struct's `keyword_init?`, ...)
+     the way its instances answer theirs (#3482), before a program's def of
+     one as after it, an anonymous `Struct.new(...)` too */
+  return record && is_record_class_cmethod(qm, record == 2);
 }

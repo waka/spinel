@@ -60,6 +60,8 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
 int emit_call_handle_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
 int emit_call_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
 int emit_call_method_obj_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
+/* The value node id takes where a raise ahead of it runs, which nothing reads: its C type's zero */
+void emit_unread_value(Compiler *c, int id, Buf *b);
 int emit_call_poly_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
 int emit_call_poly_builtin_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt);
 int emit_call_openstruct_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
@@ -84,7 +86,7 @@ int emit_call_proc_literal_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
    has), at_cls and at_side the receiver class and side it asks there
    (refl_at, cplan_list_omits). */
 enum { REFL_SHOWN = 1, REFL_ROW = 2 };
-typedef struct { char **v; unsigned char *show; int n, cap, at, at_cls; unsigned at_side; } ReflNames;
+typedef struct { char **v; unsigned char *show; int n, cap, at, at_cls, vis_mask; unsigned at_side; } ReflNames;
 /* The classes a `k.new(...)` switch gives an ArgumentError arm, grouped by
    message so each message is emitted once. */
 typedef struct { char msg[256]; int *cis; int ncis; } CtorArityArm;
@@ -124,7 +126,9 @@ int object_defines_cmp(Compiler *c);
 int any_class_defines(Compiler *c, const char *qm);
 int any_class_responds(Compiler *c, const char *qm);
 int class_struct_kind(Compiler *c, int cid);
-int class_value_responds(Compiler *c, int id, int tv, const char *qm, Buf *b);
+int class_value_arms(Compiler *c, int id, const char *qm, CplanPresList *l, int *asked);
+int class_value_arms_yes(const CplanPresList *l);
+void class_value_responds(Compiler *c, const CplanPresList *l, int tv, Buf *b);
 void class_value_responds_runtime(int tv, Buf *b);
 void emit_class_value_responds_helper(Compiler *c, const char *const *texts, int ntexts, Buf *protos, Buf *defs);
 extern const char *const comparable_names[];
@@ -150,15 +154,36 @@ int emit_respond_to_exc_cls(Compiler *c, int recv, const char *qm, int argc, con
 int method_hidden_from_reflection(Compiler *c, int cid, const char *m);
 int refl_member_of_struct_superclass(Compiler *c, int ci, const char *m);
 int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const char *qm, int argc, const int *argv);
+int respond_to_guard_reaches(Compiler *c, TyKind rt, const char *name);
+struct CplanCells;
+void emit_guarded_presence(Compiler *c, const struct CplanCells *cells, Buf *b);
+/* The test ahead of public_method capture id (CallPlan.closed CP_CLOSED_RUN) of ci's class method mn: CRuby's NameError,
+   naming the class cn's singleton class, where the cells there say no version is public, of the visibility they say,
+   or none live (a statement) */
+void emit_capture_closed_cells(Compiler *c, int id, const char *mn, int ci, const char *cn, Buf *b);
 int is_enum_cursor_name(const char *n);
 /* nil's static answer to respond_to?(qm, ...); *prog: by a method of the program's */
 int nil_responds_static(Compiler *c, int id, const char *qm, int argc, const int *argv, int *prog);
 /* respond_to? call id (its argc arguments argv, asking qm) of a class's own
-   class method whose answer the version cells hold (cplan_cmethod_presence):
+   class method whose answer the version cells hold (cplan_cmethod_presence),
+   or of an instance (recv, of type rt) whose class's are (cplan_presence_cells):
    one of the versions' cells, or what the class answers with none of them,
    written to b. 0, writing nothing, for a call the plan does not answer
    so; with b NULL, only asked. */
-int emit_respond_to_cells(Compiler *c, int id, const char *qm, int argc, const int *argv, Buf *b);
+int emit_respond_to_cells(Compiler *c, int id, int recv, TyKind rt, const char *qm, int argc, const int *argv, Buf *b);
+/* The answer version cells cs give (cplan_presence_cells), the else arm's
+   with none live, as one parenthesized C expression to b: 0, writing
+   nothing, where a cell is no Integer slot the test can read; b NULL: only
+   asked. */
+int emit_cells_answer(Compiler *c, const CplanCells *cs, Buf *b);
+/* The answer arm a of a presence list (cplan_presence_list) gives: its cells' (emit_cells_answer), or 1 or 0 */
+void emit_presence_answer(Compiler *c, const CplanPresArm *a, Buf *b);
+/* Each arm of presence list l as `<key><class> ? <answer> : `, to b: key is the test's text ahead of the class id
+   (`_k3 == `), and the caller writes the answer for any other value after the last */
+void emit_presence_arms(Compiler *c, const CplanPresList *l, const char *key, Buf *b);
+/* The answer of PRL_OBJECT presence list l, to b: recv's value (-1: self) picks its class's arm, nil the list's own
+   answer, any other class 0 */
+void emit_presence_object(Compiler *c, const CplanPresList *l, int recv, Buf *b);
 /* The writes visibility word or include call `id` makes to its cells as its
    own call runs (cplan_vis_cell_after: the visibility cells, and the Kernel
    cells of the classes an include brings Kernel into), as an expression with
@@ -166,22 +191,24 @@ int emit_respond_to_cells(Compiler *c, int id, const char *qm, int argc, const i
    `_sp_cls.cls_id == <class> ? (void)(gv_<cell> = 1) : (void)0`), written to
    b. 0, writing nothing, for a call that writes none. */
 int emit_vis_cell_write(Compiler *c, int id, Buf *b);
+/* The error visibility word `id` (private, protected, public,
+   module_function) raises where it runs, written to b as
+   `sp_raise_cls(...)`: a NameError for the first name it takes that the
+   class self is has no instance method of there (a Symbol's, a String's, a
+   `def self.m`'s: the word looks the class method's name up among the
+   instance methods), a TypeError for module_function given an Array, whose
+   names it does not read. 0, writing nothing, where each is found. */
+int emit_vis_word_absent(Compiler *c, int id, Buf *b);
 int respond_to_user_defined(Compiler *c, int id, int recv);
 extern const char *const respond_universal[];
 extern const char *const respond_universal_all[]; /* public and private */
 int object_private_method_name(const char *qm);
 const char *const *object_private_method_names(void); /* NULL-terminated */
 int respond_to_runtime_reaches(Compiler *c, TyKind rt);
-int root_reopen_defines(Compiler *c, int id, const char *qm);
-/* ...and the ask with no site: do the tables of an Object, Kernel or BasicObject reopening hold or undefine qm at all
-   (root_reopen_defines is 0 for every call where they do not) */
-int root_reopen_holds(Compiler *c, const char *qm);
 /* 1 when the program's reopen of the builtin class or module `cls` (its
    chain) defines `name`, as call_target answers call id (-1: no call asks) */
 int reopened_owns(Compiler *c, int id, const char *cls, const char *name);
-PresenceKind presence_at(Compiler *c, int id, int cls, unsigned side, const char *qm, CplanPresence *pr);   /* what class cls holds of qm where call id runs (the call plan: cplan_presence; the final tables alone for a super or no id) */
 int bool_side_responds(Compiler *c, int id, const char *qm, int include_all, int foldable, int *ta, int *fa);
-int root_reopen_method_vis(Compiler *c, int id, int cid, const char *qm);   /* an Object, Kernel or BasicObject reopening's method qm: its visibility, or -1 */
 int private_answer_overridden(Compiler *c, const char *qm, TyKind rt);
 int refl_md_dynamic_used(Compiler *c);
 void emit_scope_parameters_pushes(Compiler *c, int mi, int tr4, Buf *b);
@@ -237,6 +264,15 @@ void emit_exc_new_msg(Compiler *c, const char *cn, int arg, Buf *b);
 int emit_exc_sub_new_arm(Compiler *c, int id, int ci, int argc, const int *atmp, int rt2, Buf *b);
 int emit_exc_sub_new_arm_splat(Compiler *c, int id, int ci, int tsa, const char *pre, int rt2, Buf *b);
 int emit_syserr_family_new(Compiler *c, int id, const char *cn, int argc, const int *argv, Buf *b);
+/* A program's reopening of a builtin exception above SystemCallError (StandardError#initialize
+   and up): CRuby's syserr_initialize builds the errno message and then calls super with it, so
+   the reopening runs on the BUILT message whatever arguments the call gave. syserr_reinit_initialize
+   answers the initialize an exception built as the builtin cn at call id runs, or -1; the open/close
+   pair wraps the expression that builds the exception (an sp_Exception *). */
+int emit_syserr_family_new_reopened(Compiler *c, int id, const char *cn, int argc, const int *argv, Buf *b);
+int syserr_reinit_initialize(Compiler *c, int id, const char *cn);
+void syserr_reinit_open(int *t, Buf *b);
+void syserr_reinit_close(Compiler *c, int initm, int t, Buf *b);
 int emit_user_new_arm(Compiler *c, int id, int ci, int argc, const int *atmp, int hoisted, int rt2, Buf *b);
 extern int g_ctor_blk_tmp;
 int hoist_ctor_block(Compiler *c, int id, Buf *b);
@@ -257,6 +293,7 @@ int poly_scalar_arms_open(Compiler *c, int id, PolyScalarArms *pa, Buf *b);
 void poly_scalar_arms_close(Compiler *c, PolyScalarArms *pa, Buf *b);
 int obj_member_shadows(Compiler *c, TyKind rt, const char *nm);
 void refl_class_singleton_methods(Compiler *c, int ci, int all, ReflNames *r);
+void refl_class_private_methods(Compiler *c, int ci, ReflNames *r);
 void refl_builtin_singleton_methods(const char *cls, int all, ReflNames *r);
 void refl_class_instance_methods(Compiler *c, int ci, int pub, int prot, ReflNames *r);
 void refl_module_instance_methods(Compiler *c, int m, int prot, ReflNames *r);
@@ -382,7 +419,7 @@ void emit_bind_call_boxed(Compiler *c, int id, int target, int kn, const char *s
 void emit_bm_abi_args(Buf *b, const char *rb, int abi, const char *sig, int fixed, int rest, int ret, int poly, int pfixed, const char *thunk, int tmin, int tmax);
 int emit_method_obj_on_constant(Compiler *c, int id, int recv, const char *sym, Buf *b);
 int method_obj_of_native_func(Compiler *c, int recv, const char *sym);
-const char *emit_method_thunk(Compiler *c, int mi, int recv_bound, int *out_min, int *out_max);
+const char *emit_method_thunk(Compiler *c, int mi, int recv_bound, int self_cls, int *out_min, int *out_max);
 int emit_method_tramp_fn(Compiler *c, Scope *tm, int shift, const char *fname, int boxed_src, int self_cls, int *out_min, int *out_max);
 int method_legacy_int_abi(Compiler *c, int mi, int recv_bound, char *out_sig, size_t sigcap, int *out_fixed, int *out_rest, int *out_ret);
 int method_node_recv_class(Compiler *c, int recv, int dflt);

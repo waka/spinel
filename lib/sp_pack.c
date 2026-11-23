@@ -299,9 +299,9 @@ static const char *pk_val_name(sp_RbVal v) {
   switch (v.tag) {
     case SP_TAG_NIL:  return "nil";
     case SP_TAG_BOOL: return v.v.b ? "true" : "false";
-    case SP_TAG_STR:  return "String";
     case SP_TAG_SYM:  return "Symbol";
     case SP_TAG_OBJ:
+      if (v.cls_id == SP_BUILTIN_STRBUF) return "String";
       if (v.cls_id >= 0 && sp_obj_cls_name_fn) return sp_obj_cls_name_fn((int)v.cls_id);
       return "Object";
     default:          return "Object";
@@ -438,12 +438,14 @@ static void pk_ber_poly(sp_RbVal v, char **buf, size_t *len, size_t *cap) {
 
 /* Keep the ordinary loop's inlined conversion with a second packing entry. */
 static inline double pk_poly_to_flt(sp_RbVal v) {
-  v = sp_rbval_str(v);
+  if (sp_rbval_is_string(v)) {
+    const char *s = sp_rbval_string_bytes(v);
+    return s ? strtod(s, NULL) : 0.0;
+  }
   switch (v.tag) {
     case SP_TAG_FLT:  return v.v.f;
     case SP_TAG_INT:  return (double)v.v.i;
     case SP_TAG_BOOL: return v.v.b ? 1.0 : 0.0;
-    case SP_TAG_STR:  return v.v.s ? strtod(v.v.s, NULL) : 0.0;
     default:          return 0.0;
   }
 }
@@ -468,7 +470,6 @@ static const char *pk_conv_name(sp_RbVal v) {
    Array is its live bytes; it too read as none. */
 static const char *pk_str_elem_bytes(char spec, sp_RbVal v, size_t *n) {
   *n = 0;
-  if (v.tag == SP_TAG_STR && v.v.s) { *n = sp_str_byte_len(v.v.s); return v.v.s; }
   if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_STRBUF && v.v.p) {
     sp_String *h = (sp_String *)v.v.p;
     if (!h->data) return "";
@@ -486,7 +487,7 @@ static const char *pk_str_elem_bytes(char spec, sp_RbVal v, size_t *n) {
   if (v.tag == SP_TAG_NIL && spec != 'm' && spec != 'u') return "";
   if (v.tag == SP_TAG_OBJ && v.cls_id >= 0 && v.v.p && sp_obj_to_str_fn) {
     SP_GC_ROOT_RBVAL(v);   /* across the user #to_str */
-    const char *r = sp_String_cstr_nil(sp_obj_to_str_fn((int)v.cls_id, v.v.p));
+    const char *r = sp_String_cstr_nil(sp_obj_to_str_handle((int)v.cls_id, v.v.p));
     if (r) { *n = sp_str_byte_len(r); return r; }
   }
   sp_raise_cls("TypeError", sp_sprintf("no implicit conversion of %s into String", pk_conv_name(v)));
@@ -846,14 +847,11 @@ static void pk_ptr_poly(char spec, int64_t count, sp_PolyArray *arr, sp_int *idx
   for (int64_t k = 0; k < n; k++) {
     if (*idx >= arr->len) pk_too_few(*buf);
     sp_RbVal e = arr->data[(*idx)++];
-    const char *s = NULL;
-    if (e.tag == SP_TAG_STR) s = e.v.s;
-    else if (e.tag == SP_TAG_OBJ && e.cls_id == SP_BUILTIN_STRBUF && e.v.p) s = ((sp_String *)e.v.p)->data;
-    else if (e.tag != SP_TAG_NIL) {
+    if (!sp_rbval_is_string(e) && e.tag != SP_TAG_NIL) {
       free(*buf);
       sp_raise_cls("TypeError", sp_sprintf("no implicit conversion of %s into String", pk_conv_name(e)));
     }
-    pk_int_directive('J', (int64_t)(intptr_t)s, 0, buf, len, cap);
+    pk_int_directive('J', (int64_t)(intptr_t)sp_rbval_string_bytes(e), 0, buf, len, cap);
   }
 }
 
@@ -1055,20 +1053,60 @@ const char *sp_StrArray_pack(sp_StrArray *arr, const char *fmt) {
 
 /* ---------- Unpack entry point ---------- */
 
-/* base64 sextet value for an ASCII byte, or -1 for a non-alphabet char. */
-static int uk_b64val(unsigned char ch) {
-  if (ch >= 'A' && ch <= 'Z') return ch - 'A';
-  if (ch >= 'a' && ch <= 'z') return ch - 'a' + 26;
-  if (ch >= '0' && ch <= '9') return ch - '0' + 52;
-  if (ch == '+') return 62;
-  if (ch == '/') return 63;
-  return -1;
+/* base64 sextet value for a byte, or -1 for a byte outside the alphabet: a
+   table, as CRuby's b64_xtable */
+static const signed char uk_b64tab[256] = {
+  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, 62, -1, -1, -1, 63,
+  52, 53, 54, 55, 56, 57, 58, 59, 60, 61, -1, -1, -1, -1, -1, -1,
+  -1,  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14,
+  15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, -1, -1, -1, -1, -1,
+  -1, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40,
+  41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, -1, -1, -1, -1, -1,
+  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1,
+  -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1
+};
+static inline int uk_b64val(unsigned char ch) { return uk_b64tab[ch]; }
+/* `m0`: strict RFC 4648, as CRuby's pack.c and the base64 package's
+   b64_dec_strict: a length that is a multiple of 4, `=` only as the padding
+   of the last block, and zero in the bits the padding drops */
+static char *uk_b64_decode_rfc4648(const char *src, size_t n) {
+  if (n % 4 != 0) sp_raise_cls("ArgumentError", "invalid base64");
+  char *out = sp_str_alloc(n);
+  size_t o = 0;
+  for (size_t i = 0; i < n; i += 4) {
+    int q[4], npad = 0;
+    for (int k = 0; k < 4; k++) {
+      unsigned char ch = (unsigned char)src[i + k];
+      if (ch == '=') {
+        if (i + 4 != n || k < 2) sp_raise_cls("ArgumentError", "invalid base64");
+        npad++; q[k] = 0;
+      }
+      else {
+        int val = uk_b64val(ch);
+        if (npad || val < 0) sp_raise_cls("ArgumentError", "invalid base64");
+        q[k] = val;
+      }
+    }
+    if ((npad == 2 && (q[1] & 0xF)) || (npad == 1 && (q[2] & 0x3)))
+      sp_raise_cls("ArgumentError", "invalid base64");
+    out[o++] = (char)((q[0] << 2) | (q[1] >> 4));
+    if (npad < 2) out[o++] = (char)((q[1] << 4) | (q[2] >> 2));
+    if (npad < 1) out[o++] = (char)((q[2] << 6) | q[3]);
+  }
+  out[o] = 0; sp_str_set_len(out, o);
+  return out;
 }
 /* Decode `n` base64 bytes from `src` into a fresh GC string (the `m` directive).
-   Non-alphabet bytes (whitespace, newlines) are skipped; `=` ends the data. In
-   `strict` mode (the `m0` count) any non-alphabet byte is an ArgumentError, as
-   RFC 4648 requires. */
-static char *uk_b64_decode_strict(const char *src, size_t n, int strict) {
+   Non-alphabet bytes (whitespace, newlines) are skipped; `=` ends the data. */
+static char *uk_b64_decode(const char *src, size_t n) {
   char *out = sp_str_alloc(n);   /* decoded size <= input size */
   size_t o = 0;
   int quad[4], qi = 0;
@@ -1076,7 +1114,7 @@ static char *uk_b64_decode_strict(const char *src, size_t n, int strict) {
     unsigned char ch = (unsigned char)src[i];
     if (ch == '=') break;
     int val = uk_b64val(ch);
-    if (val < 0) { if (strict) sp_raise_cls("ArgumentError", "invalid base64"); continue; }
+    if (val < 0) continue;
     quad[qi++] = val;
     if (qi == 4) {
       out[o++] = (char)((quad[0] << 2) | (quad[1] >> 4));
@@ -1092,7 +1130,6 @@ static char *uk_b64_decode_strict(const char *src, size_t n, int strict) {
   out[o] = 0; sp_str_set_len(out, o);
   return out;
 }
-static char *uk_b64_decode(const char *src, size_t n) { return uk_b64_decode_strict(src, n, 0); }
 /* Decode `n` quoted-printable bytes into a fresh GC string (the `M` directive):
    `=XX` is a hex byte, `=\n` (soft line break) is dropped, everything else is
    literal. */
@@ -1117,82 +1154,57 @@ static char *uk_qp_decode(const char *src, size_t n) {
   return out;
 }
 
-/* An unpack format byte that is no directive: ArgumentError, as CRuby's
-   unknown_directive words it. The directive shows as itself when printable,
-   else as \xNN; the format as an escaped string (\0, \e, \n, ..., \xNN for
-   a byte, \uNNNN for a UTF-8 character or, in a String that is not binary,
-   another control character). It was skipped, so a typo read on with the
-   directives after it, and a NUL byte ended the format. */
+/* unknown_directive in CRuby's pack.c */
 static SP_NORETURN void uk_unknown_directive(char type, const char *fmt, size_t flen) {
-  size_t cap = flen * 10 + 64, o = 0;
-  char *msg = (char *)malloc(cap);
-  if (!msg) sp_raise_cls("ArgumentError", "unknown unpack directive");
   unsigned char t = (unsigned char)type;
-  int bin = sp_str_is_binary(fmt);
-  if (t >= 0x20 && t < 0x7f) o += (size_t)snprintf(msg + o, cap - o, "unknown unpack directive '%c' in '", type);
-  else o += (size_t)snprintf(msg + o, cap - o, "unknown unpack directive '\\x%02x' in '", t);
-  /* A format every character of which is printable is shown as it is, as
-     CRuby's rb_str_quote_unprintable leaves it ('Cé'); only one holding an
-     unprintable character is escaped as a whole. */
-  int printable = 1;
-  for (size_t i = 0; i < flen && printable; i++) {
-    unsigned char ch = (unsigned char)fmt[i];
-    if (ch < 0x20 || ch == 0x7f) printable = 0;
-    else if (ch >= 0x80) {
-      int len = bin ? 0 : ch >= 0xC2 && ch < 0xE0 ? 2 : ch >= 0xE0 && ch < 0xF0 ? 3 : ch >= 0xF0 && ch < 0xF5 ? 4 : 0;
-      if (!len || i + (size_t)len > flen) { printable = 0; break; }
-      for (int j = 1; j < len; j++)
-        if (((unsigned char)fmt[i + j] & 0xC0) != 0x80) { printable = 0; break; }
-      i += (size_t)len - 1;
-    }
-  }
-  if (printable) { memcpy(msg + o, fmt, flen); o += flen; }
-  for (size_t i = 0; i < flen && !printable; i++) {
-    unsigned char ch = (unsigned char)fmt[i];
-    const char *esc = NULL;
-    switch (ch) {
-      case 0: esc = "\\0"; break;
-      case '\n': esc = "\\n"; break;
-      case '\t': esc = "\\t"; break;
-      case '\r': esc = "\\r"; break;
-      case '\f': esc = "\\f"; break;
-      case '\v': esc = "\\v"; break;
-      case '\b': esc = "\\b"; break;
-      case '\a': esc = "\\a"; break;
-      case 0x1b: esc = "\\e"; break;
-      case 0x7f: esc = "\\c?"; break;
-      default: break;
-    }
-    if (esc) { o += (size_t)snprintf(msg + o, cap - o, "%s", esc); continue; }
-    if (ch >= 0x20 && ch < 0x7f) { msg[o++] = (char)ch; continue; }
-    /* another control character is a codepoint in a UTF-8 String */
-    if (ch < 0x20 && !bin) { o += (size_t)snprintf(msg + o, cap - o, "\\u%04X", ch); continue; }
-    /* a whole UTF-8 character: \uNNNN (\u{N} past the BMP) */
-    int len = bin ? 0 : ch >= 0xC2 && ch < 0xE0 ? 2 : ch >= 0xE0 && ch < 0xF0 ? 3 : ch >= 0xF0 && ch < 0xF5 ? 4 : 0;
-    if (len && i + (size_t)len <= flen) {
-      uint32_t cp = ch & (0x7F >> len);
-      int ok = 1;
-      for (int j = 1; j < len && ok; j++) {
-        unsigned char cb = (unsigned char)fmt[i + j];
-        if ((cb & 0xC0) != 0x80) ok = 0;
-        else cp = (cp << 6) | (cb & 0x3F);
-      }
-      if (ok) {
-        o += (size_t)snprintf(msg + o, cap - o, cp > 0xFFFF ? "\\u{%X}" : "\\u%04X", (unsigned)cp);
-        i += (size_t)len - 1;
-        continue;
-      }
-    }
-    o += (size_t)snprintf(msg + o, cap - o, "\\x%02X", ch);
-  }
-  msg[o++] = '\'';
-  msg[o] = 0;
-  char *m = sp_str_alloc(o);
-  memcpy(m, msg, o + 1);
-  sp_str_set_len(m, o);
-  free(msg);
-  sp_raise_cls("ArgumentError", m);
+  const char *q = sp_str_quote_unprintable(fmt, flen, sp_str_is_binary(fmt));
+  SP_GC_ROOT_STR(q);
+  if (t >= 0x20 && t < 0x7f)
+    sp_raise_cls("ArgumentError", sp_sprintf("unknown unpack directive '%c' in '%s'", type, q));
+  sp_raise_cls("ArgumentError", sp_sprintf("unknown unpack directive '\\x%02x' in '%s'", t, q));
 }
+/* One element of an integer directive, read from the bytes at u: the
+   directive's value as a signed 64-bit quantity (`Q` and `J`, which
+   need the unsigned range, are read by their caller). */
+static int64_t uk_get_int_spec(char spec, const unsigned char *u, int big) {
+  switch (spec) {
+    case 'C': return u[0];
+    case 'c': return (int8_t)u[0];
+    case 'n': return ((int64_t)u[0] << 8) | u[1];
+    case 'N': return ((int64_t)u[0] << 24) | ((int64_t)u[1] << 16) | ((int64_t)u[2] << 8) | u[3];
+    case 'v': return ((int64_t)u[1] << 8) | u[0];
+    case 'V': return ((int64_t)u[3] << 24) | ((int64_t)u[2] << 16) | ((int64_t)u[1] << 8) | u[0];
+    case 's': return (int16_t)pk_get_int(u, 2, big);
+    case 'S': return (uint16_t)pk_get_int(u, 2, big);
+    case 'l': return (int32_t)pk_get_int(u, 4, big);
+    case 'L': return (uint32_t)pk_get_int(u, 4, big);
+    case 'q': return (int64_t)pk_get_int(u, 8, big);
+    case 'i': return (int32_t)pk_get_int(u, 4, big);
+    case 'I': return (uint32_t)pk_get_int(u, 4, big);
+    case 'j': return (int64_t)(intptr_t)pk_get_int(u, (int)sizeof(intptr_t), big);
+    default: return 0;
+  }
+}
+
+/* The UTF-8 character at str[*off] for `U`: its codepoint, with *off moved
+   past it. */
+static int64_t uk_utf8_cp(const char *str, size_t slen, size_t *off) {
+  unsigned char b0 = (unsigned char)str[*off];
+  int len = b0 < 0x80 ? 1 : (b0 >> 5) == 0x6 ? 2 : (b0 >> 4) == 0xE ? 3 : (b0 >> 3) == 0x1E ? 4 : 0;
+  /* A lead byte with no valid length, or a truncated / mis-continued
+     sequence, is malformed UTF-8 -- ArgumentError, as in MRI. */
+  if (len == 0 || *off + (size_t)len > slen)
+    sp_raise_cls("ArgumentError", "malformed UTF-8 character");
+  int64_t cp = len == 1 ? b0 : (b0 & (0x7F >> len));
+  for (int j = 1; j < len; j++) {
+    unsigned char cb = (unsigned char)str[*off + j];
+    if ((cb & 0xC0) != 0x80) sp_raise_cls("ArgumentError", "malformed UTF-8 character");
+    cp = (cp << 6) | (cb & 0x3F);
+  }
+  *off += (size_t)len;
+  return cp;
+}
+
 sp_PolyArray *sp_str_unpack_off(const char *str, const char *fmt, sp_int byteoff);
 sp_PolyArray *sp_str_unpack(const char *str, const char *fmt) {SP_GC_ROOT_STR(str);SP_GC_ROOT_STR(fmt); return sp_str_unpack_off(str, fmt, 0); }
 
@@ -1341,9 +1353,9 @@ else if (spec == 'Z') {
        one string (the count/`0` modifier only tweaks strictness, not framing). */
     if (spec == 'm' || spec == 'M') {
       size_t avail = slen - off;
-      /* `m0` is strict RFC 4648: reject any non-alphabet byte. */
-      char *s = (spec == 'm') ? uk_b64_decode_strict(str + off, avail, count == 0)
-                              : uk_qp_decode(str + off, avail);
+      char *s = (spec == 'M') ? uk_qp_decode(str + off, avail)
+              : (count == 0) ? uk_b64_decode_rfc4648(str + off, avail)
+                             : uk_b64_decode(str + off, avail);
       sp_str_mark_binary(s);   /* unpack answers BYTES here: ASCII-8BIT, as CRuby (the b/B/h/H arms build ASCII TEXT and stay on the text side) */
       sp_PolyArray_push(out, sp_box_str_new(s));
       off = slen;
@@ -1379,20 +1391,8 @@ else if (spec == 'Z') {
     if (spec == 'U') {
       int64_t got = 0;
       while ((count < 0 || got < count) && off < slen) {
-        unsigned char b0 = (unsigned char)str[off];
-        int len = b0 < 0x80 ? 1 : (b0 >> 5) == 0x6 ? 2 : (b0 >> 4) == 0xE ? 3 : (b0 >> 3) == 0x1E ? 4 : 0;
-        /* A lead byte with no valid length, or a truncated / mis-continued
-           sequence, is malformed UTF-8 -- ArgumentError, as in MRI. */
-        if (len == 0 || off + (size_t)len > slen)
-          sp_raise_cls("ArgumentError", "malformed UTF-8 character");
-        int64_t cp = len == 1 ? b0 : (b0 & (0x7F >> len));
-        for (int j = 1; j < len; j++) {
-          unsigned char cb = (unsigned char)str[off + j];
-          if ((cb & 0xC0) != 0x80) sp_raise_cls("ArgumentError", "malformed UTF-8 character");
-          cp = (cp << 6) | (cb & 0x3F);
-        }
-        sp_PolyArray_push(out, sp_box_int((sp_int)cp));
-        off += len; got++;
+        sp_PolyArray_push(out, sp_box_int((sp_int)uk_utf8_cp(str, slen, &off)));
+        got++;
       }
       continue;
     }
@@ -1428,20 +1428,7 @@ else if (spec == 'Z') {
       }
       int64_t v = 0;
       switch (spec) {
-        case 'C': v = u[0]; break;
-        case 'c': v = (int8_t)u[0]; break;
-        case 'n': v = ((int64_t)u[0] << 8) | u[1]; break;
-        case 'N': v = ((int64_t)u[0] << 24) | ((int64_t)u[1] << 16) | ((int64_t)u[2] << 8) | u[3]; break;
-        case 'v': v = ((int64_t)u[1] << 8) | u[0]; break;
-        case 'V': v = ((int64_t)u[3] << 24) | ((int64_t)u[2] << 16) | ((int64_t)u[1] << 8) | u[0]; break;
-        case 's': v = (int16_t)pk_get_int(u, 2, big); break;
-        case 'S': v = (uint16_t)pk_get_int(u, 2, big); break;
-        case 'l': v = (int32_t)pk_get_int(u, 4, big); break;
-        case 'L': v = (uint32_t)pk_get_int(u, 4, big); break;
-        case 'q': v = (int64_t)pk_get_int(u, 8, big); break;
-        case 'i': v = (int32_t)pk_get_int(u, 4, big); break;
-        case 'I': v = (uint32_t)pk_get_int(u, 4, big); break;
-        case 'j': v = (int64_t)(intptr_t)pk_get_int(u, (int)sizeof(intptr_t), big); break;
+        default: v = uk_get_int_spec(spec, u, big); break;
         /* a pointer CRuby's own pack did not make: nil for NULL, else it has
            no object to answer */
         case 'p': case 'P':
@@ -1461,6 +1448,43 @@ else if (spec == 'Z') {
       }
       off += fsize;
       if (spec != 'x') sp_PolyArray_push(out, pk_box_i64(v));
+    }
+  }
+  return out;
+}
+
+/* String#unpack for a literal format of integer directives whose values
+   fit an Integer slot (an_unpack_lit_type): the same values as
+   sp_str_unpack_off, in an Integer Array, with a slot past the end nil. */
+sp_IntArray *sp_str_unpack_ints(const char *str, const char *fmt) {
+  if (!str) sp_nil_recv("unpack");
+  SP_GC_ROOT_STR(str);
+  SP_GC_ROOT_STR(fmt);
+  sp_IntArray *out = sp_IntArray_new();
+  SP_GC_ROOT(out);
+  size_t slen = sp_str_byte_len(str);
+  size_t off = 0;
+  const char *p = fmt;
+  const char *pend = fmt + sp_str_byte_len(fmt);
+  while (p < pend) {
+    char spec = *p++;
+    spec = pk_native_spec(spec, p);
+    int big = 0;
+    int64_t count = pk_parse_count_mods(&p, &big);
+    if (spec == 'U') {
+      for (int64_t got = 0; (count < 0 || got < count) && off < slen; got++)
+        sp_IntArray_push(out, (sp_int)uk_utf8_cp(str, slen, &off));
+      continue;
+    }
+    size_t fsize = spec == 'C' || spec == 'c' ? 1
+                 : spec == 'n' || spec == 'v' || spec == 's' || spec == 'S' ? 2
+                 : 4;
+    if (count < 0) count = (int64_t)((slen - off) / fsize);
+    for (int64_t k = 0; k < count; k++) {
+      if (off + fsize > slen) { sp_IntArray_push_nil(out); continue; }
+      int64_t v = uk_get_int_spec(spec, (const unsigned char *)(str + off), big);
+      sp_IntArray_push(out, (sp_int)v);
+      off += fsize;
     }
   }
   return out;

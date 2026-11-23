@@ -39,7 +39,6 @@ static sp_RbVal sp_mar_cplx_part(sp_float v, int is_f) {
     return mk_int((sp_int)(int64_t)v);
   return mk_float(v);
 }
-static sp_RbVal mk_str(const char *s){ sp_RbVal r; r.tag = SP_TAG_STR;  r.cls_id = 0; r.v.s = s; return r; }
 static sp_RbVal mk_sym(sp_sym s)    { sp_RbVal r; r.tag = SP_TAG_SYM;  r.cls_id = 0; r.v.i = (sp_int)s; return r; }
 static sp_RbVal mk_strbuf(void *h)  { sp_RbVal r; r.tag = SP_TAG_OBJ; r.cls_id = SP_BUILTIN_STRBUF; r.v.p = h; return r; }
 static sp_RbVal mk_bigint(void *p)  { sp_RbVal r; r.tag = SP_TAG_BIGINT; r.cls_id = 0; r.v.p = p; return r; }
@@ -49,6 +48,13 @@ static sp_int   poly_i(sp_RbVal v) { return v.tag == SP_TAG_INT ? v.v.i : (sp_in
 static void mar_raise(const char *cls, const char *msg) {
   if (sp_marshal_v.raise) sp_marshal_v.raise(cls, msg);
 }
+/* The exception hooks the generated unit defines (lib/spinel_rt.h). */
+void sp_exc_arm(jmp_buf b);
+void sp_exc_disarm(void);
+const char *sp_exc_cur_cls(void);
+const char *sp_exc_cur_msg(void);
+void *sp_exc_cur_obj(void);
+void sp_fiber_reraise(const char *cls, const char *msg, void *obj);
 
 /* ---- dump ---- */
 static void sp_mar_raw(sp_mar_buf *b, const char *s, size_t n) {SP_GC_ROOT_STR(s); for (size_t i = 0; i < n; i++) sp_mar_b(b, (unsigned char)s[i]); }
@@ -76,7 +82,9 @@ void sp_mar_sym(sp_mar_buf *b, const char *name) {SP_GC_ROOT_STR(name);
   for (int i = 0; i < b->nws; i++)
     if (!strcmp(b->wsyms[i], name)) { sp_mar_b(b, ';'); sp_mar_long(b, i); return; }
   if (b->nws >= b->cws) { b->cws = b->cws ? b->cws * 2 : 8; b->wsyms = (char **)realloc(b->wsyms, sizeof(char *) * (size_t)b->cws); if (!b->wsyms) sp_oom_die(); }
-  b->wsyms[b->nws++] = strdup(name);
+  char *dup = strdup(name);
+  if (!dup) sp_oom_die();
+  b->wsyms[b->nws++] = dup;
   sp_mar_b(b, ':'); sp_mar_bytes(b, name, strlen(name));
 }
 /* CRuby's Marshal float text: the shortest %.g that round-trips, exponent
@@ -104,7 +112,12 @@ static int sp_mar_seen(sp_mar_buf *b, void *ptr) {
   if (ptr) for (int i = 0; i < b->nl; i++) if (b->lptr[i] == ptr) { sp_mar_b(b, '@'); sp_mar_long(b, b->lid[i]); return 1; }
   int id = b->link_next++;
   if (ptr) {
-    if (b->nl >= b->cl) { b->cl = b->cl ? b->cl * 2 : 16; b->lptr = (void **)realloc(b->lptr, sizeof(void *) * (size_t)b->cl); b->lid = (int *)realloc(b->lid, sizeof(int) * (size_t)b->cl); }
+    if (b->nl >= b->cl) {
+      b->cl = b->cl ? b->cl * 2 : 16;
+      b->lptr = (void **)realloc(b->lptr, sizeof(void *) * (size_t)b->cl);
+      b->lid = (int *)realloc(b->lid, sizeof(int) * (size_t)b->cl);
+      if (!b->lptr || !b->lid) sp_oom_die();
+    }
     b->lptr[b->nl] = ptr; b->lid[b->nl] = id; b->nl++;
   }
   return 0;
@@ -126,28 +139,36 @@ static void sp_mar_w_hash(sp_mar_buf *b, sp_RbVal v) {
   }
   if (d.tag != SP_TAG_NIL) sp_mar_w(b, d);
 }
+static void sp_mar_w_string(sp_mar_buf *b, const char *bytes, size_t len, int binary, void *identity);
+
+static void sp_mar_w_range_bound(sp_mar_buf *b, sp_RbVal end, int symbol_name) {
+  if (symbol_name && end.tag != SP_TAG_NIL) {
+    /* A Symbol bound is written as a String record. Its spelling shares no
+       object link with the String returned by Symbol#name. */
+    sp_String *name = end.v.p;
+    sp_mar_w_string(b, name->data, (size_t)name->len, name->binary, NULL);
+    return;
+  }
+  sp_mar_w(b, end);
+}
+
 /* A Range (Integer, Float or String), as CRuby writes one: an `o` record of
    class Range with its exclude-end flag and its two ends, in that order. An
    absent end (beginless, endless) is nil. Each kind reads its own layout:
    an Integer Range flags an absent end (nobeg / noend) and keeps a
    Float end beside an Integer begin in fend; a Float Range records which
    ends it was written without, or as Integers (sp_types.h); a String Range
-   holds NULL for an absent end and, when it keeps handles, writes those. */
+   writes its endpoint handles and holds NULL for an absent end. */
 static void sp_mar_w_range(sp_mar_buf *b, sp_RbVal v) {
   sp_RbVal bg = mk_nil(), ed = mk_nil();
-  int excl;
+  int excl, symbol_names = 0;
   SP_GC_ROOT_RBVAL(bg); SP_GC_ROOT_RBVAL(ed);
   if (v.cls_id == SP_BUILTIN_STR_RANGE) {
-    /* the Range as it is held, not as sp_srange_live reads it: an end that
-       keeps its handle (--share-strings) is written as the handle's box, the
-       identity a String element of the same object is written under, so the
-       two link as CRuby's do */
-    sp_StrRange s = *(sp_StrRange *)v.v.p;
-    if (s.hf) bg = mk_strbuf(s.hf);
-    else if (s.first) bg = mk_str(s.first);
-    if (s.hl) ed = mk_strbuf(s.hl);
-    else if (s.last) ed = mk_str(s.last);
+    sp_StrRange s = sp_srange_value(v.v.p);
+    if (s.first) bg = mk_strbuf(s.first);
+    if (s.last) ed = mk_strbuf(s.last);
     excl = s.excl != 0;
+    symbol_names = s.sym;
   }
   else if (v.cls_id == SP_BUILTIN_FLOAT_RANGE) {
     sp_FloatRange *f = (sp_FloatRange *)v.v.p;
@@ -164,8 +185,8 @@ static void sp_mar_w_range(sp_mar_buf *b, sp_RbVal v) {
   }
   sp_mar_b(b, 'o'); sp_mar_sym(b, "Range"); sp_mar_long(b, 3);
   sp_mar_sym(b, "excl"); sp_mar_w(b, mk_bool(excl));
-  sp_mar_sym(b, "begin"); sp_mar_w(b, bg);
-  sp_mar_sym(b, "end"); sp_mar_w(b, ed);
+  sp_mar_sym(b, "begin"); sp_mar_w_range_bound(b, bg, symbol_names);
+  sp_mar_sym(b, "end"); sp_mar_w_range_bound(b, ed, symbol_names);
 }
 /* An Integer: a Fixnum record `i` while it fits CRuby's 31-bit marshal
    Fixnum (-2**30 ... 2**30 - 1), else the Bignum record `l` -- a sign, a
@@ -183,6 +204,12 @@ static void sp_mar_w_int(sp_mar_buf *b, sp_int n) {
   sp_mar_b(b, 'l'); sp_mar_b(b, w < 0 ? '-' : '+'); sp_mar_long(b, (long)nwords);
   for (size_t i = 0; i < nwords * 2; i++) sp_mar_b(b, (unsigned char)(i < 8 ? m >> (8 * i) : 0));
 }
+static void sp_mar_w_string(sp_mar_buf *b, const char *bytes, size_t len, int binary, void *identity) {
+  if (sp_mar_seen(b, identity)) return;
+  if (!binary) sp_mar_b(b, 'I');
+  sp_mar_b(b, '"'); sp_mar_bytes(b, bytes, len);
+  if (!binary) { sp_mar_long(b, 1); sp_mar_sym(b, "E"); sp_mar_b(b, 'T'); }
+}
 /* An exception, as CRuby writes one: `o`, its class, then `mesg` (the
    message, nil when none was given) and `bt` (the backtrace set on it, else
    nil). `nivar` more ivars follow: a user subclass's own, written by its
@@ -191,13 +218,37 @@ void sp_mar_w_exc_head(sp_mar_buf *b, const char *cls, void *p, long nivar) {
   sp_Exception *e = (sp_Exception *)p;
   const char *m = sp_exc_msg_text(e);
   sp_mar_b(b, 'o'); sp_mar_sym(b, cls); sp_mar_long(b, 2 + nivar);
-  sp_mar_sym(b, "mesg"); sp_mar_w(b, m ? mk_str(m) : mk_nil());
+  sp_mar_sym(b, "mesg");
+  if (m) sp_mar_w_string(b, m, sp_str_byte_len(m), sp_str_is_binary(m), e->msg_h ? e->msg_h : (void *)m);
+  else sp_mar_b(b, '0');
   sp_mar_sym(b, "bt"); sp_mar_w(b, e->backtrace ? sp_box_str_array(e->backtrace) : mk_nil());
 }
 void sp_mar_w_body(sp_mar_buf *b, sp_RbVal v) {
   if (sp_json_kind_fn(v) == 2) { sp_mar_w_hash(b, v); return; }
   sp_mar_b(b, '['); sp_int n = sp_json_len_fn(v); sp_mar_long(b, n);
   for (sp_int i = 0; i < n; i++) sp_mar_w(b, sp_json_aref_fn(v, i));
+}
+/* The head of a builtin subclass instance's record, as CRuby writes it:
+   `I` when ivars follow, `C`, the class, the builtin's body, and the count
+   of the ivars after it, which the caller writes. A String's body is its
+   bytes (`"`), and its encoding is one more ivar, `:E` true, written first
+   unless the String is binary; an Array's or a Hash's is its elements. */
+void sp_mar_w_bsub(sp_mar_buf *b, const char *nm, sp_RbVal v, long niv) {
+  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_STRBUF) {
+    sp_String *h = (sp_String *)v.v.p;
+    int bin = h && h->binary;
+    long tot = niv + (bin ? 0 : 1);
+    if (tot) sp_mar_b(b, 'I');
+    sp_mar_b(b, 'C'); sp_mar_sym(b, nm);
+    sp_mar_b(b, '"'); sp_mar_bytes(b, h ? h->data : "", h ? (size_t)h->len : 0);
+    if (tot) sp_mar_long(b, tot);
+    if (!bin) { sp_mar_sym(b, "E"); sp_mar_b(b, 'T'); }
+    return;
+  }
+  if (niv) sp_mar_b(b, 'I');
+  sp_mar_b(b, 'C'); sp_mar_sym(b, nm);
+  sp_mar_w_body(b, v);
+  if (niv) sp_mar_long(b, niv);
 }
 void sp_mar_w(sp_mar_buf *b, sp_RbVal v) {
   /* an Array or Hash subclass instance, boxed as its builtin (#7449): its
@@ -227,17 +278,6 @@ void sp_mar_w(sp_mar_buf *b, sp_RbVal v) {
       break;
     }
     case SP_TAG_SYM:  sp_mar_sym(b, sp_sym_name_fn ? sp_sym_name_fn((sp_sym)v.v.i) : ""); break;
-    case SP_TAG_STR: {
-      const char *s = v.v.s ? v.v.s : "";
-      if (sp_mar_seen(b, (void *)(uintptr_t)s)) break;
-      /* CRuby wraps a String in an encoding ivar: I "<bytes>" 1 :E T. */
-      /* A binary String has no encoding ivar. */
-      int binary = sp_str_is_binary(v.v.s);
-      if (!binary) sp_mar_b(b, 'I');
-      sp_mar_b(b, '"'); sp_mar_bytes(b, s, sp_str_byte_len(s));
-      if (!binary) { sp_mar_long(b, 1); sp_mar_sym(b, "E"); sp_mar_b(b, 'T'); }
-      break;
-    }
     case SP_TAG_OBJ:
       if (v.cls_id == SP_BUILTIN_COMPLEX) {
         if (sp_mar_seen(b, v.v.p)) break;
@@ -272,16 +312,9 @@ void sp_mar_w(sp_mar_buf *b, sp_RbVal v) {
           if (sp_mar_seen(b, v.v.p)) break;
           sp_mar_w_hash(b, v);
         }
-        /* a shared String handle in a box (--share-strings, #6765): the
-           String it holds, with the handle as its identity */
         else if (v.cls_id == SP_BUILTIN_STRBUF) {
-          if (sp_mar_seen(b, v.v.p)) break;
           sp_String *h = (sp_String *)v.v.p;
-          int binary = h && h->binary;
-          if (!binary) sp_mar_b(b, 'I');
-          sp_mar_b(b, '"');
-          sp_mar_bytes(b, h && h->data ? h->data : "", h && h->data ? (size_t)h->len : 0);
-          if (!binary) { sp_mar_long(b, 1); sp_mar_sym(b, "E"); sp_mar_b(b, 'T'); }
+          sp_mar_w_string(b, h ? h->data : "", h ? (size_t)h->len : 0, h && h->binary, h);
         }
         else if (v.cls_id == SP_BUILTIN_EXCEPTION) {
           if (sp_mar_seen(b, v.v.p)) break;
@@ -300,6 +333,7 @@ void sp_mar_w(sp_mar_buf *b, sp_RbVal v) {
       sp_Bigint *bg = (sp_Bigint *)v.v.p;
       size_t cap = sp_bigint_byte_len(bg) + 1;
       unsigned char *buf = (unsigned char *)calloc(cap + 1, 1);
+      if (!buf) sp_oom_die();
       size_t nbytes = sp_bigint_to_le_bytes(bg, buf, cap);
       size_t nwords = (nbytes + 1) / 2; if (nwords == 0) nwords = 1;
       sp_mar_b(b, 'l');
@@ -313,21 +347,48 @@ void sp_mar_w(sp_mar_buf *b, sp_RbVal v) {
       mar_raise("TypeError", "unsupported value for Marshal.dump");
   }
 }
+/* Free a writer's heap buffers (output bytes, symbol table, object-link table)
+   and the writer struct itself. */
+static void sp_mar_buf_done(sp_mar_buf *b) {
+  for (int i = 0; i < b->nws; i++) free(b->wsyms[i]);
+  free(b->wsyms);
+  free(b->p); free(b->lptr); free(b->lid);
+  free(b);
+}
 const char *sp_marshal_dump(sp_RbVal v) {
   SP_GC_ROOT_RBVAL(v);   /* a Float component allocates via sp_float_to_s -> may GC */
-  sp_mar_buf b; memset(&b, 0, sizeof b);
-  sp_mar_b(&b, 4); sp_mar_b(&b, 8);  /* major.minor = 4.8 */
-  sp_mar_w(&b, v);
-  char *out = sp_str_alloc_raw(b.len + 1);
-  memcpy(out, b.p, b.len); out[b.len] = 0;
-  sp_str_set_len(out, b.len);
-  /* a marshalled stream is bytes, and CRuby names it ASCII-8BIT: without the
-     tag #length counts UTF-8 units over binary data and [] slices by them */
-  sp_str_mark_binary(out);
-  for (int i = 0; i < b.nws; i++) free(b.wsyms[i]);
-  free(b.wsyms);
-  free(b.p); free(b.lptr); free(b.lid);
-  return out;
+  /* A raise inside the dump (unsupported object, default-proc Hash, singleton,
+     anonymous class) longjmps past normal cleanup. Heap-allocate the writer
+     after sp_exc_arm through a volatile pointer so its fields have allocated
+     storage duration across setjmp/longjmp, -O2 cannot clobber the pointer,
+     and a SystemStackError from sp_exc_arm leaks nothing. */
+  sp_mar_buf *volatile b = NULL;
+  int nroots = sp_gc_nroots;
+  jmp_buf jb;
+  if (setjmp(jb) == 0) {
+    sp_exc_arm(jb);
+    sp_mar_buf *w = (sp_mar_buf *)calloc(1, sizeof *w);
+    if (!w) sp_oom_die();
+    b = w;
+    sp_mar_b(w, 4); sp_mar_b(w, 8);  /* major.minor = 4.8 */
+    sp_mar_w(w, v);
+    char *out = sp_str_alloc_raw(w->len + 1);
+    memcpy(out, w->p, w->len); out[w->len] = 0;
+    sp_str_set_len(out, w->len);
+    /* a marshalled stream is bytes, and CRuby names it ASCII-8BIT: without the
+       tag #length counts UTF-8 units over binary data and [] slices by them */
+    sp_str_mark_binary(out);
+    sp_exc_disarm();
+    sp_mar_buf_done(w);
+    return out;
+  }
+  const char *cls = sp_exc_cur_cls(), *msg = sp_exc_cur_msg();
+  void *obj = sp_exc_cur_obj();
+  sp_exc_disarm();
+  sp_gc_nroots = nroots;   /* the dump's own roots unwound with it */
+  if (b) sp_mar_buf_done(b);
+  sp_fiber_reraise(cls, msg, obj);
+  return "";
 }
 
 /* ---- load ---- */
@@ -394,7 +455,11 @@ static char *sp_mar_rstr(sp_mar_rd *r, long n) {
 }
 /* Reserve the next object-link id (nil placeholder so a self-ref resolves). */
 static int sp_mar_reg(sp_mar_rd *r) {
-  if (r->nobj >= r->cobj) { r->cobj = r->cobj ? r->cobj * 2 : 16; r->objs = (sp_RbVal *)realloc(r->objs, sizeof(sp_RbVal) * (size_t)r->cobj); }
+  if (r->nobj >= r->cobj) {
+    r->cobj = r->cobj ? r->cobj * 2 : 16;
+    r->objs = (sp_RbVal *)realloc(r->objs, sizeof(sp_RbVal) * (size_t)r->cobj);
+    if (!r->objs) sp_oom_die();
+  }
   int id = r->nobj; r->objs[r->nobj++] = mk_nil(); return id;
 }
 static sp_sym mar_intern(const char *name) { return sp_marshal_v.sym_intern ? sp_marshal_v.sym_intern(name) : 0; }
@@ -415,19 +480,42 @@ static sp_RbVal sp_mar_r_bsub(sp_mar_rd *r, int ivars) {
   if (!ok || !sp_bsub_cls_fn || sp_bsub_cls_fn(v) < 0) mar_raise("ArgumentError", "undefined class/module in Marshal.load");
   SP_GC_ROOT_RBVAL(v);
   int kind = sp_json_kind_fn ? sp_json_kind_fn(v) : 0;
+  int str = v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_STRBUF;
   unsigned char t = sp_mar_rb(r);
-  if (!((t == '[' && kind == 1) || (t == '{' && kind == 2))) mar_raise("ArgumentError", "dump format error (user class)");
+  if (!((t == '[' && kind == 1) || (t == '{' && kind == 2) || (t == '"' && str)))
+    mar_raise("ArgumentError", "dump format error (user class)");
   int id = sp_mar_reg(r);
   r->objs[id] = v;
   long len = sp_mar_rlong(r);
-  for (long i = 0; i < len; i++) {
-    if (kind == 1) sp_marshal_v.any_push(v, sp_mar_r(r));
-    else { sp_RbVal k = sp_mar_r(r); SP_GC_ROOT_RBVAL(k); sp_marshal_v.hash_set(v, k, sp_mar_r(r)); }
+  if (str) {
+    /* a String subclass's bytes, binary until an `:E` ivar says text */
+    if (len < 0 || (size_t)len > r->len - r->pos) mar_raise("ArgumentError", "marshal data too short");
+    sp_String *h = (sp_String *)v.v.p;
+    sp_String_force_encoding(h, 1);
+    h->len = 0;
+    sp_fd_append_len(h, r->s + r->pos, (int64_t)len);
+    r->pos += (size_t)len;
   }
+  else
+    for (long i = 0; i < len; i++) {
+      if (kind == 1) sp_marshal_v.any_push(v, sp_mar_r(r));
+      else { sp_RbVal k = sp_mar_r(r); SP_GC_ROOT_RBVAL(k); sp_marshal_v.hash_set(v, k, sp_mar_r(r)); }
+    }
   long n = ivars ? sp_mar_rlong(r) : 0;
   for (long i = 0; i < n; i++) {
-    sp_marshal_v.arr_push(iv, sp_mar_r(r));   /* ivar symbol */
-    sp_marshal_v.arr_push(iv, sp_mar_r(r));   /* ivar value  */
+    sp_RbVal k = sp_mar_r(r); SP_GC_ROOT_RBVAL(k);
+    sp_RbVal val = sp_mar_r(r); SP_GC_ROOT_RBVAL(val);
+    const char *kn = str && k.tag == SP_TAG_SYM && sp_sym_name_fn ? sp_sym_name_fn((sp_sym)k.v.i) : NULL;
+    /* (a String's encoding is no ivar: :E, or :encoding with its name) */
+    if (kn && (!strcmp(kn, "E") || !strcmp(kn, "encoding"))) {
+      const char *enc = !strcmp(kn, "encoding") ? sp_rbval_string_bytes(val) : NULL;
+      int text = enc ? !(strcasecmp(enc, "ASCII-8BIT") == 0 || strcasecmp(enc, "BINARY") == 0)
+                     : (val.tag == SP_TAG_BOOL && val.v.b);
+      if (text) sp_String_force_encoding((sp_String *)v.v.p, 0);
+      continue;
+    }
+    sp_marshal_v.arr_push(iv, k);     /* ivar symbol */
+    sp_marshal_v.arr_push(iv, val);   /* ivar value  */
   }
   if (n) sp_marshal_v.obj_load(cn, v, iv, &ok);
   return v;
@@ -450,12 +538,12 @@ static sp_RbVal sp_mar_r_range(sp_mar_rd *r) {
     else if (!strcmp(kn, "begin")) bg = val;
     else if (!strcmp(kn, "end")) ed = val;
   }
-  int bs = bg.tag == SP_TAG_STR, es = ed.tag == SP_TAG_STR;
+  int bs = sp_rbval_is_string(bg), es = sp_rbval_is_string(ed);
   int bf = bg.tag == SP_TAG_FLT, ef = ed.tag == SP_TAG_FLT;
   int bi = bg.tag == SP_TAG_INT, ei = ed.tag == SP_TAG_INT;
   int bn = bg.tag == SP_TAG_NIL, en = ed.tag == SP_TAG_NIL;
   if ((bs || es) && (bs || bn) && (es || en))
-    return sp_box_srange(sp_srange_new(bs ? bg.v.s : NULL, es ? ed.v.s : NULL, excl));
+    return sp_box_srange(sp_srange_new_box(bg, ed, excl));
   if (bi && ef) return sp_box_range(sp_range_new_fend(bg.v.i, ed.v.f, excl));
   if ((bf || ef) && (bf || bi || bn) && (ef || ei || en)) {
     int om = (bn ? 1 : bi ? SP_FRANGE_INT_BEGIN : 0) | (en ? 2 : ei ? SP_FRANGE_INT_END : 0);
@@ -488,8 +576,14 @@ static sp_RbVal sp_mar_r(sp_mar_rd *r) {
     case ':': {
       long n = sp_mar_rlong(r);
       char *name = sp_mar_rstr(r, n); SP_GC_ROOT(name);
-      if (r->nsym >= r->csym) { r->csym = r->csym ? r->csym * 2 : 8; r->syms = (char **)realloc(r->syms, sizeof(char *) * (size_t)r->csym); }
-      r->syms[r->nsym++] = strdup(name);
+      if (r->nsym >= r->csym) {
+        r->csym = r->csym ? r->csym * 2 : 8;
+        r->syms = (char **)realloc(r->syms, sizeof(char *) * (size_t)r->csym);
+        if (!r->syms) sp_oom_die();
+      }
+      char *dup = strdup(name);
+      if (!dup) sp_oom_die();
+      r->syms[r->nsym++] = dup;
       return mk_sym(mar_intern(name));
     }
     case ';': {
@@ -500,11 +594,20 @@ static sp_RbVal sp_mar_r(sp_mar_rd *r) {
     case '"': {
       /* a bare String record is ASCII-8BIT: CRuby writes every other
          encoding as an ivar of an `I` around it, which the `I` arm reads */
+      long n = sp_mar_rlong(r);
+      if (n < 0) {
+        mar_raise("ArgumentError", "negative string size (or size too big)");
+        return mk_nil();
+      }
+      if ((size_t)n > r->len - r->pos) {
+        mar_raise("ArgumentError", "marshal data too short");
+        return mk_nil();
+      }
       int id = sp_mar_reg(r);
-      char *s = sp_mar_rstr(r, sp_mar_rlong(r));
-      sp_str_mark_binary(s);
-      sp_RbVal v = mk_str(s);
-      r->objs[id] = v; return v;
+      sp_String *s = sp_String_new_inline_len(r->s + r->pos, n);
+      sp_String_force_encoding(s, 1);
+      r->pos += (size_t)n;
+      return r->objs[id] = mk_strbuf(s);
     }
     case 'I': {
       if (r->pos < r->len && r->s[r->pos] == 'C') { r->pos++; return sp_mar_r_bsub(r, 1); }
@@ -513,16 +616,16 @@ static sp_RbVal sp_mar_r(sp_mar_rd *r) {
       for (long i = 0; i < nivar; i++) {
         sp_RbVal k = sp_mar_r(r);
         sp_RbVal val = sp_mar_r(r);
-        if (inner.tag != SP_TAG_STR || k.tag != SP_TAG_SYM || !sp_sym_name_fn) continue;
-        /* the String's encoding: `:E` true (UTF-8) or false (US-ASCII), or
-           `:encoding` and a name. Spinel's two encodings are UTF-8 and
-           ASCII-8BIT, so any encoding but ASCII-8BIT reads as UTF-8. */
+        if (!sp_rbval_is_string(inner) || k.tag != SP_TAG_SYM || !sp_sym_name_fn) continue;
+        /* The encoding ivar is :E for text or :encoding with a name. */
         const char *kn = sp_sym_name_fn((sp_sym)k.v.i);
-        if (!strcmp(kn, "E")) sp_str_as_text(inner.v.s);
-        else if (!strcmp(kn, "encoding")) {
-          const char *en = val.tag == SP_TAG_STR ? val.v.s : "";
-          if (strcasecmp(en, "ASCII-8BIT") && strcasecmp(en, "BINARY")) sp_str_as_text(inner.v.s);
+        if (strcmp(kn, "E")) {
+          if (strcmp(kn, "encoding")) continue;
+          const char *enc = sp_rbval_string_bytes(val);
+          if (enc && (!strcasecmp(enc, "ASCII-8BIT") || !strcasecmp(enc, "BINARY"))) continue;
         }
+        if (inner.tag == SP_TAG_OBJ) sp_String_force_encoding((sp_String *)inner.v.p, 0);
+        else sp_str_as_text(sp_rbval_string_bytes(inner));
       }
       return inner;
     }
@@ -571,6 +674,7 @@ static sp_RbVal sp_mar_r(sp_mar_rd *r) {
       long nwords = sp_mar_rlong(r);
       size_t nbytes = (size_t)(nwords > 0 ? nwords : 0) * 2;
       unsigned char *buf = (unsigned char *)malloc(nbytes ? nbytes : 1);
+      if (!buf) sp_oom_die();
       for (size_t i = 0; i < nbytes; i++) buf[i] = sp_mar_rb(r);
       sp_Bigint *bn = sp_bigint_from_le_bytes(sign == '-', buf, nbytes);
       free(buf);
@@ -610,13 +714,6 @@ static sp_RbVal sp_mar_r(sp_mar_rd *r) {
     default: mar_raise("ArgumentError", "unsupported type in Marshal.load"); return mk_nil();
   }
 }
-/* The exception hooks the generated unit defines (lib/spinel_rt.h). */
-void sp_exc_arm(jmp_buf b);
-void sp_exc_disarm(void);
-const char *sp_exc_cur_cls(void);
-const char *sp_exc_cur_msg(void);
-void *sp_exc_cur_obj(void);
-void sp_fiber_reraise(const char *cls, const char *msg, void *obj);
 /* A reader leaves the active chain and frees its tables. */
 static void sp_mar_rd_done(sp_mar_rd *r) {
   SP_MAR_LOCK();
@@ -632,21 +729,26 @@ sp_RbVal sp_marshal_load(const char *s, sp_int len) {
      r->s is a plain field, not a root slot; the collector walks registered
      slots, so the parameter is what has to be registered. */
   SP_GC_ROOT_STR(s);
-  sp_mar_rd *r = (sp_mar_rd *)calloc(1, sizeof *r);
-  r->s = s ? s : ""; r->len = s ? (size_t)len : 0;
-  SP_MAR_LOCK();
-  r->prev = sp_mar_active; sp_mar_active = r;
-  SP_MAR_UNLOCK();
-  if (r->len >= 2) r->pos = 2;  /* skip the 4.8 version header */
   /* A raise inside the parse (an unknown class, a format error, a value a
      loader cannot convert) longjmps past the return below, and the reader
      stayed on the active chain: the next collection walked its freed
      frame. It is caught here, the reader taken off the chain, and raised
-     on to the program's own handler. */
+     on to the program's own handler. Allocate and link the reader after
+     sp_exc_arm so a SystemStackError from sp_exc_arm leaks nothing and
+     leaves no dangling entry on sp_mar_active. */
+  sp_mar_rd *volatile rd = NULL;
   int nroots = sp_gc_nroots;
   jmp_buf jb;
   if (setjmp(jb) == 0) {
     sp_exc_arm(jb);
+    sp_mar_rd *r = (sp_mar_rd *)calloc(1, sizeof *r);
+    if (!r) sp_oom_die();
+    r->s = s ? s : ""; r->len = s ? (size_t)len : 0;
+    SP_MAR_LOCK();
+    r->prev = sp_mar_active; sp_mar_active = r;
+    SP_MAR_UNLOCK();
+    rd = r;
+    if (r->len >= 2) r->pos = 2;  /* skip the 4.8 version header */
     sp_RbVal v = sp_mar_r(r);
     sp_exc_disarm();
     sp_mar_rd_done(r);
@@ -656,7 +758,7 @@ sp_RbVal sp_marshal_load(const char *s, sp_int len) {
   void *obj = sp_exc_cur_obj();
   sp_exc_disarm();
   sp_gc_nroots = nroots;   /* the parse's own roots unwound with it */
-  sp_mar_rd_done(r);
+  if (rd) sp_mar_rd_done(rd);
   sp_fiber_reraise(cls, msg, obj);
   return mk_nil();
 }

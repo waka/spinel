@@ -162,6 +162,24 @@ static inline void sp_IntArray_push(sp_IntArray*a,sp_int v){if(a->frozen){sp_rai
    place, where n pushes grew it from 16 by doubling -- a realloc and a copy
    at every step, and a frozen and a capacity test per element. */
 static sp_IntArray*sp_IntArray_new_fill(sp_int n,sp_int v){if((uintmax_t)n>SIZE_MAX/sizeof(sp_int))sp_oom_die();sp_IntArray*a=sp_IntArray_new_cap(n);for(sp_int i=0;i<n;i++)a->data[i]=v;a->len=n;return a;}
+/* An Integer or Float result an iterator fills by index (map, Array.new
+   with a block): made at its full length, each value stored into its slot,
+   one past the end (the receiver grew in the block) appended, and the
+   length cut to the values stored when the walk ends (_end_fresh). A store
+   writes no length, which a push does per element (SP_ARR_LEN_ONCE): a fill
+   runs as a while loop's stores do. The array is the iterator's own until
+   it answers it, so no frozen test, and its slots are not set ahead: none
+   is read before its store, and a walk that ends early drops the array (a
+   block that breaks or raises at the first element costs what a push did). */
+#define SP_FRESH_CAP 65536   /* Array.new(n) with a block makes at most this many slots up front */
+static inline sp_IntArray*sp_IntArray_new_fresh(sp_int n){sp_IntArray*a=sp_IntArray_new_cap(n);a->len=n;return a;}
+static inline void sp_IntArray_put_fresh(sp_IntArray*a,sp_int i,sp_int v){if(SP_LIKELY((unsigned long long)i<(unsigned long long)a->len))a->data[a->start+i]=v;else sp_IntArray_push(a,v);}
+static inline void sp_IntArray_end_fresh(sp_IntArray*a,sp_int n){if(n<a->len)a->len=n;}
+/* ... Array.new(n) with a block fills it a run of up to SP_FRESH_CAP slots at a time: _fresh_to makes the next run's slots
+   (empty, the capacity doubling up to n), and each value goes into its slot unchecked (_store_fresh). A block that breaks,
+   throws or raises early so pays for one run, not for n slots it never fills. */
+static SP_NOINLINE void sp_IntArray_fresh_to(sp_IntArray*a,sp_int m,sp_int n){if(m>a->cap){sp_int c=a->cap*2;if(c<m)c=m;if(c>n)c=n;sp_IntArray_set_cap(a,c);}a->len=m;}
+static inline void sp_IntArray_store_fresh(sp_IntArray*a,sp_int i,sp_int v){a->data[a->start+i]=v;}
 /* Array.new(n) with no default: n nils, so the bitmap exists from the start
    with every live bit set (and the data zeroed, so a bit cleared by a later
    store leaves a real 0 behind only where the store wrote one). */
@@ -207,7 +225,14 @@ static SP_COLD void sp_IntArray_drop_nilbits(sp_IntArray*a);
    bitmap with no nil left dropped (no name of the array holds the bitmap
    across a store) */
 static SP_NOINLINE SP_COLD void sp_IntArray_clr_nil(sp_IntArray*a,sp_int pi){sp_nilbit_clr(a->nilbits,pi);if((uint64_t)pi>=a->nil_lo&&!sp_nilbit_get(a->nilbits,a->nil_lo)&&(a->nil_lo=sp_nil_lo_up(a->nilbits,a->nil_lo,a->cap))==SP_NIL_LO_NONE)sp_IntArray_drop_nilbits(a);}
-static inline void sp_IntArray_set(sp_IntArray*a,sp_int i,sp_int v){if(SP_LIKELY(a&&!a->frozen&&i>=0&&i<a->len)){a->data[a->start+i]=v;if(SP_UNLIKELY(a->nilbits))sp_IntArray_clr_nil(a,a->start+i);return;}sp_IntArray_set_cold(a,i,v);}
+static inline void sp_IntArray_set(sp_IntArray*a,sp_int i,sp_int v){if(SP_LIKELY(a&&!a->frozen&&(uint64_t)i<(uint64_t)a->len)){a->data[a->start+i]=v;if(SP_UNLIKELY(a->nilbits))sp_IntArray_clr_nil(a,a->start+i);return;}sp_IntArray_set_cold(a,i,v);}
+/* `fill(v, s, len)`'s stores, slots s up to e (s >= 0): what a sp_IntArray_set
+   per slot does, with its checks made once. The store at e - 1 goes first
+   when it is past the end (it grows the array and makes the gap before s
+   nil, as one store past the end does) or the receiver is frozen (it raises
+   as the first store would); the slots are then written in one run, which
+   the C compiler can vectorize where a store per slot re-read the header. */
+static inline void sp_IntArray_fill_span(sp_IntArray*a,sp_int s,sp_int e,sp_int v){if(!a||s>=e)return;if(SP_UNLIKELY(a->frozen||e>a->len))sp_IntArray_set(a,e-1,v);sp_int*d=a->data+a->start;for(sp_int i=s;i<e;i++)d[i]=v;if(SP_UNLIKELY(a->nilbits))sp_nilbits_clear_range(a->nilbits,a->start+s,a->start+e);}
 /* `a[i] = nil`: the slot's value is 0 and its bit set (the index rules of
    sp_IntArray_set: a negative index from the end, IndexError below -len, a
    gap of nils past the end) */
@@ -337,6 +362,12 @@ static SP_NOINLINE void sp_FloatArray_set_cap(sp_FloatArray*a,sp_int nc){sp_gc_h
 static inline void sp_FloatArray_push(sp_FloatArray*a,sp_float v){if(a->frozen){sp_raise_frozen_array_at(a, SP_BUILTIN_FLT_ARRAY);return;}sp_int l=SP_ARR_LEN_ONCE(a);if(l>=a->cap)sp_FloatArray_set_cap(a,sp_array_grown_cap(a->cap));a->data[l]=v;a->len=l+1;}
 /* Array.new(n, v): see sp_IntArray_new_fill */
 static sp_FloatArray*sp_FloatArray_new_fill(sp_int n,sp_float v){if((uintmax_t)n>SIZE_MAX/sizeof(sp_float))sp_oom_die();sp_FloatArray*a=sp_FloatArray_new_cap(n);for(sp_int i=0;i<n;i++)a->data[i]=v;a->len=n;return a;}
+/* (as sp_IntArray_new_fresh) */
+static inline sp_FloatArray*sp_FloatArray_new_fresh(sp_int n){sp_FloatArray*a=sp_FloatArray_new_cap(n);a->len=n;return a;}
+static inline void sp_FloatArray_put_fresh(sp_FloatArray*a,sp_int i,sp_float v){if(SP_LIKELY((unsigned long long)i<(unsigned long long)a->len))a->data[i]=v;else sp_FloatArray_push(a,v);}
+static inline void sp_FloatArray_end_fresh(sp_FloatArray*a,sp_int n){if(n<a->len)a->len=n;}
+static SP_NOINLINE void sp_FloatArray_fresh_to(sp_FloatArray*a,sp_int m,sp_int n){if(m>a->cap){sp_int c=a->cap*2;if(c<m)c=m;if(c>n)c=n;sp_FloatArray_set_cap(a,c);}a->len=m;}
+static inline void sp_FloatArray_store_fresh(sp_FloatArray*a,sp_int i,sp_float v){a->data[i]=v;}
 static SP_COLD sp_FloatArray*sp_FloatArray_new_nil(sp_int n){sp_FloatArray*a=sp_FloatArray_new_fill(n,0.0);if(n>0){SP_NILBITS_NEW_A(a);SP_NILBITS_SET_RANGE_A(a, 0, n);}return a;}
 static SP_NOINLINE SP_COLD void sp_FloatArray_clr_nil(sp_FloatArray*a,sp_int i);
 static SP_NOINLINE SP_COLD sp_ofloat sp_FloatArray_take_cold(sp_FloatArray*a,sp_int i,sp_float v){if(sp_nilbit_get(a->nilbits,i)){sp_FloatArray_clr_nil(a,i);return sp_ofloat_nil();}return sp_ofloat_of(v);}
@@ -417,6 +448,8 @@ static SP_NOINLINE SP_COLD void sp_FloatArray_clr_nil(sp_FloatArray*a,sp_int i){
    nil-bit clear made it too big to inline (bm_matmul under promote) */
 static SP_NOINLINE SP_COLD void sp_FloatArray_set_cold(sp_FloatArray*a,sp_int i,sp_float v){if(!a)return;if(a->frozen){sp_raise_frozen_array_at(a, SP_BUILTIN_FLT_ARRAY);return;}sp_int orig=i;if(i<0)i+=a->len;if(i<0)sp_raise_cls("IndexError",sp_sprintf("index %lld too small for array; minimum: %lld",(long long)orig,(long long)-a->len));while(i>=a->cap)sp_FloatArray_set_cap(a,a->cap*2+1);if(i>=a->len)sp_FloatArray_fill_to(a,i);a->data[i]=v;if(SP_UNLIKELY(a->nilbits))sp_FloatArray_clr_nil(a,i);}  /* the gap is nil, not 0.0 (#3836) */
 static inline void sp_FloatArray_set(sp_FloatArray*a,sp_int i,sp_float v){if(SP_LIKELY(a&&!a->frozen&&(unsigned long long)i<(unsigned long long)a->len)){a->data[i]=v;if(SP_UNLIKELY(a->nilbits))sp_FloatArray_clr_nil(a,i);return;}sp_FloatArray_set_cold(a,i,v);}
+/* `fill(v, s, len)` on a Float Array: see sp_IntArray_fill_span */
+static inline void sp_FloatArray_fill_span(sp_FloatArray*a,sp_int s,sp_int e,sp_float v){if(!a||s>=e)return;if(SP_UNLIKELY(a->frozen||e>a->len))sp_FloatArray_set(a,e-1,v);sp_float*d=a->data;for(sp_int i=s;i<e;i++)d[i]=v;if(SP_UNLIKELY(a->nilbits))sp_nilbits_clear_range(a->nilbits,s,e);}
 static SP_NOINLINE SP_COLD void sp_FloatArray_set_nil(sp_FloatArray*a,sp_int i){if (SP_UNLIKELY(!a)) sp_nil_recv("[]=");if(a->frozen){sp_raise_frozen_array_at(a, SP_BUILTIN_FLT_ARRAY);return;}sp_int orig=i;if(i<0)i+=a->len;if(i<0)sp_raise_cls("IndexError",sp_sprintf("index %lld too small for array; minimum: %lld",(long long)orig,(long long)-a->len));while(i>=a->cap)sp_FloatArray_set_cap(a,a->cap*2+1);if(i>=a->len)sp_FloatArray_fill_to(a,i);a->data[i]=0.0;if(!a->nilbits)SP_NILBITS_NEW_A(a);SP_NILBIT_SET_A(a, i);}
 static inline void sp_FloatArray_oset(sp_FloatArray*a,sp_int i,sp_ofloat o){if(SP_UNLIKELY(o.nil))sp_FloatArray_set_nil(a,i);else sp_FloatArray_set(a,i,o.v);}
 static SP_NOINLINE SP_COLD void sp_FloatArray_push_nil(sp_FloatArray*a){sp_FloatArray_push(a,0.0);if(a->frozen)return;if(!a->nilbits)SP_NILBITS_NEW_A(a);SP_NILBIT_SET_A(a, a->len-1);}
@@ -569,7 +602,7 @@ static inline sp_RbVal sp_PtrArray_get_box(sp_PtrArray *a, sp_int i) {
 /* the class a boxed value would name in a TypeError, from what this header can see */
 static inline const char *sp_PtrArray_val_class(sp_RbVal v) {
   switch (v.tag) {
-    case SP_TAG_INT: return "Integer"; case SP_TAG_FLT: return "Float"; case SP_TAG_STR: return "String";
+    case SP_TAG_INT: return "Integer"; case SP_TAG_FLT: return "Float";
     case SP_TAG_NIL: return "NilClass"; case SP_TAG_SYM: return "Symbol";
     case SP_TAG_BOOL: return v.v.b ? "TrueClass" : "FalseClass";
     case SP_TAG_OBJ:

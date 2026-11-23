@@ -280,6 +280,7 @@ void nt_truncate(NodeTable *nt, int count) {
   if (count < 0 || count >= nt->count) return;
   /* (the dropped nodes' slots counted toward the nodes they held) */
   par_drop(nt);
+  if (count < nt->low_mark) nt->low_touched = 1;   /* (the ids from count on are made again) */
   nt->count = count;
 }
 
@@ -318,10 +319,21 @@ NodeTable *nt_new_table(void) {
   return nt;
 }
 
+/* An edit of the type or a string field of node id: noted when the node is
+   below the mark an index was built to (low_mark). */
+static void nt_low_touch(NodeTable *nt, int id) {
+  if (id < nt->low_mark) nt->low_touched = 1;
+}
+void nt_low_watch(NodeTable *nt) {
+  nt->low_mark = nt->count;
+  nt->low_touched = 0;
+}
+
 /* The node at `id`, the table first extended to it; the slots it grows by
    start empty. */
 static SpNode *node_put(NodeTable *nt, int id) {
   if (id < 0) return NULL;
+  nt_low_touch(nt, id);
   if (id >= nt->node_cap) {
     int nc = nt->node_cap ? nt->node_cap : 256;
     while (nc <= id) {
@@ -596,7 +608,7 @@ int nt_clone_subtree(NodeTable *nt, int root) {
   nt_aux(nt, nt->count - 1);
   nt_aux_reset(nt, base, nt->count);
   if (nt->orig_lo) for (int i = 0; i < sn; i++) nt_set_origin(nt, base + i, list[i], 'c', 0);
-  nt->version++; nt->edits++; nt->clone_version++;
+  nt->version++; nt->edits++;
   par_cover(nt);
   for (int i = 0; i < sn; i++) par_node(nt, base + i);
   free(list);
@@ -615,6 +627,7 @@ void nt_node_set_type(NodeTable *nt, int id, const char *type) {
   if (id < 0 || id >= nt->count || !type) return;
   NodeKind was = nt_kind(nt, id);
   SpNode *nd = &nt->nodes[id];
+  nt_low_touch(nt, id);
   node_set_type(nt, nd, type, strlen(type));
   nd->kind = 0;          /* the cached NodeKind is stale now */
   nt->version++; nt->edits++;
@@ -685,6 +698,7 @@ void nt_node_reset(NodeTable *nt, int id, const char *type) {
   if (!nd) return;
   NodeKind was = nt_kind(nt, id);
   nt->version++; nt->edits++;
+  nt_low_touch(nt, id);
   nt_retire(nt, nd->type); nd->type = NULL;
   nt_retire(nt, nd->content); nd->content = NULL;
   for (int j = 0; j < nd->ns; j++) { nt_retire(nt, nd->s[j].key); nt_retire(nt, nd->s[j].val); }
@@ -720,6 +734,7 @@ void nt_node_set_str(NodeTable *nt, int id, const char *key, const char *val) {
   SpNode *nd = (SpNode *)node_at(nt, id);
   if (!nd) return;
   nt->version++; nt->edits++;
+  nt_low_touch(nt, id);
   size_t klen = strlen(key), vlen = strlen(val);
   if (vlen == 16 && !strcmp(val, "__cext_extension") && !strcmp(key, "name")) nt->has_cext_decls = 1;
   if (!strcmp(key, "name")) nt_stale_ckey(nt, nd);
@@ -745,6 +760,7 @@ char *nt_node_swap_str(NodeTable *nt, int id, const char *key, const char *val) 
   SpNode *nd = (SpNode *)node_at(nt, id);
   if (!nd) return NULL;
   nt->version++;
+  nt_low_touch(nt, id);
   if (nt_kind(nt, id) == NK_CallNode && sp_streq(key, "name")) {
     nt_rename_note(nt, nt_str(nt, id, "name"), val);
     nt->rename_version++;
@@ -764,6 +780,7 @@ void nt_node_restore_str(NodeTable *nt, int id, const char *key, char *held) {
   SpNode *nd = (SpNode *)node_at(nt, id);
   if (!nd) { free(held); return; }
   nt->version++;
+  nt_low_touch(nt, id);
   if (nt_kind(nt, id) == NK_CallNode && sp_streq(key, "name")) {
     nt_rename_note(nt, nt_str(nt, id, "name"), held);
     nt->rename_version++;
@@ -894,6 +911,7 @@ void nt_free(NodeTable *nt) {
   }
   free(nt->nodes);
   nki_drop(nt);
+  free(nt->kind_gen);
   for (int i = 0; i < nt->nkind_retired; i++) free(nt->kind_retired[i]);
   free(nt->kind_retired);
   for (int i = 0; i < nt->nstr_retired; i++) free(nt->str_retired[i]);
@@ -913,6 +931,8 @@ void nt_free(NodeTable *nt) {
   for (int i = 0; i < nt->npar_old; i++) free(nt->par_old[i]);
   free(nt->par_old);
   if (nt->holders) { free(nt->holders->par); free(nt->holders->stamp); free(nt->holders); }
+  for (int i = 0; i < nt->nsplits; i++) { free(nt->splits[i].buf); free(nt->splits[i].names); }
+  free(nt->splits);
   if (nt->builders) { free(nt->builders->call); free(nt->builders->module); free(nt->builders->stamp); free(nt->builders); }
   free(nt);
 }
@@ -1055,6 +1075,8 @@ void nt_kind_iter_close(NtKindIter *it) {
 }
 static void nki_drop(NodeTable *nt) {
   nt->nkind_moved = 0;
+  if (nt->kind_gen)
+    for (int k = 0; k < NK__COUNT; k++) nt->kind_gen[k]++;
   if (!nt->kind_ids) return;
   for (int k = 0; k < NK__COUNT; k++) nki_release(nt, nt->kind_ids[k]);
   free(nt->kind_ids); free(nt->kind_n); free(nt->kind_cap);
@@ -1137,6 +1159,7 @@ static void nki_apply_moves(NodeTable *nt) {
     nki_work(n);
     nki_release(nt, old);
     nt->kind_ids[k] = p; nt->kind_n[k] = n; nt->kind_cap[k] = cap;
+    nt->kind_gen[k]++;
   }
   free(hit);
   free(mv);
@@ -1146,6 +1169,10 @@ static void nki_apply_moves(NodeTable *nt) {
    yet added to their kinds' ids */
 static void nki_refresh(NodeTable *nt) {
   if (nt->kind_ids && nt->kind_count > nt->count) nki_drop(nt);
+  if (!nt->kind_gen) {
+    nt->kind_gen = (unsigned *)calloc((size_t)NK__COUNT, sizeof(unsigned));
+    if (!nt->kind_gen) nt_oom();
+  }
   if (!nt->kind_ids) {
     nt->kind_ids = (int **)calloc((size_t)NK__COUNT, sizeof(int *));
     nt->kind_n = (int *)calloc((size_t)NK__COUNT, sizeof(int));
@@ -1158,6 +1185,7 @@ static void nki_refresh(NodeTable *nt) {
     int k = (int)nt_kind(nt, id);
     nki_grow(nt, k, nt->kind_n[k] + 1);
     nt->kind_ids[k][nt->kind_n[k]++] = id;
+    nt->kind_gen[k]++;
   }
   nt->kind_count = nt->count;
 }
@@ -1172,6 +1200,7 @@ void nt_swap_nodes(NodeTable *nt, int a, int b) {
   nt->nodes[a] = nt->nodes[b];
   nt->nodes[b] = t;
   nt->version++; nt->edits++;
+  nt_low_touch(nt, a); nt_low_touch(nt, b);
   par_drop(nt);   /* every node a or b held, and each that holds them, moves */
   nki_drop(nt);   /* the kind index lists ids by kind: rebuild it */
 }
@@ -1185,6 +1214,13 @@ const int *nt_nodes_of_kind(const NodeTable *nt, NodeKind k, int *count) {
   if (!w->kind_ids || w->kind_count != w->count || w->nkind_moved) nki_refresh(w);
   *count = w->kind_n[k];
   return w->kind_ids[k];
+}
+
+unsigned nt_kind_gen(const NodeTable *nt, NodeKind k) {
+  if (k < 0 || k >= NK__COUNT) return 0;
+  NodeTable *w = (NodeTable *)nt;
+  if (!w->kind_ids || w->kind_count != w->count || w->nkind_moved) nki_refresh(w);
+  return w->kind_gen[k];
 }
 
 
@@ -1220,6 +1256,7 @@ void nt_renumber(NodeTable *nt, const int *order) {
   for (int i = 0; i < nt->nautoloads; i++) nt->autoloads[i].node = perm[nt->autoloads[i].node];
   free(perm);
   nt->version++; nt->edits++;
+  if (nt->low_mark > 0) nt->low_touched = 1;   /* (every id moved) */
   par_drop(nt);
   nki_drop(nt);   /* the ids of each kind moved */
   free(nt->aux); nt->aux = NULL; nt->aux_cap = 0;   /* and so did each one's entry */
@@ -1229,6 +1266,7 @@ int nt_set_str(NodeTable *nt, int id, const char *key, const char *val) {
   SpNode *nd = (SpNode *)node_at(nt, id);
   if (!nd) return 0;
   nt->version++; nt->edits++;
+  nt_low_touch(nt, id);
   if (!strcmp(key, "name")) nt_stale_ckey(nt, nd);
   size_t vlen = strlen(val);
   for (int j = 0; j < nd->ns; j++) {
@@ -1245,6 +1283,13 @@ int nt_set_str(NodeTable *nt, int id, const char *key, const char *val) {
 
 
 
+
+void nt_rename_local(NodeTable *nt, int id, const char *newname) {
+  const char *was = nt_str(nt, id, "name");
+  if (!was) return;
+  if (!nt_str(nt, id, "wname")) nt_node_set_str(nt, id, "wname", was);
+  nt_set_str(nt, id, "name", newname);
+}
 
 /* A condition's predicate as a constant: 1 always truthy, 0 always falsy,
    -1 a value known only when it runs. Only a literal folds: true and the
@@ -1333,4 +1378,110 @@ int nt_import_subtree(NodeTable *dst, const NodeTable *src, int root) {
     free(ids);
   }
   return id;
+}
+
+/* ---- a scope's local names ---- */
+
+const char *const *nt_scope_locals(const NodeTable *nt, int id, int *out_n) {
+  NodeTable *t = (NodeTable *)nt;   /* (the split is a memo, not the tree) */
+  const char *s = nt_str(nt, id, "locals");
+  if (out_n) *out_n = 0;
+  if (!s || !*s) return NULL;
+  if (id >= t->nsplits) {
+    int nc = id + 1 > 2 * t->nsplits ? id + 1 : 2 * t->nsplits;
+    struct NtScopeSplit *np = realloc(t->splits, (size_t)nc * sizeof *np);
+    if (!np) nt_oom();
+    memset(np + t->nsplits, 0, (size_t)(nc - t->nsplits) * sizeof *np);
+    t->splits = np; t->nsplits = nc;
+  }
+  struct NtScopeSplit *e = &t->splits[id];
+  if (e->src != s) {
+    int n = 1;
+    for (const char *p = s; *p; p++) if (*p == ',') n++;
+    free(e->buf); free(e->names);
+    e->buf = dup_n(s, strlen(s));
+    e->names = malloc((size_t)n * sizeof *e->names);
+    if (!e->names) nt_oom();
+    int k = 0;
+    for (char *p = e->buf; ; ) {
+      char *c = strchr(p, ',');
+      if (c) *c = '\0';
+      if (*p) e->names[k++] = p;
+      if (!c) break;
+      p = c + 1;
+    }
+    e->n = k;
+    e->src = s;
+  }
+  if (out_n) *out_n = e->n;
+  return e->names;
+}
+
+int nt_scope_has_local(const NodeTable *nt, int id, const char *name) {
+  int n = 0;
+  const char *const *ls = nt_scope_locals(nt, id, &n);
+  for (int i = 0; name && i < n; i++) if (sp_streq(ls[i], name)) return 1;
+  return 0;
+}
+
+void nt_scope_locals_set(NodeTable *nt, int id, const char *const *names, int n) {
+  size_t len = 1;
+  for (int i = 0; i < n; i++) len += strlen(names[i]) + 1;
+  char *joined = nt_alloc(len);
+  char *w = joined;
+  for (int i = 0; i < n; i++) {
+    size_t l = strlen(names[i]);
+    if (i) *w++ = ',';
+    memcpy(w, names[i], l); w += l;
+  }
+  *w = '\0';
+  nt_node_set_str(nt, id, "locals", joined);
+  free(joined);
+}
+
+int nt_block_local_node(const NodeTable *nt, int blk, const char *name) {
+  int n = 0;
+  const int *ids;
+  if (blk < 0 || !name) return -1;
+  if (nt_kind(nt, blk) == NK_LambdaNode) ids = nt_arr(nt, blk, "block_locals", &n);
+  else {
+    int bp = nt_ref(nt, blk, "parameters");
+    ids = bp >= 0 && nt_kind(nt, bp) == NK_BlockParametersNode ? nt_arr(nt, bp, "locals", &n) : NULL;
+  }
+  for (int i = 0; i < n; i++) {
+    const char *bn = nt_str(nt, ids[i], "name");
+    if (bn && sp_streq(bn, name)) return ids[i];
+  }
+  return -1;
+}
+
+/* Does a node of kind k bind a name as a parameter, or as a destructured
+   target of one? (A block-local does not.) */
+static int nt_names_a_binding(NodeKind k) {
+  switch (k) {
+  case NK_RequiredParameterNode: case NK_OptionalParameterNode: case NK_RestParameterNode:
+  case NK_KeywordRestParameterNode: case NK_RequiredKeywordParameterNode:
+  case NK_OptionalKeywordParameterNode: case NK_BlockParameterNode:
+  case NK_LocalVariableTargetNode:
+    return 1;
+  default:
+    return 0;
+  }
+}
+
+int nt_param_binds(const NodeTable *nt, int id, const char *name) {
+  if (id < 0) return 0;
+  if (nt_names_a_binding(nt_kind(nt, id))) {
+    const char *pn = nt_str(nt, id, "name");
+    if (pn && sp_streq(pn, name)) return 1;
+  }
+  int nr = nt_num_refs(nt, id);
+  for (int i = 0; i < nr; i++)
+    if (nt_param_binds(nt, nt_ref_at(nt, id, i), name)) return 1;
+  int na = nt_num_arrs(nt, id);
+  for (int i = 0; i < na; i++) {
+    int n = 0; const int *ids = nt_arr_at(nt, id, i, &n);
+    for (int j = 0; j < n; j++) if (nt_param_binds(nt, ids[j], name)) return 1;
+  }
+  return 0;
 }

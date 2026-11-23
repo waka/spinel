@@ -150,16 +150,15 @@ typedef enum {
                     scope, read and written through *_cell_<name> */
 } ReprCell;
 
-/* Is value v (of representation r) typed as the handle while its own text
-   is its String's bytes, the handle formed apart from that text: a fresh
-   one, wrapped around the bytes where it is stored (RS_FRESH), or the
-   handle a String Range keeps for its endpoint (strbuf_srange_tail), read
-   off the Range? An operand or an argument held ahead of its call is
-   held as the String, and the handle taken as its route takes it. */
-int repr_handle_apart(Compiler *c, int v, Repr r);
+/* Does the storage of r take a fresh handle formed from its byte result? */
+int repr_handle_apart(Repr r);
 /* Does a call's settled return route hand back a shared String handle? */
 int repr_native_call_handle(Compiler *c, int node);
 int repr_call_returns_handle(Compiler *c, int v);
+int repr_string_iterator_handle(Compiler *c, int node);
+/* The handle entry of a zero-argument native String reader. */
+const char *repr_native_string_symbol(const NativeMethod *m);
+const NativeMethod *repr_native_string_reader(Compiler *c, int node);
 int scope_always_raises(Compiler *c, int mi);
 const NativeMethod *repr_super_native_keeps(Compiler *c, int n); /* super into a native keeps binding (#9258) */
 /* The native binding whose handle a boxed call's arm for class k publishes. */
@@ -184,6 +183,11 @@ int repr_self_shared(const Compiler *c, int node);
 /* The representation of a local variable's slot (a global's and a
    constant's LocalVar too). */
 Repr repr_of_slot(const Compiler *c, const LocalVar *lv);
+/* Can the closure cell of local lv hold its value, and so ride a capture struct (a proc's, or a define_method block's
+   environment)? A Float capture is a real sp_float field, not the proc's argument slot; a by-value struct rides its
+   own cell (#3995 for the class; the Range / Rational / Complex siblings were left on the reject, and Time / Tms / a
+   String range after them). */
+int repr_cell_capturable(const Compiler *c, const LocalVar *lv);
 /* An Array operand's stored representation. A subclass keeps its node's
    Array projection rather than its object's local-slot representation. */
 Repr repr_array_operand(Compiler *c, int node);
@@ -232,7 +236,7 @@ typedef enum {
   RF_FLT,           /* sp_box_float */
   RF_FLT_NIL,       /* a Float boxed with its nil: sp_box_ofloat */
   RF_BIGINT,        /* a Bignum, NULL as nil */
-  RF_STR,           /* sp_box_str */
+  RF_STR,           /* String handle box */
   RF_BOOL,
   RF_SYM,
   RF_STRUCT,        /* a by-value struct: a Range, Time, Complex, Rational,
@@ -305,6 +309,8 @@ typedef enum {
   CF_REFUSE,        /* no conversion keeps the value: refused */
   CF__COUNT
 } CoerceForm;
+/* How emit_coerce may convert: hold as-is, or run a Ruby conversion. */
+enum { CO_HOLD, CO_CONVERT };
 /* the form emit_coerce stores `node` into a `slot` slot in (how: CO_HOLD
    or CO_CONVERT) */
 int repr_coerce_form(Compiler *c, int node, TyKind slot, int how);

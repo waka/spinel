@@ -10,14 +10,14 @@
  *
  *   Values / tags:
  *     sp_RbVal            boxed value       (sp_gc.h)
- *     SP_TAG_INT/FLT/BOOL/NIL/STR/SYM/OBJ   value tags
+ *     SP_TAG_INT/FLT/BOOL/NIL/SYM/OBJ   value tags
  *
  *   Container reflection hooks (installed by the generated program at startup;
  *   a package reads a program's typed containers only through these):
  *     sp_json_kind_fn, sp_json_len_fn, sp_json_aref_fn, sp_json_hpair_fn
  *     sp_sym_name_fn
  *
- *   String heap + scalar formatting (sp_alloc.h):
+ *   String payload allocation and scalar formatting (sp_alloc.h):
  *     sp_str_alloc, sp_str_alloc_raw, sp_str_set_len, sp_str_empty
  *     sp_int_to_s, sp_float_to_s
  *     sp_oom_die
@@ -25,10 +25,12 @@
  *                              is: a parser's object keys)
  *
  *   Boxing a new String (sp_string.h):
- *     sp_box_str_new  (a String the package just built, boxed as the String's
- *                      own handle: a change through the box reaches every copy
- *                      of it, as in CRuby. A parser's String values, not its
- *                      object keys)
+ *     sp_box_str_new  (the package's newly built String or the owner of a
+ *                      live String payload, boxed as a handle. A change
+ *                      through the box reaches all copies. Use it for a
+ *                      parser's String values.
+ *                      Object keys follow the frozen Hash key contract.)
+ *     sp_poly_arg_string  (retain a String or the result of its #to_str)
  *
  *   Float digits (sp_dtoa.h):
  *     sp_float_shortest  (the shortest round-trip digits and exponent, for a
@@ -36,6 +38,8 @@
  *
  *   Errors:
  *     sp_raise_cls   (raise a named exception class)
+ *     sp_raise_parse_error  (raise one with the line and column that its
+ *                            #line and #column answer: JSON::ParserError)
  *
  *   GC roots (sp_gc.h):
  *     SP_GC_ROOT, SP_GC_ROOT_STR, SP_GC_ROOT_RBVAL
@@ -64,5 +68,7 @@
 #include "sp_alloc.h"   /* sp_str_alloc, sp_str_set_len, sp_int_to_s, sp_float_to_s, sp_oom_die */
 #include "sp_dtoa.h"    /* sp_float_shortest */
 #include "sp_string.h"   /* sp_box_str_new */
+
+sp_String *sp_poly_arg_string(sp_RbVal value);
 
 #endif /* SPINEL_RUNTIME_H */

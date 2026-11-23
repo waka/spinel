@@ -87,12 +87,16 @@ typedef struct {
      keyed on node identity or name can revalidate against it. */
   unsigned version;
   /* The parts of version that a local variable read appended by
-     nt_new_local_read, a call renamed by nt_node_swap_str or
-     nt_node_restore_str (nt_stamp_holds), and a subtree appended by
-     nt_clone_subtree bumped: a clone touches no node below the count it
-     found, so an index of the nodes by name extends over the clones when
-     every bump since its build was one (an_calls_named_first). */
-  unsigned read_version, rename_version, clone_version;
+     nt_new_local_read and a call renamed by nt_node_swap_str or
+     nt_node_restore_str bumped (nt_stamp_holds). */
+  unsigned read_version, rename_version;
+  /* The count an index of the nodes by name was built over (low_mark, set
+     by nt_low_watch), and whether an edit since changed the type or a
+     string field of a node below it (low_touched). An edit of the nodes
+     appended since leaves it clear, so the index extends over them instead
+     of being rebuilt (an_calls_named_first). */
+  int low_mark;
+  unsigned char low_touched;
   /* The last NT_RENAME_LOG of the renames rename_version counts, by that
      count: the name each replaced and the one it set (nt_renames_spare). */
   NtRename rename_log[NT_RENAME_LOG];
@@ -122,6 +126,7 @@ typedef struct {
      be reading. */
   int **kind_ids;
   int *kind_n, *kind_cap;
+  unsigned *kind_gen;
   int kind_count;
   int *kind_moved, nkind_moved, ckind_moved;
   int kind_live;
@@ -137,6 +142,10 @@ typedef struct {
   /* the class builder each constant write holds (class_def_builder), asked
      node by node; NULL until the first */
   struct NtBuilders *builders;
+  /* the names of each scope's `locals`, split once (nt_scope_locals); NULL
+     until the first ask */
+  struct NtScopeSplit *splits;
+  int nsplits;
   /* how many times a call was marked to bind the builtin's own method
      (nt_mark_builtin_call): none, and no call is marked, which an ask can
      tell without a node read (a clone copies a marked node's mark) */
@@ -188,6 +197,18 @@ struct NtBuilders {
   unsigned ver;
   unsigned long edits;
   int cnt;
+};
+
+/* A scope node's `locals` split into names, kept on the table it was asked
+   of: entry id holds the names of the string it was split from (src), and
+   counts only while the node still holds that string. An edit retires a
+   replaced string and never frees it before nt_free, so its pointer names its
+   content and an edit clears nothing. Freed with the table. */
+struct NtScopeSplit {
+  const char *src;
+  char *buf;
+  const char **names;
+  int n;
 };
 
 /* The roots of the program's files, entry first (see file_roots). */
@@ -252,6 +273,9 @@ static inline NodeKind nt_kind(const NodeTable *nt, int id) {
    Lets a pass iterate only the nodes it cares about instead of scanning the
    whole table and filtering by kind. *count receives the number of ids. */
 const int *nt_nodes_of_kind(const NodeTable *nt, NodeKind k, int *count);
+/* Generation counter for kind `k`'s id list: bumped whenever a node of kind
+   `k` is added, removed, retyped, swapped, or renumbered. */
+unsigned nt_kind_gen(const NodeTable *nt, NodeKind k);
 
 /* Iterate the ids of kind KIND (ascending), binding each to a fresh `int IDV`:
      NT_FOREACH_KIND(nt, NK_CallNode, id) { ... use id ... }
@@ -389,6 +413,8 @@ int  nt_new_int(NodeTable *nt, long long v);                     /* a new Intege
    Such a read is a leaf, so a whole-tree index built before it was appended
    (one that reads no local variable read) is still the index of the table. */
 int  nt_appended_only_local_reads(const NodeTable *nt, int from);
+/* Start watching the nodes below the count for edits (low_mark, low_touched). */
+void nt_low_watch(NodeTable *nt);
 /* A new local variable read of name, counted in read_version. */
 int  nt_new_local_read(NodeTable *nt, const char *name);
 /* The table's version when an index was built, with its two counted parts.
@@ -796,10 +822,44 @@ NodeTable *sp_parse_snippet_in(const char *src, const SnipFrame *f);
    src/main.c sets them, spinel_parse.c defines them. A string is a path to
    write, or NULL. */
 extern int g_opt_debug, g_opt_line_map, g_opt_positions, g_opt_warn_widen, g_opt_check_stores,
-           g_opt_defer_refusals, g_opt_emit_types_keep_c;
+           g_opt_defer_refusals, g_opt_emit_types_keep_c, g_opt_strict_rbs;
 extern const char *g_opt_emit_types, *g_opt_emit_rbs, *g_opt_emit_symbol_map, *g_opt_profile_symbol_map,
                   *g_opt_rbs_seed;
 
+
+/* ---- a scope's local names ----
+   A block's, lambda's, def's or class body's `locals` is one comma-joined
+   string, which every pass edits as a whole (nt_scope_locals_set); these
+   answer it as names, split once per string. */
+
+/* The names in scope node id's `locals`, in order, and their count in *out_n
+   (none: an empty list). The array is the table's own and holds until the
+   node's locals are next asked after an edit of them: a caller that edits
+   them while it reads the names copies them first. */
+const char *const *nt_scope_locals(const NodeTable *nt, int id, int *out_n);
+/* Does scope node id list a local named name? */
+int nt_scope_has_local(const NodeTable *nt, int id, const char *name);
+/* Replace scope node id's locals with the n names given. */
+void nt_scope_locals_set(NodeTable *nt, int id, const char *const *names, int n);
+/* Does a parameter in the subtree at id, a block's or def's parameters,
+   bind name, spelled so (a renamed parameter's node holds its new spelling)?
+   A block-local does not bind it as a parameter. */
+int nt_param_binds(const NodeTable *nt, int id, const char *name);
+/* The BlockLocalVariableNode with which block or lambda blk declares name as
+   a block-local (`|a; name|`), -1 if it declares none. */
+int nt_block_local_node(const NodeTable *nt, int blk, const char *name);
+
+/* The name a local-binding or local-reference node was written with: its
+   `wname`, which a pass that renamed the node (nt_rename_local) kept, else
+   its `name`. A node a desugar made has no Prism origin, so its name is what
+   it wrote. */
+static inline const char *nt_wname(const NodeTable *nt, int id) {
+  const char *w = nt_str(nt, id, "wname");
+  return w ? w : nt_str(nt, id, "name");
+}
+/* Rename local node id to newname, keeping the name it was first written
+   with in `wname`. A node without a `name` is left as it is. */
+void nt_rename_local(NodeTable *nt, int id, const char *newname);
 
 /* The name a class or module header's constant path is keyed by: the one
    qualify_colliding_classes gave a colliding header ("qc_name"), else the

@@ -515,7 +515,7 @@ static __attribute__((noreturn)) void unsup_leave(const char *file, int line, co
   exit(1);
 }
 /* The .rb position the parser stamped on `id`, or line 0. */
-static const char *unsup_pos(Compiler *c, int id, int *line) {
+const char *unsup_pos(Compiler *c, int id, int *line) {
   *line = (int)nt_int(c->nt, id, "node_line", 0);
   int fid = (int)nt_int(c->nt, id, "node_file", 0);
   const char *file = nt_file_path(c->nt, fid);
@@ -1474,6 +1474,13 @@ int g_class_body_id = -1;
 int g_emitting_class_id = -1;
 const char *g_dm_subst_name = NULL;
 int g_dm_subst_node = -1;
+
+int substituted_local_node(const NodeTable *nt, int node) {
+  if (!g_dm_subst_name || g_dm_subst_node < 0 || nt_kind(nt, node) != NK_LocalVariableReadNode)
+    return -1;
+  const char *name = nt_str(nt, node, "name");
+  return name && sp_streq(name, g_dm_subst_name) ? g_dm_subst_node : -1;
+}
 int g_ie_class_id = -1;
 int g_ie_discard_value = 0;
 int g_ie_nil_ivars = 0;
@@ -1497,17 +1504,40 @@ int redo_label_push(int owner) {
   g_redo_rescue_base[g_redo_depth] = g_rescue_save_depth;
   return g_redo_stack[g_redo_depth++] = ++g_tmp;
 }
-/* A redo goes back to the innermost label: it pops the frames of the begins it
-   is written in, as a `next` does for its loop, and the exceptions of the
-   rescue clauses entered since the label. With an ensure between, it is the
-   bare goto it was; so it is where the regions are no longer counted, since
-   an ensure there could not be seen. */
-void emit_redo_unwind(Buf *b) {
-  int top = g_redo_depth - 1;
-  if (g_ensure_depth != g_redo_ensure_base[top] || g_ensure_depth >= MAX_ENSURE_DEPTH) return;
-  int pops = g_exc_frame_depth - g_redo_exc_base[top], k = g_rescue_save_depth - g_redo_rescue_base[top];
+static void emit_redo_frame_pops(Buf *b, int exc_base, int rescue_base) {
+  int pops = g_exc_frame_depth - exc_base;
   if (pops > 0) buf_printf(b, "sp_exc_top -= %d; ", pops);
-  if (k > 0) buf_printf(b, "sp_rescue_sp -= %d; ", k);
+  emit_rescue_pops_to(b, rescue_base);
+}
+
+/* Leave each protected region on the way back to the block or loop body. */
+void emit_redo_transfer(Buf *b) {
+  int top = g_redo_depth - 1;
+  if (g_ensure_depth > g_redo_ensure_base[top]) {
+    EnsureCtx *region = &g_ensure_stack[g_ensure_depth - 1];
+    region->has_redo = 1;
+    buf_printf(b, "_redof%d = 1; ", region->lid);
+    emit_redo_frame_pops(b, region->exc_base, region->rescue_base);
+    buf_printf(b, "goto _ensure%d;", region->lid);
+    return;
+  }
+  emit_redo_frame_pops(b, g_redo_exc_base[top], g_redo_rescue_base[top]);
+  emit_loop_latch_poll(b, " ");
+  buf_printf(b, "goto _redo_%d;", g_redo_stack[top]);
+}
+
+void emit_redo_region_open(Buf *b, int label, int indent) {
+  if (g_redo_depth <= 0) return;
+  emit_indent(b, indent);
+  buf_printf(b, "int _redof%d = 0; (void)_redof%d;\n", label, label);
+}
+
+void emit_redo_region_close(Buf *b, const EnsureCtx *region, int indent) {
+  if (!region->has_redo) return;
+  emit_indent(b, indent);
+  buf_printf(b, "if (_redof%d) { ", region->lid);
+  emit_redo_transfer(b);
+  buf_puts(b, " }\n");
 }
 const char *g_loop_break_var = NULL;
 /* When a direct instance_exec/eval splice is wrapped in a do{}while(0), this
@@ -1666,6 +1696,7 @@ TyKind g_ret_type = TY_UNKNOWN;
    expressions type. `return <value>` emitted into it is a C constraint
    violation, and GCC 14 rejects it. */
 int g_c_ret_void = 0;
+int g_in_file_top = 0;
 /* The body of the Fiber.new / Thread.new / Enumerator.new block whose C
    function is being emitted, or -1. A `next` this body owns leaves that
    function (emit_next_leaving_body). */
@@ -2032,6 +2063,40 @@ int bigl_intern(const char *v) {
   }
   g_bigl_val[g_bigl_n] = strdup(v);
   return g_bigl_n++;
+}
+int bigl_lookup(const char *v) {
+  if (!v) return -1;
+  for (int i = 0; i < g_bigl_n; i++) if (sp_streq(g_bigl_val[i], v)) return i;
+  return -1;
+}
+void bigl_int_text(Compiler *c, int lit, char out[32]) {
+  snprintf(out, 32, "%lld", (long long)nt_int(c->nt, lit, "value", 0));
+}
+int bigl_shift_text(Compiler *c, int call, char *out, size_t cap) {
+  const NodeTable *nt = c->nt;
+  if (call < 0 || nt_kind(nt, call) != NK_CallNode || !sp_streq(nt_str(nt, call, "name"), "<<")) return 0;
+  int recv = nt_ref(nt, call, "receiver"), argc = 0;
+  const int *argv = call_args(nt, call, &argc);
+  if (recv < 0 || argc != 1 || nt_kind(nt, recv) != NK_IntegerNode || nt_kind(nt, argv[0]) != NK_IntegerNode) return 0;
+  if (nt_str(nt, recv, "bigval") || nt_str(nt, argv[0], "bigval") || !repr_of(c, call).big) return 0;
+  long long v = (long long)nt_int(nt, recv, "value", 0), n = (long long)nt_int(nt, argv[0], "value", 0);
+  if (n < 0 || n > 1024 || v == 0) return 0;
+  /* |v| * 2**n in decimal, least significant digit first, by doubling */
+  unsigned long long u = v < 0 ? 0ULL - (unsigned long long)v : (unsigned long long)v;
+  char dig[400]; int len = 0;
+  while (u) { dig[len++] = (char)(u % 10); u /= 10; }
+  for (long long k = 0; k < n; k++) {
+    int carry = 0;
+    for (int i = 0; i < len; i++) { int d = dig[i] * 2 + carry; dig[i] = (char)(d % 10); carry = d / 10; }
+    if (carry) { if (len >= (int)sizeof dig) return 0; dig[len++] = (char)carry; }
+  }
+  size_t need = (size_t)len + (v < 0) + 1;
+  if (need > cap) return 0;
+  size_t o = 0;
+  if (v < 0) out[o++] = '-';
+  for (int i = len - 1; i >= 0; i--) out[o++] = (char)('0' + dig[i]);
+  out[o] = 0;
+  return 1;
 }
 int g_uses_symbols = 0;
 int g_uses_marshal = 0;
@@ -2405,11 +2470,7 @@ static int subtree_has_param_named(const Compiler *c, int id, const char *nm) {
     const char *pn = nt_str(nt, id, "name");
     /* shadow-renaming rewrites a param's node-table name to NAME__bpNN;
        the parser's locals list keeps the raw NAME -- match both. */
-    if (pn) {
-      size_t nl = strlen(nm);
-      if (sp_streq(pn, nm)) return 1;
-      if (block_param_written_len(c, pn) == nl && !strncmp(pn, nm, nl)) return 1;
-    }
+    if (pn && (sp_streq(pn, nm) || sp_streq(nt_wname(nt, id), nm))) return 1;
   }
   int nr = nt_num_refs(nt, id);
   for (int i = 0; i < nr; i++)
@@ -2519,108 +2580,95 @@ void emit_param_cell_fresh(Compiler *c, int blk, const char *pname, Buf *b, int 
 }
 void emit_block_locals_reset(Compiler *c, int blk, Buf *b, int indent) {
   if (blk < 0) return;
-  const char *locs = nt_str(c->nt, blk, "locals");
-  if (!locs || !*locs) return;
-  char tmpn_buf[128];
-  const char *p = locs;
-  while (*p) {
-    const char *e = strchr(p, ',');
-    size_t l = e ? (size_t)(e - p) : strlen(p);
-    if (l) {
-      /* names longer than the stack buffer are legal Ruby; heap-fall back
-         rather than silently skipping the reset */
-      char *tmpn = l < sizeof tmpn_buf ? tmpn_buf : malloc(l + 1);
-      if (!tmpn) break;
-      memcpy(tmpn, p, l); tmpn[l] = 0;
-      /* Skip every name bound by the block's parameter list, including
-         destructured, optional, rest, and shadow (`; x`) declarations --
-         collected straight from the parameters subtree, since
-         block_param_name only covers plain leading params. */
-      int is_param = subtree_has_param_named(c, nt_ref(c->nt, blk, "parameters"), tmpn);
+  int nloc = 0;
+  const char *const *locs = nt_scope_locals(c->nt, blk, &nloc);
+  for (int li = 0; li < nloc; li++) {
+    const char *tmpn = locs[li];
+    /* Skip every name bound by the block's parameter list, including
+       destructured, optional and rest parameters -- collected straight
+       from the parameters subtree, since block_param_name only covers
+       plain leading params. A block-local (`; x`) binds no parameter, and
+       is reset. */
+    int is_param = subtree_has_param_named(c, nt_ref(c->nt, blk, "parameters"), tmpn);
 
-      if (is_param) {
-        /* A cell_shadow param is bound by the loop emitters WRITING THE PLAIN C
-           SLOT, while every read in the body already goes through the cell. The
-           publish used to sit at the capture fill -- the point the lifted proc
-           is built -- so every read before that read a cell still holding the
-           previous iteration's value, or nil on the first pass. Two nested
-           blocks and a `next` were enough to arrange it: doom's build_composite
-           saw `pref` as nil on the first patch of every texture and drew
-           nothing. The slot is current from the moment the loop writes it, so
-           publish here, at the top of the body, which is where the LocalVar
-           doc has always said the copy belongs. */
-        Scope *psc = comp_scope_of(c, blk);
-        LocalVar *plv = psc ? scope_local(psc, tmpn) : NULL;
-        if (plv && plv->is_cell && plv->cell_shadow) {
-          const char *prn = rename_local(tmpn);
-          /* Inlined inside a real proc function the cell is reachable only
-             through the capture struct, and the slot is not this frame's at
-             all -- there the capture fill is still the only publish. */
-          if (!(g_cap_struct && g_cap_names && nameset_has(g_cap_names, prn))) {
-            /* A fresh cell first, as a captured block-local gets below: the
-               parameter is bound anew by every iteration too, and one shared
-               cell had every proc a `&blk` callee stored answer the last
-               value the parameter took (#4462). */
-            char pcell_buf[160];
-            emit_fresh_cell(c, plv, cell_var_name(prn, pcell_buf, sizeof pcell_buf), b, indent);
-            emit_indent(b, indent);
-            if (plv->type == TY_PROC)
-              buf_printf(b, "*_cell_%s = (sp_int)(uintptr_t)lv_%s;\n", prn, prn);
-            else
-              buf_printf(b, "*_cell_%s = lv_%s;\n", prn, prn);
-          }
-        }
-      }
-      else {
-        Scope *sc = comp_scope_of(c, blk);
-        LocalVar *lv = sc ? scope_local(sc, tmpn) : NULL;
-        /* A captured (cell-backed) block-local gets a FRESH cell each
-           invocation: the capture struct copies the current cell pointer at
-           proc creation, so per-iteration closures each keep their own
-           binding -- one shared cell made every closure observe the final
-           iteration's value (#3230). The prologue's SP_GC_ROOT registered
-           the cell VARIABLE's address, so the reassignment stays rooted;
-           earlier cells stay live through their captures' scans. */
-        if (lv && lv->is_cell) {
-          const char *rn2 = rename_local(tmpn);
-          /* The cell VARIABLE is declared in the frame that owns the scope. A
-             block body is not always emitted into that frame: when an
-             enclosing block became a real proc function, this one is inlined
-             INSIDE it, and there the cell is reachable only through the
-             capture struct -- `_cell_terms` named nothing the function
-             declared and the C build stopped (#4127). Refreshing the capture
-             slot is also the right per-iteration semantics: a proc created in
-             this iteration copies the slot at creation, so it keeps this
-             iteration's binding. */
-          char cellv_buf[160];
-          const char *cellv = cell_var_name(rn2, cellv_buf, sizeof cellv_buf);
-          emit_fresh_cell(c, lv, cellv, b, indent);
-        }
-        else if (lv && lv->type != TY_UNKNOWN && !lv->is_cell) {
+    if (is_param) {
+      /* A cell_shadow param is bound by the loop emitters WRITING THE PLAIN C
+         SLOT, while every read in the body already goes through the cell. The
+         publish used to sit at the capture fill -- the point the lifted proc
+         is built -- so every read before that read a cell still holding the
+         previous iteration's value, or nil on the first pass. Two nested
+         blocks and a `next` were enough to arrange it: doom's build_composite
+         saw `pref` as nil on the first patch of every texture and drew
+         nothing. The slot is current from the moment the loop writes it, so
+         publish here, at the top of the body, which is where the LocalVar
+         doc has always said the copy belongs. */
+      Scope *psc = comp_scope_of(c, blk);
+      LocalVar *plv = psc ? scope_local(psc, tmpn) : NULL;
+      if (plv && plv->is_cell && plv->cell_shadow) {
+        const char *prn = rename_local(tmpn);
+        /* Inlined inside a real proc function the cell is reachable only
+           through the capture struct, and the slot is not this frame's at
+           all -- there the capture fill is still the only publish. */
+        if (!(g_cap_struct && g_cap_names && nameset_has(g_cap_names, prn))) {
+          /* A fresh cell first, as a captured block-local gets below: the
+             parameter is bound anew by every iteration too, and one shared
+             cell had every proc a `&blk` callee stored answer the last
+             value the parameter took (#4462). */
+          char pcell_buf[160];
+          emit_fresh_cell(c, plv, cell_var_name(prn, pcell_buf, sizeof pcell_buf), b, indent);
           emit_indent(b, indent);
-          /* A value-type object is stored inline (sp_X, not sp_X*), so its
-             empty/nil reset is a zeroed struct -- default_value_from_compiler(c, )'s blanket
-             "NULL" would assign a pointer to a struct lvalue (#3267). */
-          if (ty_is_object(lv->type) && c->classes[ty_object_class(lv->type)].is_value_type) {
-            buf_printf(b, "lv_%s = (sp_%s){0};\n", rename_local(tmpn),
-                       c->classes[ty_object_class(lv->type)].c_name);
-          }
-          else {
-            /* a block-local starts every iteration nil: an oint slot's nil,
-               a plain scalar's zero */
-            const char *nv = slot_is_oint(lv) ? oint_nil(lv->type) : nil_value(lv->type);
-            if (!nv) nv = lv->type == TY_RANGE ? "(sp_Range){0}" : default_value_from_compiler(c, lv->type);
-            buf_printf(b, "lv_%s = %s;\n", rename_local(tmpn), nv);
-          }
+          if (plv->type == TY_PROC)
+            buf_printf(b, "*_cell_%s = (sp_int)(uintptr_t)lv_%s;\n", prn, prn);
+          else
+            buf_printf(b, "*_cell_%s = lv_%s;\n", prn, prn);
         }
       }
-      if (tmpn != tmpn_buf) free(tmpn);
     }
-    if (!e) break;
-    p = e + 1;
+    else {
+      Scope *sc = comp_scope_of(c, blk);
+      LocalVar *lv = sc ? scope_local(sc, tmpn) : NULL;
+      /* A captured (cell-backed) block-local gets a FRESH cell each
+         invocation: the capture struct copies the current cell pointer at
+         proc creation, so per-iteration closures each keep their own
+         binding -- one shared cell made every closure observe the final
+         iteration's value (#3230). The prologue's SP_GC_ROOT registered
+         the cell VARIABLE's address, so the reassignment stays rooted;
+         earlier cells stay live through their captures' scans. */
+      if (lv && lv->is_cell) {
+        const char *rn2 = rename_local(tmpn);
+        /* The cell VARIABLE is declared in the frame that owns the scope. A
+           block body is not always emitted into that frame: when an
+           enclosing block became a real proc function, this one is inlined
+           INSIDE it, and there the cell is reachable only through the
+           capture struct -- `_cell_terms` named nothing the function
+           declared and the C build stopped (#4127). Refreshing the capture
+           slot is also the right per-iteration semantics: a proc created in
+           this iteration copies the slot at creation, so it keeps this
+           iteration's binding. */
+        char cellv_buf[160];
+        const char *cellv = cell_var_name(rn2, cellv_buf, sizeof cellv_buf);
+        emit_fresh_cell(c, lv, cellv, b, indent);
+      }
+      else if (lv && lv->type != TY_UNKNOWN && !lv->is_cell) {
+        emit_indent(b, indent);
+        /* A value-type object is stored inline (sp_X, not sp_X*), so its
+           empty/nil reset is a zeroed struct -- default_value_from_compiler(c, )'s blanket
+           "NULL" would assign a pointer to a struct lvalue (#3267). */
+        if (ty_is_object(lv->type) && c->classes[ty_object_class(lv->type)].is_value_type) {
+          buf_printf(b, "lv_%s = (sp_%s){0};\n", rename_local(tmpn),
+                     c->classes[ty_object_class(lv->type)].c_name);
+        }
+        else {
+          /* a block-local starts every iteration nil: an oint slot's nil,
+             a plain scalar's zero */
+          const char *nv = slot_is_oint(lv) ? oint_nil(lv->type) : nil_value(lv->type);
+          if (!nv) nv = lv->type == TY_RANGE ? "(sp_Range){0}" : default_value_from_compiler(c, lv->type);
+          buf_printf(b, "lv_%s = %s;\n", rename_local(tmpn), nv);
+        }
+      }
+    }
   }
 }
-
 /* The receiver's local name when it is a shared-mutable (TY_STRBUF) string
    local read, else NULL (#3227 shim gate). */
 const char *strbuf_local_name(Compiler *c, int recv) {
@@ -3822,16 +3870,14 @@ int sb_shim_args_first(Compiler *c, int id, Buf *pre, int indent) {
 int strbuf_marked_yields_handle(Compiler *c, int v) {
   const NodeTable *nt = c->nt;
   if (nt_kind(nt, v) != NK_CallNode) return 0;
+  if (repr_call_returns_handle(c, v)) return 1;
   int r = nt_ref(nt, v, "receiver");
   TyKind rt = r >= 0 ? comp_ntype(c, r) : TY_UNKNOWN;
-  /* A fresh object-method result is bytes to wrap, not a reader's handle. */
-  if (ty_is_object(rt) && share_value_fresh(c, v, 0)) return 0;
-  /* A yielding method is inlined into the demanded handle slot. Other
-     method calls keep their byte ABI and need a proved return pickup;
-     a field reader has its own handle arm. */
+  /* A yielding call can inline into the requested handle slot. A field
+     reader can take its handle from the slot it reads. */
   if (ty_is_object(rt)) {
     int mi = cplan_user(c, v).mi;
-    if (mi >= 0) return c->scopes[mi].yields || an_memo_reader_ivar(c, mi) || repr_call_returns_handle(c, v);
+    if (mi >= 0) return c->scopes[mi].yields || an_memo_reader_ivar(c, mi);
   }
   if (rt != TY_STRING && rt != TY_STRBUF) return 1;
   const char *nm = nt_str(nt, v, "name");
@@ -4064,17 +4110,7 @@ int strbuf_call_reads_handle(Compiler *c, int recv) {
 const NativeMethod *strbuf_native_answer(Compiler *c, int n) {
   const NodeTable *nt = c->nt;
   if (n < 0 || nt_kind(nt, n) != NK_CallNode || nt_ref(nt, n, "block") >= 0) return NULL;
-  int r = nt_ref(nt, n, "receiver");
-  TyKind rt = r >= 0 ? comp_ntype(c, r) : TY_UNKNOWN;
-  /* (or a subclass of one, where no method of the program's answers the name first) */
-  int nk = ty_is_object(rt) ? comp_native_answer_class(c, ty_object_class(rt), nt_str(nt, n, "name")) : -1;
-  if (nk < 0 || !c->classes[nk].is_native_class) return NULL;
-  int a = nt_ref(nt, n, "arguments"), argc = 0;
-  if (a >= 0) nt_arr(nt, a, "arguments", &argc);
-  int nm = comp_native_method_find(c, nk, nt_str(nt, n, "name"), argc, 0);
-  const NativeMethod *m = nm >= 0 ? &c->native_methods[nm] : NULL;
-  if (!m || !(m->share & NSH_ANSWERS) || !m->share_csym || argc != 0) return NULL;
-  return m;
+  return repr_native_string_reader(c, n);
 }
 /* The handle text of recv's slot, appended to b of any length, and with b
    NULL only the answer is given, nothing emitted. The one place the paths
@@ -4256,19 +4292,10 @@ static int strbuf_slot_into(Compiler *c, int recv, Buf *b) {
   }
   /* a native method answering the String its object keeps: its handle
      form's call */
-  const NativeMethod *nm = strbuf_native_answer(c, recv);
-  if (nm) {
+  if (strbuf_native_answer(c, recv) && repr_native_call_handle(c, recv)) {
     if (!b) return 1;
-    Buf rb; memset(&rb, 0, sizeof rb);
-    emit_expr(c, nt_ref(c->nt, recv, "receiver"), &rb);
-    int fit = rb.p != NULL;
-    /* (the native object of a subclass's instance is cast, as the call's receiver is, #9269) */
-    TyKind ort = comp_ntype(c, nt_ref(c->nt, recv, "receiver"));
-    int sub = ty_is_object(ort) && ty_object_class(ort) != nm->class_id;
-    if (fit && sub) buf_printf(b, "%s((%s *)(%s))", nm->share_csym, c->classes[nm->class_id].c_struct, rb.p);
-    else if (fit) buf_printf(b, "%s(%s)", nm->share_csym, rb.p);
-    free(rb.p);
-    if (fit) return 1;
+    emit_native_string_handle(c, recv, b);
+    return 1;
   }
   /* (--share-strings: a value route over a handle, `(+s)`, whose handle
      already ran into a temp (emit_bang_self_handle): that temp holds it,
@@ -4860,6 +4887,23 @@ static int const_recv_hold(Compiler *c, int id, Buf *b, int *holds_slot, int stm
 int emit_const_class_call_wrap(Compiler *c, int id, Buf *b, void (*emit)(Compiler *, int, Buf *)) {
   if (nt_kind(c->nt, id) != NK_CallNode) return 0;
   int r = nt_ref(c->nt, id, "receiver");
+  /* a private constant read through its scope, as a call's receiver: the
+     read's NameError runs ahead of the call, which is emitted behind it for
+     its type alone */
+  {
+    static int in_private;
+    char pmsg[512];
+    if (r >= 0 && !in_private && const_path_private(c, r, pmsg, sizeof pmsg)) {
+      buf_puts(b, "({ sp_raise_cls(\"NameError\", \"");
+      emit_c_escaped_n(b, pmsg, strlen(pmsg));
+      buf_puts(b, "\"); ");
+      in_private = 1;
+      emit(c, id, b);
+      in_private = 0;
+      buf_puts(b, "; })");
+      return 1;
+    }
+  }
   if (r < 0 || !an_const_read_keeps_class(c, r) || const_value_recv(c, r) >= 0 || view_const_read_done(c, r)) return 0;
   for (int i = g_n_argov - 1; i >= 0; i--)
     if (g_argov_node[i] == id || g_argov_node[i] == r) return 0;
@@ -5297,6 +5341,7 @@ void emit_coerce_text(Compiler *c, int node, TyKind from, TyKind slot, int how,
     RCCT(CF_NIL_SENT);
     return;
   case CF_INT2BIG:
+    if (emit_bigint_lit(c, node, b)) { RCCT(CF_INT2BIG); return; }
     buf_printf(b, "sp_bigint_new_int(%s)", text);
     RCCT(CF_INT2BIG);
     return;
@@ -5858,7 +5903,7 @@ void emit_walk_arity_raise(Compiler *c, int id, int recv, const char *name, int 
   if (nt_argv_has(nt, av, an, NT_ARG_SPLAT | NT_ARG_KEYWORDS | NT_ARG_BLOCK)) return;
   int has_blk = nt_ref(nt, site, "block") >= 0;
   const struct { const char *cls, *test; } kinds[] = {
-    { "String", "_t%d.tag == SP_TAG_STR || sp_poly_is_strbuf(_t%d)" },
+    { "String", "sp_rbval_is_string(_t%d) || sp_poly_is_strbuf(_t%d)" },
     { "Symbol", "_t%d.tag == SP_TAG_SYM" },
     { "Integer", "_t%d.tag == SP_TAG_INT || _t%d.tag == SP_TAG_BIGINT" },
     { "Float", "_t%d.tag == SP_TAG_FLT" },
@@ -6504,8 +6549,8 @@ void emit_str_literal_n(Buf *b, const char *content, size_t len, int frozen) {
      The heap string it builds is writable (0xfe), so a frozen literal is
      sealed with sp_str_freeze_val (flips the heap marker to 0xf1 in place). */
   if (len > strlen(content)) {
-    /* A FROZEN NUL-containing literal is immortal (sp_str_sweep never frees a
-       0xf1 string), so build it once into a call-site-local static and reuse it.
+    /* A frozen NUL-containing literal is pinned. Build it once at this
+       call site and reuse it.
        This avoids re-allocating it on every evaluation -- which, besides the
        churn, made the literal a GC-triggering sibling that could sweep an
        unrooted operand mid-expression (e.g. the receiver in
@@ -6623,6 +6668,12 @@ int emit_catch_tag(Compiler *c, int id, Buf *b) {
   unsupported(c, id, "catch/throw with a Float or Bignum tag (use a Symbol, String, Integer, nil, boolean, or object tag)");
   return 0;
 }
+/* A key typed Bignum on an Integer-keyed table: the value may fit an sp_int
+   (`2**64 - 2**64 + 5`), and CRuby's Integer is one class, so the lookup is
+   decided at run time (sp_bigint_okey). */
+int hash_bigint_key(Compiler *c, int key, TyKind kt) {
+  return kt == TY_INT && comp_ntype(c, key) == TY_BIGINT;
+}
 /* A key whose static kind can never be in a typed hash's table: a String
    or a user object looked up in an Integer-keyed Hash, a Float where
    1.eql?(1.0) is false, nil in any of them. Hash looks a key up by #hash and
@@ -6639,11 +6690,17 @@ int hash_key_misses(Compiler *c, int key, TyKind kt) {
   TyKind actual = comp_ntype(c, key);
   if (kt == TY_POLY || actual == kt || actual == TY_POLY || actual == TY_UNKNOWN) return 0;
   if (kt == TY_STRING && actual == TY_STRBUF) return 0;
+  if (hash_bigint_key(c, key, kt)) return 0;
   return actual == TY_NIL || actual == TY_BOOL || actual == TY_INT ||
          actual == TY_BIGINT || actual == TY_FLOAT || actual == TY_SYMBOL ||
          actual == TY_STRING || actual == TY_STRBUF || actual == TY_REGEX ||
          ty_is_struct_valued(actual) || ty_is_array(actual) || ty_is_hash(actual) ||
          ty_is_object(actual);
+}
+
+/* a key the table's own key kind cannot carry to a block's parameter */
+int hash_key_foreign(Compiler *c, int key, TyKind kt) {
+  return hash_key_misses(c, key, kt) || hash_bigint_key(c, key, kt);
 }
 
 /* nil looked up in an Integer-keyed table as a stored key: never now. An
@@ -6672,7 +6729,7 @@ void emit_hash_okey(Compiler *c, int key, Buf *b) {
    nil key (CRuby looks nil up and misses; it is no TypeError) */
 int hash_okey_form(Compiler *c, int key, TyKind kt) {
   if (kt != TY_INT) return 0;
-  if (hash_key_misses(c, key, kt)) return 1;
+  if (hash_key_foreign(c, key, kt)) return 1;
   Repr r = repr_of(c, key);
   if (r.kind == RK_BOXED) return 1;
   return r.opt_producer && r.as_ty == TY_INT;
@@ -6689,8 +6746,11 @@ void emit_hash_key_o(Compiler *c, int key, TyKind kt, Buf *b) {
   if (!hash_okey_form(c, key, kt)) { emit_hash_key(c, key, kt, b); return; }
   if (hash_key_misses(c, key, kt)) { emit_hash_okey(c, key, b); return; }
   if (repr_of(c, key).kind == RK_BOXED) {
-    buf_puts(b, "({ sp_RbVal _hk = "); emit_boxed(c, key, b);
-    buf_puts(b, "; _hk.tag == SP_TAG_INT ? sp_oint_of(_hk.v.i) : sp_oint_nil(); })");
+    buf_puts(b, "sp_poly_okey("); emit_boxed(c, key, b); buf_puts(b, ")");
+    return;
+  }
+  if (hash_bigint_key(c, key, kt)) {
+    buf_puts(b, "sp_bigint_okey("); emit_expr(c, key, b); buf_puts(b, ")");
     return;
   }
   emit_oint_expr(c, key, TY_INT, b);
@@ -6705,12 +6765,10 @@ int hash_opw_okey(Compiler *c, int key, TyKind rt) {
 }
 /* that boxed key temp as the read's sp_oint key */
 void emit_opw_okey_read(const char *t, Buf *b) {
-  buf_printf(b, "(%s.tag == SP_TAG_INT ? sp_oint_of(%s.v.i) : sp_oint_nil())", t, t);
+  buf_printf(b, "sp_poly_okey(%s)", t);
 }
 
-/* --share-strings: String Array value v as a PolyArray holding each
-   element boxed as a handle of its own (a slot whose elements the rule
-   shares, or a fresh Array an iterator consumes: share_node_fresh_elems) */
+/* Box a String Array's elements with their existing handles. */
 void emit_str_array_handles(Compiler *c, int v, Buf *b) {
   /* a String Range's minmax: its min and max as they answer them, the
      endpoints themselves (sp_srange_extreme_h), not copies */
@@ -6762,7 +6820,7 @@ void emit_hash_key(Compiler *c, int key, TyKind kt, Buf *b) {
 }
 static void emit_hash_key_value(Compiler *c, int key, TyKind kt, Buf *b) {
   int kboxed = repr_of(c, key).kind == RK_BOXED;
-  if (hash_key_misses(c, key, kt)) {
+  if (hash_key_misses(c, key, kt) || (!kboxed && hash_bigint_key(c, key, kt))) {
     /* an Integer key no entry equals goes through the _okey entry points
        (hash_okey_miss), which each caller asks first: one that reaches here
        has none, and refuses at compile time rather than raise a TypeError
@@ -6791,10 +6849,8 @@ static void emit_hash_key_value(Compiler *c, int key, TyKind kt, Buf *b) {
        answer a value no key can equal and let the lookup miss. */
     buf_puts(b, "({ sp_RbVal _hk = ");
     emit_boxed(c, key, b);
-    /* A shared-string handle is `==` to the immediate string with the same
-       bytes and now hashes alike, so it is a key that IS in the table: deref
-       it rather than answering the no-key sentinel (#4279). */
-    if (kt == TY_STRING)      buf_puts(b, "; _hk = sp_poly_strbuf_deref(_hk); _hk.tag == SP_TAG_STR ? _hk.v.s : (const char *)0; })");
+    /* A String box supplies a byte key. Other kinds miss. */
+    if (kt == TY_STRING)      buf_puts(b, "; sp_rbval_string_bytes(_hk); })");
     else if (kt == TY_SYMBOL) buf_puts(b, "; _hk.tag == SP_TAG_SYM ? (sp_sym)_hk.v.i : (sp_sym)-1; })");
     else                      buf_puts(b, "; sp_poly_hkey_i(_hk); })");   /* another kind raises (A5) */
     return;
@@ -6804,23 +6860,7 @@ static void emit_hash_key_value(Compiler *c, int key, TyKind kt, Buf *b) {
     emit_boxed(c, key, b);
     return;
   }
-  /* a read marked to hand out a shared String's handle (a dynamic call's
-     argument the read also is, at another round) keys a String-keyed hash by
-     a copy of its bytes, which publishes nothing on the side channel. A key
-     whose handle is formed apart from its String (a literal a rest
-     parameter's earlier round marked, repr_handle_apart) is the String
-     already: emit_expr answers its bytes, which are the key as they are. */
-  Repr kr = repr_of(c, key);
-  if (kt == TY_STRING && comp_ntype(c, key) == TY_STRBUF && kr.handle && !repr_handle_apart(c, key, kr)) {
-    int t = ++g_tmp;
-    buf_printf(b, "({ sp_String *_t%d = ", t);
-    emit_expr(c, key, b);
-    /* (one representation: the key is read as the handle's view; the Hash
-       copies a key it keeps, sp_hash_key_str) */
-    buf_printf(b, "; _t%d ? sp_String_cstr(_t%d) : NULL; })", t, t);
-    return;
-  }
-  /* (one representation: a String key of either face, as bytes) */
+  /* Borrow the String's current bytes. The Hash owns any key it keeps. */
   if (kt == TY_STRING) { buf_puts(b, "SP_STR_B("); emit_expr(c, key, b); buf_puts(b, ")"); return; }
   emit_expr(c, key, b);
 }
@@ -7098,7 +7138,7 @@ static char *mc_version_name(const Scope *s) {
 }
 /* A replaced version no call marked reachable has no number and no
    function: spelled from its name it would be the table's method */
-static int mc_version_unkept(const Scope *s) {
+int mc_version_unkept(const Scope *s) {
   return s->replaced && !s->reachable && !s->version_n && !s->main_n && !s->entry && !s->c_name;
 }
 const char *mc_method(Compiler *c, const Scope *s) {
@@ -8102,25 +8142,13 @@ int ty_gc_holds_refs(Compiler *c, TyKind t) {
 /* Root a temp of a kind ty_gc_holds_refs answers: as emit_gc_root_tmp, or
    each String a by-value kind carries, the way declare_local_named roots
    a local of that kind. */
-/* The roots a String Range by value adds, built --share-strings, beyond its
-   two endpoint strings: the handles it keeps (#8321). `ref` is the struct. */
-void emit_srange_handle_roots(Compiler *c, const char *ref, Buf *b) {
-  buf_printf(b, " SP_GC_ROOT(%s.hf); SP_GC_ROOT(%s.hl);", ref, ref);
-}
-/* The mark lines of a String Range slot by value (`ref` the slot: an
-   object's ivar, a global, a constant, a class variable), which the walker
-   cannot follow: its two endpoint strings and, built --share-strings, the
-   handles it keeps (#8321). */
+/* A by-value String Range owns two handle references. */
 void emit_srange_marks(Compiler *c, const char *ref, Buf *b) {
-  buf_printf(b, "  sp_mark_string(%s.first);\n", ref);
-  buf_printf(b, "  sp_mark_string(%s.last);\n", ref);
-  buf_printf(b, "  sp_gc_mark(%s.hf);\n  sp_gc_mark(%s.hl);\n", ref, ref);
+  buf_printf(b, "  sp_gc_mark(%s.first);\n  sp_gc_mark(%s.last);\n", ref, ref);
 }
 void emit_gc_root_tmp_refs(Compiler *c, TyKind t, int tmp, Buf *b) {
   if (t == TY_STR_RANGE) {
-    buf_printf(b, "SP_GC_ROOT_STR(_t%d.first); SP_GC_ROOT_STR(_t%d.last);", tmp, tmp);
-    char ref[32]; snprintf(ref, sizeof ref, "_t%d", tmp);
-    emit_srange_handle_roots(c, ref, b);
+    buf_printf(b, "SP_GC_ROOT_SRANGE(_t%d);", tmp);
     return;
   }
   if (!comp_ty_value_obj(c, t)) { emit_gc_root_tmp(c, t, tmp, b); return; }
@@ -8204,7 +8232,7 @@ void emit_main_exit(Buf *b) {
 }
 
 void emit_retf_return(int eid, int has_retval, Buf *b) {
-  if (g_c_ret_void && g_ret_type == TY_UNKNOWN) { buf_printf(b, "if (_retf%d) { ", eid); emit_main_exit(b); }
+  if (g_c_ret_void && g_ret_type == TY_UNKNOWN && !g_in_file_top) { buf_printf(b, "if (_retf%d) { ", eid); emit_main_exit(b); }
   /* A fiber body is `static void`: returning the value there is a C
      constraint violation (GCC 14 rejects it), and the value had nowhere to
      go anyway -- a void function's caller cannot read it. Drop it and
@@ -8264,10 +8292,8 @@ void arity_kw_suffix(const Compiler *c, int params, char *out, size_t n) {
   for (int i = 0, first = 1; i < nk && off < n; i++) {
     if (!param_is_required_kw(nt, kws[i])) continue;
     /* a block parameter's rename suffix (`k__bp3`) is ours, not the name */
-    const char *kn = nt_str(nt, kws[i], "name");
-    if (!kn) kn = "?";
-    int kl = block_param_is_renamed(c, kn) ? (int)block_param_written_len(c, kn) : (int)strlen(kn);
-    off += (size_t)snprintf(out + off, n - off, "%s%.*s", first ? "" : ", ", kl, kn);
+    const char *kn = nt_str(nt, kws[i], "name") ? nt_wname(nt, kws[i]) : "?";
+    off += (size_t)snprintf(out + off, n - off, "%s%s", first ? "" : ", ", kn);
     first = 0;
   }
 }
@@ -9013,6 +9039,15 @@ void emit_oint_expr(Compiler *c, int node, TyKind t, Buf *b) {
   if (vc >= 0 && nt_kind(nt, vc) == NK_StatementsNode) {
     int pn = 0; const int *pv = nt_arr(nt, vc, "body", &pn);
     vc = pv && pn == 1 ? nt_paren_single(nt, pv[0]) : -1;
+  }
+  /* A collecting block reads a tail next as its result. Read that result
+     in the requested optional form, as for an ordinary tail. Other next
+     expressions still leave the block through the statement emitter. */
+  if (nt_kind(nt, vc) == NK_NextNode && next_is_block_value(c, vc)) {
+    int argc = 0;
+    const int *argv = call_args(nt, vc, &argc);
+    if (argc == 0) { buf_puts(b, oint_nil(t)); return; }
+    if (argc == 1) { emit_oint_expr(c, argv[0], t, b); return; }
   }
   /* a value with no C type of its own (a call on a method that answers
      nothing included): evaluated for its effect, then nil */

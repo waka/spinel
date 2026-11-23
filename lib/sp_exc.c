@@ -244,9 +244,7 @@ static int sp_exc_level_matches(const char *cls, const char *target) {
 /* Class names are rodata by contract -- every caller passes a bare literal and
    sp_exc_gc_scan never marks them -- so they take no string root here or in
    the raise path. Rooting one had the collector read its marker byte, which
-   for a bare literal is the byte BEFORE the object: an out-of-bounds read on
-   every raise, and a WRITE of 0xfc over whatever precedes it whenever that
-   byte happened to read as an unmarked heap string. */
+   for a bare literal is the byte before the object, an out-of-bounds read. */
 int sp_exc_cls_matches(const char *raised, const char *target) {
   if (!raised || !target) return 0;
 #ifdef SP_CEXT
@@ -465,7 +463,7 @@ sp_Exception *sp_exc_new_for_catch(const char *cls, const char *msg) {
   /* every caller hands a message with a marker byte (a raise's, from the
      handler stack, or sp_exc_msg_given's): a frozen one stays frozen */
   int fz = msg && msg != sp_exc_no_msg && !sp_cmsg_p(msg) &&
-           (((const unsigned char *)msg)[-1] == 0xfa || ((const unsigned char *)msg)[-1] == 0xf8);
+           (((const unsigned char *)msg)[-1] == 0xfa);
   /* the caller's message may be held by nothing else: rooted before the
      copy allocates (#8323) */
   const char *msg0 = msg; SP_GC_ROOT_STR(msg0);
@@ -582,15 +580,11 @@ sp_RbVal sp_Exception_set_backtrace(sp_Exception *e, sp_StrArray *bt) {
 }
 /* cls_name is rodata -- every caller passes a bare literal, and the scan below
    says so and never marks it. Rooting it as a STRING had the collector read
-   its marker byte, which for a bare literal is the byte BEFORE the object: a
-   global-buffer-overflow on every raise, and a WRITE of 0xfc over whatever
-   precedes it whenever that byte happens to read as an unmarked heap string.
-   ASAN reports it on the first collection inside any raise. */
-/* The message is copied onto the string heap first, then rooted. The caller's
+   its marker byte, which for a bare literal is outside the object. */
+/* The message is copied into a String object first, then rooted. The caller's
    pointer cannot be rooted as it stands: a bare C literal -- which every raise
    the runtime and the generated code issue passes -- has no marker byte, so
-   sp_mark_string reads the byte BEFORE the object, and WRITES 0xfc over it
-   whenever that byte reads as an unmarked heap string. The copy runs with no
+   sp_mark_string would read outside the object. The copy runs with no
    collection in between (sp_msg_heapify), so an unrooted heap message cannot
    be swept out from under it either. The no-message sentinel keeps its
    identity: it is what tells an empty message apart from none at all. */
@@ -748,7 +742,7 @@ const char *sp_exc_class_name(volatile sp_Exception *ve) {
      that byte -- hand back a marked copy instead. One copy is made for a name
      and kept, as a literal is. A Class value carries its name in a plain
      struct that no root and no scan knows (`k = e.class` held in a local, a
-     parameter or an instance variable), so a copy on the string heap was
+     parameter or an instance variable), so a managed copy was
      collected under it and `k.to_s` answered the String that took its place. */
   struct kept_name { const char *key, *copy; };
   static struct kept_name *kept = NULL;   /* guarded by the heap lock */
@@ -1220,6 +1214,28 @@ sp_RbVal sp_exc_error_code_acc(sp_Exception *e) {SP_GC_ROOT(e);
   sp_exc_acc_gate(e, SP_BCLS_SOCKET_RESOLUTIONERROR, "Socket::ResolutionError", "error_code");
   return e->xkey;
 }
+/* A parse error that knows where it is: JSON::ParserError, raised by the
+   json package's reader with the line and column its message names, which
+   #line and #column answer. They ride the xkey and result slots, which no
+   other accessor reads on that class. */
+SP_NORETURN void sp_raise_parse_error(const char *cls, const char *msg, sp_int line, sp_int column) {
+  sp_pending_exc_key = sp_box_int(line);
+  sp_pending_exc_val = sp_box_int(column);
+  sp_pending_exc_flags |= 2 | 4;
+  sp_raise_cls(cls, msg);
+}
+/* JSON::ParserError#line / #column (NestingError inherits them): what the
+   parser recorded, nil on one the program made itself or a NestingError, as
+   in json, whose reader sets @line and @column only on the errors it
+   positions. */
+sp_RbVal sp_exc_parse_line_acc(sp_Exception *e) {SP_GC_ROOT(e);
+  sp_exc_acc_gate(e, SP_BCLS_JSON_PARSERERROR, "JSON::ParserError", "line");
+  return e->has_key ? e->xkey : sp_box_nil();
+}
+sp_RbVal sp_exc_parse_column_acc(sp_Exception *e) {SP_GC_ROOT(e);
+  sp_exc_acc_gate(e, SP_BCLS_JSON_PARSERERROR, "JSON::ParserError", "column");
+  return e->has_key ? e->result : sp_box_nil();
+}
 /* A builtin class's direct superclass by name (SP_EXC_HIER, above). */
 const char *sp_exc_parent_of_name(const char *cls) {
   if (!cls) return NULL;
@@ -1250,6 +1266,7 @@ sp_bool sp_exc_has_acc(sp_Exception *e, const char *acc) {
     {"signo", "SignalException"}, {"signm", "SignalException"},
     {"name", "NameError"}, {"errno", "SystemCallError"}, {"result", "StopIteration"},
     {"error_code", "Socket::ResolutionError"},
+    {"line", "JSON::ParserError"}, {"column", "JSON::ParserError"},
   };
   for (size_t i = 0; i < sizeof OWN / sizeof OWN[0]; i++)
     if (!strcmp(acc, OWN[i][0])) return sp_exc_cls_matches(c, OWN[i][1]);
@@ -1340,11 +1357,11 @@ const char *sp_exc_cat(int n, ...) {
   for (int i = 0; i < n && i < 8; i++) { memcpy(w, parts[i], lens[i]); w += lens[i]; }
   return r;
 }
-/* "<Class>: <msg>" and "<msg> (<Class>)": the class name is read from the exception
-   itself (no allocation), msg is the Spinel String the caller computed first, and the
-   copy runs with no collection, so no argument needs a root. */
+/* "<Class>: <msg>" and "<msg> (<Class>)": the class display can allocate.
+   Keep the message bytes the caller computed live until the copy. */
 const char *sp_exc_full_text(volatile sp_Exception *ve, const char *msg) {
   sp_Exception *e = (sp_Exception *)ve;
+  SP_GC_ROOT_STR(msg);
   const char *cn = sp_exc_cls_display(e && e->cls_name ? e->cls_name : "RuntimeError");
   size_t lc = strlen(cn), lm = sp_str_byte_len(msg);
   char *r = sp_str_alloc_nogc(lc + 2 + lm);
@@ -1353,6 +1370,7 @@ const char *sp_exc_full_text(volatile sp_Exception *ve, const char *msg) {
 }
 const char *sp_exc_detailed_text(volatile sp_Exception *ve, const char *msg) {
   sp_Exception *e = (sp_Exception *)ve;
+  SP_GC_ROOT_STR(msg);
   const char *cn = sp_exc_cls_display(e && e->cls_name ? e->cls_name : "RuntimeError");
   size_t lc = strlen(cn), lm = sp_str_byte_len(msg);
   /* An empty message names the class, except RuntimeError's default text.
@@ -1766,28 +1784,18 @@ void *sp_exc_ending_obj(const char *cls, const char *msg, void *obj, void *cause
   if (!e->cause) { sp_gc_wb((void *)e); e->cause = (sp_Exception *)cause; }
   return e;
 }
-/* Drop the catch entries, break scopes and proc-return homes a raise unwinds
-   past. sp_raise_cls calls this just before it longjmps to sp_exc_stack
-   [sp_exc_top-1]; that handler is the frame the exception lands in, and every
-   entry opened INSIDE it dies with the C frames the longjmp skips over.
+/* Drop the catch entries, break scopes and proc-return homes a jump unwinds
+   past before entering sp_exc_stack[sp_exc_top - 1]. Entries opened inside
+   that handler die with the C frames the longjmp skips over.
 
    Each of the three records the exception depth at its own entry, so "opened
    inside the landing frame" reads the same on all of them: the landing frame
    was armed at sp_exc_top-1, so anything entered after it recorded sp_exc_top
    or more, and anything entered before it recorded less.
 
-   The raise is the one place this can be done once. A landing pops the same
-   entries with `> sp_exc_top` after its own sp_exc_top--, but only six of the
-   ten emitted landings ever did so, and the four that did not -- Kernel#loop
-   in either form, the enumerator fold and the ext-host try -- leaked every
-   entry that unwound through them. Here it also costs the emitted code
-   nothing.
-
-   Not called for a proc return, a throw or a valued break: those longjmp to
-   sp_exc_stack themselves, and each trims its own target stack first
-   (sp_throw sets sp_catch_top, sp_brk_throw sets sp_brk_top, sp_proc_return
-   walks to a live home), so the entries between here and the target are still
-   the ones they mean to deliver to. */
+   A transfer may cross several handlers. Each jump drops only the scopes
+   crossed on that leg, so an ensure can still use targets outside its
+   landing frame. */
 static void sp_handler_stacks_unwind(void) {
   /* a dead catch entry is worse than a leak: sp_catch_top is fixed at 64, so a
      raise out of a catch in a loop walks it off the end -- and a later `throw`
@@ -1824,9 +1832,12 @@ static void *sp_exc_recover_named(const char *cls, const char *msg) {
   else {
     /* "uninitialized constant NAME": the name is the unquoted trailing token,
        the constant the message reports as missing (#3034) */
+    /* ("private constant K::NAME referenced" names it the same way) */
     const char *pfx = "uninitialized constant ";
-    if (strncmp(msg, pfx, 23) != 0) return NULL;
-    const char *p = msg + 23;
+    const char *p;
+    if (strncmp(msg, pfx, 23) == 0) p = msg + 23;
+    else if (strncmp(msg, "private constant ", 17) == 0) p = msg + 17;
+    else return NULL;
     size_t n = 0;
     while (p[n] && (isalnum((unsigned char)p[n]) || p[n] == '_' || p[n] == ':')) n++;
     /* (of `Q::NAME` the last segment: the message names the scope too) */
@@ -1972,7 +1983,7 @@ SP_NORETURN SP_COLD void sp_raise_cls(const char *cls, const char *msg) {
   /* a raise leaves any region a signal may be raised in at once (#9222):
      what follows allocates */
   sp_sig_async_ok = 0;
-  /* Launder the message onto the string heap and root the copy before anything
+  /* Launder the message into a String object and root the copy before anything
      below allocates. `msg` is the caller's own pointer and comes in one of two
      shapes, neither of which survives a collection here. A raiser that formats
      its text -- sp_sprintf, as sp_raise_poly_nomethod and its kin do -- hands
@@ -2019,21 +2030,38 @@ SP_NORETURN SP_COLD void sp_raise_cls(const char *cls, const char *msg) {
   /* an object pending here belongs to a raise already made (a re-raise); one
      the steps below make for this raise is this raise's */
   int reinit_fresh = !sp_pending_exc_obj;
+  /* the steps below build the object a rescue, an at_exit hook or the report
+     reads; with none of them to read it the raise skips them. The report reads
+     it only through a #message or #to_s the program defines: one reading #key
+     on an uncaught `{}.fetch(:a)` gets :a, as in CRuby */
+  int carried = sp_exc_top > 0 || sp_at_exit_armed || sp_user_exc_message_fn != NULL;
   /* NameError/NoMethodError#name: the runtime raisers' messages carry the
      offending name as the first quoted token ("undefined method 'foo' for
      ..."); materialize the carried object with #name set so a rescue binding
-     reads it (#2758). Keyed on the exact runtime message shapes. */
-  if (!sp_pending_exc_obj && msg && cls && (sp_exc_top > 0 || sp_at_exit_armed) &&
+     reads it (#2758). Keyed on the exact runtime message shapes. A raise the
+     program wrote (`raise NameError, :"undefined method 'x'"`, a message
+     whose to_s gives that text) records no name or receiver, as in CRuby. */
+  if (!user_raise && !sp_pending_exc_obj && msg && cls && carried &&
       (strcmp(cls, "NoMethodError") == 0 || strcmp(cls, "NameError") == 0) &&
       (strncmp(msg, "undefined method '", 18) == 0 ||
        strncmp(msg, "undefined local variable or method '", 36) == 0 ||   /* 36 = prefix len; 37 compared the NUL too (#3121) */
        strncmp(msg, "private method '", 16) == 0 ||      /* visibility refusals carry the name too */
        strncmp(msg, "protected method '", 18) == 0 ||
        strncmp(msg, "instance variable ", 18) == 0 ||   /* remove_instance_variable of an absent ivar */
-       strncmp(msg, "uninitialized constant ", 23) == 0))   /* const_get / bad const (#3034) */
+       strncmp(msg, "uninitialized constant ", 23) == 0 ||   /* const_get / bad const (#3034) */
+       strncmp(msg, "private constant ", 17) == 0))          /* a private constant read through its scope */
     sp_pending_exc_obj = sp_exc_recover_named(cls, msg);
+  /* `raise KeyError, msg` (NameError, FrozenError) the program wrote records
+     no key or receiver, where the runtime's raisers do: #key and #receiver
+     raise ArgumentError on it, as in CRuby */
+  if (user_raise && !sp_pending_exc_obj && msg && cls && carried &&
+      (sp_exc_cls_matches(cls, "KeyError") || sp_exc_cls_matches(cls, "NameError") || sp_exc_cls_matches(cls, "FrozenError"))) {
+    sp_Exception *ue = sp_exc_new_for_catch(cls, msg);
+    ue->has_key = 0; ue->has_recv = 0;
+    sp_pending_exc_obj = ue;
+  }
   /* the introspection staging (receiver/key/value) rides the carried object */
-  if (sp_pending_exc_flags && msg && cls && (sp_exc_top > 0 || sp_at_exit_armed))
+  if (sp_pending_exc_flags && msg && cls && carried)
     sp_pending_exc_obj = sp_exc_apply_staged(cls, msg, sp_pending_exc_obj);
   sp_pending_exc_flags = 0;
   /* An error the runtime raises is built in CRuby by the class's #initialize,
@@ -2070,7 +2098,7 @@ SP_NORETURN SP_COLD void sp_raise_cls(const char *cls, const char *msg) {
      takes the cause, as in CRuby. A cause whose chain leads back to the
      object would close a cycle: CRuby raises ArgumentError instead. The
      object named as its own cause leaves its cause as it is. */
-  if ((sp_exc_top > 0 || sp_at_exit_armed) && sp_explicit_cause_set && sp_explicit_cause && sp_pending_exc_obj) {
+  if (carried && sp_explicit_cause_set && sp_explicit_cause && sp_pending_exc_obj) {
     if (sp_explicit_cause == sp_pending_exc_obj) {
       sp_explicit_cause = ((sp_Exception *)sp_pending_exc_obj)->cause;
     }
@@ -2085,7 +2113,7 @@ SP_NORETURN SP_COLD void sp_raise_cls(const char *cls, const char *msg) {
     }
   }
   /* The slot takes the laundered copy made at the top of this function (or the
-     bare-raise sentinel, or NULL) as it stands: it is already a string-heap
+     bare-raise sentinel, or NULL) as it stands: it is already a managed
      one with a marker byte, so sp_mark_in_flight_exceptions can mark it from
      here to the landing, and copying it a second time would only reintroduce
      an allocation between the last read of the caller's pointer and this
@@ -2134,6 +2162,18 @@ SP_NORETURN SP_COLD void sp_raise_cls(const char *cls, const char *msg) {
     SP_GC_ROOT(pending);
     sp_Exception *e = pending ? pending : sp_exc_new(cls, msg);
     SP_GC_ROOT(e);
+    /* the cause it was raised with (an explicit `cause:`, the exception a
+       rescue was handling, or the one in flight through an ensure), as a
+       rescue arm that took it would see it */
+    if (!e->cause) {
+      void *c = sp_exc_raise_cause(cont, e);
+      if (c && c != (void *)e) { sp_gc_wb((void *)e); e->cause = (sp_Exception *)c; }
+    }
+    /* (an uncaught raise the program wrote records no key or receiver either, for a reopened #message) */
+    if (!pending && user_raise && cls &&
+        (sp_exc_cls_matches(cls, "KeyError") || sp_exc_cls_matches(cls, "NameError") || sp_exc_cls_matches(cls, "FrozenError"))) {
+      e->has_key = 0; e->has_recv = 0;
+    }
     sp_ExcReport report = { e, NULL };
     sp_pending_exc_obj = NULL;
 #ifdef SP_EXC_ABORT
@@ -2173,11 +2213,37 @@ SP_NORETURN SP_COLD void sp_raise_cls(const char *cls, const char *msg) {
    a --debug backtrace names its frame Kernel#require, and the archive's
    -O2 build leaves no frame there. */
 #include "sp_proc.h"
+sp_unwind_state sp_unwind_pause(void) {
+  sp_unwind_state state = {
+    sp_unwind_kind, sp_unwind_target, sp_unwind_exc_top, sp_unwind_home,
+    { .tag = SP_TAG_NIL }
+  };
+  if (state.kind == SP_UNWIND_BREAK) state.value = sp_brk_val[state.target];
+  if (state.kind == SP_UNWIND_PROCRET) state.value = state.home->val;
+  sp_unwind_kind = SP_UNWIND_NONE;
+  return state;
+}
+
+void sp_unwind_restore(const sp_unwind_state *state) {
+  sp_unwind_kind = state->kind;
+  sp_unwind_target = state->target;
+  sp_unwind_exc_top = state->exc_top;
+  sp_unwind_home = state->home;
+  if (state->kind == SP_UNWIND_BREAK) sp_brk_val[state->target] = state->value;
+  if (state->kind == SP_UNWIND_PROCRET) state->home->val = state->value;
+  /* A throw delivers the most recent value written to its catch slot, even
+     if that later throw was canceled before reaching the catch. */
+}
+
 /* Continue a non-local unwind after a handler has run its ensure: if more ensure
    handlers lie between here and the target, longjmp to the next; otherwise
    deliver to the target (the proc-return home node, or the matched catch slot). */
 void sp_unwind_resume(void) {
-  if (sp_exc_top > sp_unwind_exc_top) { sp_poly_recur_unwind(); longjmp(sp_exc_stack[sp_exc_top - 1], 1); }
+  if (sp_exc_top > sp_unwind_exc_top) {
+    sp_handler_stacks_unwind();
+    sp_poly_recur_unwind();
+    longjmp(sp_exc_stack[sp_exc_top - 1], 1);
+  }
   int kind = sp_unwind_kind;
   sp_unwind_kind = SP_UNWIND_NONE;
   if (kind == SP_UNWIND_EXIT) exit(sp_exc_at_exit(0));
@@ -2189,9 +2255,11 @@ void sp_unwind_resume(void) {
     longjmp(sp_unwind_home->jb, 1);
   }
   if (kind == SP_UNWIND_BREAK) {
+    sp_brk_top = sp_unwind_target + 1;
     sp_poly_recur_pop(sp_brk_recur_mark[sp_unwind_target]);
     longjmp(sp_brk_stack[sp_unwind_target], 1);
   }
+  sp_catch_top = sp_unwind_target + 1;
   sp_poly_recur_pop(sp_catch_recur_mark[sp_unwind_target]);
   longjmp(sp_catch_stack[sp_unwind_target], 1);
 }
@@ -2207,7 +2275,7 @@ void sp_fiber_reraise(const char *cls, const char *msg, void *obj) {
      frozen one (a literal's, sp_exc_msg_plain) is handed on counted, so
      the re-raise keeps its mark */
   if (msg && !sp_exc_msg_empty_given(msg) && !sp_cmsg_p(msg) &&
-      (((const unsigned char *)msg)[-1] == 0xfa || ((const unsigned char *)msg)[-1] == 0xf8))
+      (((const unsigned char *)msg)[-1] == 0xfa))
     msg = sp_exc_msg_counted_frozen(msg, sp_str_byte_len(msg));
   sp_raise_cls(cls, msg);
 }
@@ -2248,13 +2316,12 @@ void sp_trap_call(sp_Proc *p, int no) {
   const char *ecls = sp_exc_cls[sp_exc_top], *emsg = sp_exc_msg[sp_exc_top];
   void *eobj = sp_exc_obj[sp_exc_top];
   SP_GC_ROOT_STR(emsg); SP_GC_ROOT(eobj);
-  int uk = sp_unwind_kind, ut = sp_unwind_target, ue = sp_unwind_exc_top;
-  struct sp_proc_home *uh = sp_unwind_home;
-  sp_unwind_kind = SP_UNWIND_NONE;
+  sp_unwind_state state = sp_unwind_pause();
+  SP_GC_ROOT_RBVAL(state.value);
   /* out of line on purpose: glibc marks sigprocmask __leaf__, and GCC would
      keep the unwind state in registers across a direct call */
   sp_sig_unblock(no, 0);
-  sp_unwind_kind = uk; sp_unwind_target = ut; sp_unwind_exc_top = ue; sp_unwind_home = uh;
+  sp_unwind_restore(&state);
   if (sp_unwind_kind != SP_UNWIND_NONE) sp_unwind_resume();
   sp_pending_exc_obj = eobj; sp_raise_cls(ecls, emsg);
 }

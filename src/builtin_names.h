@@ -126,6 +126,8 @@ int is_push_unshift(const char *n);   /* << push append unshift: is_push_alias's
 int is_load_path_write(const char *n); /* << push append unshift prepend concat: the calls that add to $LOAD_PATH */
 int is_poly_object_surface_name(const char *n); /* hash object_id __id__ instance_variables: a boxed receiver's call is emitted as Object's builtin, whatever a reopened builtin defines */
 int is_identity_query(const char *n); /* equal? object_id __id__ frozen?: tells an object from its copy */
+int is_string_boxed_reader(const char *n);
+int string_boxed_reader_arity(const char *n);
 int is_len_alias(const char *n);      /* length size */
 int is_length_spelling(const char *n); /* size count empty? */
 int is_difference_spelling(const char *n); /* difference */
@@ -149,6 +151,7 @@ int is_endpoint_query(const char *n); /* first last: collection or Range endpoin
 int is_map_alias(const char *n); /* map collect: Enumerable transformation aliases */
 int is_instance_eval_family(const char *n); /* instance_eval instance_exec */
 int is_reflective_access(const char *n); /* instance_variable_get/set, class_variable_get/set, const_get/set, remove_* */
+int is_unspelled_ivar_writer(const char *n); /* instance_variable_set, instance_eval/exec, define_singleton_method, Marshal, YAML, Psych */
 int is_name_checked_call(const char *n); /* CRuby's answer turns on the name given: a NameError for one not allowed or not there */
 int is_reflective_listing(const char *n); /* instance_variables class_variables constants */
 int is_local_reflection(const char *n); /* eval binding local_variable_get/set local_variables */
@@ -223,6 +226,12 @@ int is_object_loader(const char *recv, const char *meth, int argc); /* Marshal.l
 int is_method_bind_name(const char *n); /* bind bind_call */
 int is_timeout_call(const char *recv, const char *meth); /* Timeout.timeout(sec, klass) */
 int is_exception_ctor_name(const char *n); /* exception */
+int class_object_universal_method(const char *n); /* Class's public instance methods beyond Object's: new superclass ancestors attr ... */
+const char *class_object_universal_name(int i); /* ...the i-th of them, NULL past the last */
+int class_only_method(const char *n); /* new allocate attached_object subclasses superclass: not a module object's */
+int class_object_private_method(const char *n, int is_module); /* Class's or Module's private ones beyond Object's: included private ... */
+int class_object_answers_builtin(const char *n, int is_module); /* one of the two a class (module) object answers */
+int class_object_builtin_responds(const char *n, int is_module, int exc, int record); /* ...to respond_to?, with exception and a record class's own */
 int is_enumerator_maker(const char *n); /* to_enum enum_for */
 int is_allocate_name(const char *n); /* allocate */
 int is_ivar_remove_name(const char *n); /* remove_instance_variable */
@@ -233,10 +242,13 @@ const char *handle_attr_store(const char *n, int write); /* Thread Fiber: thread
 int is_frozen_value_class(const char *n); /* Integer Float Symbol NilClass TrueClass FalseClass Range */
 int is_nonblock_io(const char *n); /* read_nonblock write_nonblock */
 int is_io_read(const char *n); /* read */
+int is_io_sysread(const char *n);
+int io_output_buffer_pos(const char *n);
 
 int is_mul_or_pow(const char *n); /* * ** */
 int is_unary_sign(const char *n); /* +@ -@ */
 int is_unary_minus(const char *n); /* -@ */
+int is_casecmp_predicate(const char *n);
 int is_casecmp_family(const char *n); /* casecmp casecmp? */
 /* String#to_i([base]), #hex, #oct: the parses promote mode reads as a
    Bignum past sp_int */
@@ -266,6 +278,7 @@ int is_sort_family(const char *n); /* sort sort! */
 int is_hash_transform(const char *n); /* transform_values transform_keys */
 int is_fallback_block_call(const char *n); /* fetch delete fetch_values: the block is the fallback */
 int is_delete_name(const char *n);       /* delete: removal by key (ENV's missing-key block answers) */
+int is_io_syswrite(const char *n);
 int is_io_write(const char *n); /* syswrite write */
 int is_to_integer(const char *n); /* to_i to_int */
 int is_match_operator(const char *n); /* !~ =~ */
@@ -345,6 +358,9 @@ int is_bound_method_maker(const char *n);  /* method public_method: a Method of 
 int is_super_method_name(const char *n);   /* super_method: the Method one step up its owner's chain */
 /* const_get const_source_location nesting attached_object each_object eval binding */
 int is_constant_or_object_reflection(const char *n);
+/* is_constant_or_object_reflection, constants, __const_get__ __const_defined__: a call that reaches a
+   constant by a name it computes, or an object past the reads the program's syntax shows */
+int is_const_reaching_name(const char *n);
 int is_const_set_name(const char *n); /* const_set */
 int is_const_query_name(const char *n); /* const_get const_defined? const_source_location */
 int is_constants_list_name(const char *n); /* constants */
@@ -441,6 +457,7 @@ const char *builtin_ancestor_at(const char *cls, int i);   /* the i-th ancestor 
 int builtin_owns_instance_method(const char *cls, const char *m);   /* cls's own instance method m, any visibility (CRuby's tables) */
 const char *builtin_next_class_answering(int *i, const char *m);   /* the next class of the tables, from table *i, that Spinel has as a value and that answers m ahead of Object */
 int builtin_id_below_object_answers(int id, const char *m);   /* the builtin class with run-time id `id` does */
+int builtin_id_has_instance_method(int id, const char *m);   /* ...or an ancestor of its has m, any visibility, no undefine ahead */
 int builtin_mixin_module_id(const char *n);   /* Comparable Enumerable Kernel Math: its builtin id */
 int is_include_name(const char *n);
 int is_prepend_name(const char *n);
@@ -542,6 +559,9 @@ int is_kernel_module_function(const char *n);
 /* ...and one that never consults self (not `binding`). */
 int kernel_function_ignores_self(const char *n);
 int builtin_object_method_known(const char *m);   /* one of Object's own methods every object answers */
+int builtin_module_method_known(const char *m);   /* one of Module's own methods a class answers, and no object's */
+int kernel_private_method(const char *name);   /* one of the methods Kernel defines private */
+int is_object_method_name(const char *nm);   /* one of Object's public or private instance methods, Kernel's private ones too */
 const char *builtin_method_owner(const char *cls, const char *m);   /* the class or module defining builtin cls's m */
 const char *builtin_bool_method_owner(const char *cls, const char *m);   /* ...a true's or false's m, of class cls when known; NULL where it is not known */
 const char *builtin_function_owner(const char *m);   /* the module defining the function a receiverless method(:m) binds */
@@ -556,6 +576,8 @@ int method_list_vis_mask(const char *n); /* the visibilities a method list shows
 int is_instance_method_table_read(const char *n); /* is_instance_method_list names, instance_method */
 int is_class_value_reflection(const char *n); /* a listing, const_defined?, class_variable_get/set/defined?: from the receiver's class */
 extern const char SINGLETON_METHODS_NAME[];   /* "singleton_methods", the name a lookup of the class-side lists goes by */
+extern const char PUBLIC_METHOD_NAME[];   /* "public_method", the name a lookup of the captures of public methods goes by until desugared */
+extern const char METHOD_NAME[];   /* "method", the name a lookup of the captures goes by, a public_method's too once desugared (public_capture) */
 int is_singleton_method_list(const char *n); /* singleton_methods */
 int builtin_every_object_answers(const char *m, int cmeth); /* Object's own, Kernel's, Object's; with cmeth Module's too */
 int builtin_class_id_answers(int id, const char *m, int cmeth); /* the builtin class of cls_id id, or one above it, has m (cmeth: a class method) */
@@ -609,6 +631,7 @@ int is_builtin_module_const_name(const char *n);
 int is_untabled_native_class_name(const char *n);
 
 int is_define_method_name(const char *n); /* define_method */
+extern const char DEFINE_METHOD_NAME[];   /* "define_method", the name a lookup of Module's definer asks */
 int is_define_singleton_method_name(const char *n); /* define_singleton_method */
 int is_singleton_class_name(const char *n); /* singleton_class */
 int is_reopen_self_name(const char *n);       /* __self: the receiver of a method a builtin's reopening defines */
@@ -618,6 +641,7 @@ int is_native_decl_name(const char *n);     /* native_lib native_struct native_m
 int is_ffi_decl_name(const char *n);        /* ffi_lib attach_function attach_variable callback native_func ...: declarations made methods before the walk */
 int is_method_defined_query(const char *n); /* method_defined? public_/private_/protected_method_defined? */
 int method_defined_vis_mask(const char *n); /* the visibilities that query counts: 1 public, 2 protected, 4 private; 0 for any other name */
+int is_method_presence_name_query(const char *n);   /* respond_to? or a method_defined? query above */
 int is_undef_method_name(const char *n);  /* undef_method */
 int is_remove_method_name(const char *n); /* remove_method */
 int is_check_funcall_name(const char *n);   /* respond_to? respond_to_missing? method_missing: what rb_check_funcall asks */
@@ -793,6 +817,7 @@ int is_method_naming_call(const char *n);  /* define_method define_singleton_met
 int is_attr_name(const char *n);           /* attr attr_reader attr_writer attr_accessor: the Module methods that define accessors */
 int is_attr_decl_reader(const char *n);    /* attr attr_reader attr_accessor, and Spinel's class-body attribute attributes: declare a reader of each name */
 int is_attr_decl_writer(const char *n);    /* attr_writer attr_accessor attribute attributes: declare a writer of each name */
+int is_attr_may_write(const char *n);      /* is_attr_decl_writer's, and attr (`attr :x, true`) */
 int class_method_vis_of_name(const char *n); /* private_class_method public_class_method: BVIS_PRIVATE / BVIS_PUBLIC, else 0 */
 int is_refine_name(const char *n);         /* refine */
 int is_enum_helper_name(const char *n);   /* __enum_pairs __enum_count_int: the compiler's helpers a receiverless call names */

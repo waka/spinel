@@ -913,6 +913,7 @@ static int cf_lv(CF *f, int v, const char *nm) {
   Scope *s = &f->c->scopes[si];
   LocalVar *lv = scope_local(s, nm);
   if (!lv) return -1;
+  if (lv->owner != si) { si = lv->owner; s = &f->c->scopes[si]; }
   int idx = (int)(lv - s->locals);
   if (idx < 0 || idx >= f->nlv[si]) return -1;
   if (!f->lv_el[si]) {
@@ -927,6 +928,7 @@ static int cf_lv_in(CF *f, int si, const char *nm) {
   Scope *s = &f->c->scopes[si];
   LocalVar *lv = nm ? scope_local(s, nm) : NULL;
   if (!lv) return -1;
+  if (lv->owner != si) { si = lv->owner; s = &f->c->scopes[si]; }
   int idx = (int)(lv - s->locals);
   if (idx < 0 || idx >= f->nlv[si]) return -1;
   if (!f->lv_el[si]) {
@@ -3422,8 +3424,22 @@ static int cf_name_in(const char *nm, const char *const *names) {
   for (int i = 0; names[i]; i++) if (sp_streq(nm, names[i])) return 1;
   return 0;
 }
-static void cf_opaque_answer(CF *f, int v, int r, const char *nm, const int *argv, int argc, int blk) {
+/* every Class object, and the builtin ones: what a class reflection the
+   walk cannot follow hands out */
+static int cf_every_class(CF *f) {
   Compiler *c = f->c;
+  int b = cf_tb(f, 0);
+  for (int k = 0; k < c->nclasses; k++) cf_tb_bit(f, b, k + c->nclasses);
+  return cf_union(f, cf_pool_tb(f, b, 0, 0), cf_bv_set(f));
+}
+/* ...as the value of a reflection (superclass) and the elements of one that
+   answers an Array of them (ancestors, subclasses; the undirected walk holds
+   a value's elements in the value's own set) */
+static void cf_class_reflection_answer(CF *f, int v, int every) {
+  cf_add_set(f, v, every);
+  if (f->directed) cf_add_set(f, f->obj_cont[cf_el_obj(f, v)], every);
+}
+static void cf_opaque_answer(CF *f, int v, int r, const char *nm, const int *argv, int argc, int blk) {
   const NodeTable *nt = f->nt;
   static const char *const classes[] = { "superclass", "ancestors", "included_modules", "subclasses", "owner",
     "singleton_class", NULL };
@@ -3458,15 +3474,8 @@ static void cf_opaque_answer(CF *f, int v, int r, const char *nm, const int *arg
         cf_flow(f, f->ret_el[mi], v);
         cf_bind_block(f, mi, blk);
       } }
-  int every = -1;
-  { int b = cf_tb(f, 0);
-    for (int k = 0; k < c->nclasses; k++) cf_tb_bit(f, b, k + c->nclasses);
-    every = cf_union(f, cf_pool_tb(f, b, 0, 0), cf_bv_set(f)); }   /* (every Class object, and the builtin ones) */
-  if (cf_name_in(nm, classes)) {
-    cf_add_set(f, v, every);
-    cf_add_set(f, f->obj_cont[cf_el_obj(f, v)], every);   /* (ancestors: an Array of them) */
-    return;
-  }
+  int every = cf_every_class(f);
+  if (cf_name_in(nm, classes)) { cf_class_reflection_answer(f, v, every); return; }
   if (cf_name_in(nm, reports)) {
     /* a Method (method, public_method, singleton_method, bind) is called
        by its `[]` as a Proc is: the Proc set, whose `pr` the typing of a
@@ -4610,6 +4619,20 @@ static void cf_node(CF *f, int v) {
       cf_self_new(f, v, s->class_id, NULL, 0, -1, "allocate", -1);
       return;
     }
+    /* a super in a class method named subclasses, superclass, ancestors or
+       included_modules that reaches Class's or Module's hands out Class
+       objects, as the reflection called by name does (cf_opaque_answer;
+       the typing's twin is subs_super / rel_super). The builtin rule below
+       gave it builtin values and no class, so `super.reject(&:abstract?)`
+       in a subclasses override asked its block's parameter a class method
+       of the program's that no class value reached: the dispatch had no
+       class-side arm, and raised NoMethodError for the first subclass. */
+    if (!anc_user && s->is_cmethod && argc2 == 0 && blk < 0 &&
+        (sp_streq(s->name, "subclasses") || sp_streq(s->name, "superclass") ||
+         sp_streq(s->name, "ancestors") || sp_streq(s->name, "included_modules"))) {
+      cf_class_reflection_answer(f, v, cf_every_class(f));
+      return;
+    }
     if (!anc_user && !(s->is_cmethod && sp_streq(s->name, "new"))) {
       int ik = s->is_cmethod ? -1 : cf_inst_class(f, mi);
       int recv_el = ik >= 0 && !cf_selfless_fn(s->name) ? f->self_el[ik] : -1;
@@ -5339,23 +5362,67 @@ static void cf_solve(Compiler *c, int directed, int dump_facts) {
     ev = cf_union(&f, ev, cf_bv_set(&f));
     f.every = cf_union(&f, ev, cf_os_set(&f));
   }
+  /* Links read once for the two sets per class below, where each class
+     asked every class: a class's subclasses (its parent links), the
+     classes that include a module, a class's singleton classes. */
+  int ncl = c->nclasses;
+  int *kid_first = malloc(sizeof(int) * ((size_t)ncl + 1)), *kid_next = malloc(sizeof(int) * ((size_t)ncl + 1));
+  int *sg_first = malloc(sizeof(int) * ((size_t)ncl + 1)), *sg_next = malloc(sizeof(int) * ((size_t)ncl + 1));
+  int ninc = 0;
+  for (int x = 0; x < ncl; x++) ninc += c->classes[x].nincluded_mods;
+  int *inc_first = malloc(sizeof(int) * ((size_t)ncl + 1)), *inc_cls = malloc(sizeof(int) * ((size_t)ninc + 1)),
+      *inc_next = malloc(sizeof(int) * ((size_t)ninc + 1));
+  int *walk = malloc(sizeof(int) * (2 * (size_t)ncl + 2)), *seen = calloc((size_t)ncl + 1, sizeof(int));
+  if (!kid_first || !kid_next || !sg_first || !sg_next || !inc_first || !inc_cls || !inc_next || !walk || !seen) cf_oom();
+  for (int k = 0; k < ncl; k++) kid_first[k] = sg_first[k] = inc_first[k] = -1;
+  for (int j = ncl - 1; j >= 0; j--) {
+    int p = c->classes[j].parent;
+    kid_next[j] = -1;
+    if (p >= 0 && p < ncl && p != j) { kid_next[j] = kid_first[p]; kid_first[p] = j; }
+    int so = c->classes[j].is_singleton_of - 1;
+    sg_next[j] = -1;
+    if (so >= 0 && so < ncl) { sg_next[j] = sg_first[so]; sg_first[so] = j; }
+  }
+  for (int x = 0, e = 0; x < ncl; x++)
+    for (int m = 0; m < c->classes[x].nincluded_mods; m++, e++) {
+      int mk = c->classes[x].included_mods[m];
+      inc_cls[e] = x; inc_next[e] = -1;
+      if (mk >= 0 && mk < ncl) { inc_next[e] = inc_first[mk]; inc_first[mk] = e; }
+    }
+  int stamp = 0;
   for (int k = 0; k < c->nclasses; k++) {
     int b = cf_tb(&f, 1);
     cf_tb_bit(&f, b, k);
-    for (int j = 0; j < c->nclasses; j++)
-      if (c->classes[j].is_singleton_of - 1 == k) cf_tb_bit(&f, b, j);
+    for (int j = sg_first[k]; j >= 0; j = sg_next[j]) cf_tb_bit(&f, b, j);
     f.own[k] = cf_pool_tb(&f, b, 0, 0);
   }
   for (int k = 0; k < c->nclasses; k++) {
     int b = cf_tb(&f, 1);
     if (!f.mod[k]) cf_tb_bit(&f, b, k);
-    for (int j = 0; j < c->nclasses; j++) {
-      if (j == k || f.mod[j]) continue;
-      int in = is_descendant(c, j, k);
-      for (int x = j; x >= 0 && !in; x = c->classes[x].parent)
-        for (int m = 0; m < c->classes[x].nincluded_mods && !in; m++)
-          if (c->classes[x].included_mods[m] == k) in = 1;
-      if (in) cf_tb_bit(&f, b, j);
+    /* a class j other than k is in k's set when its parent chain reaches
+       k (is_descendant: not a class no reached code names) or a class of
+       that chain, j itself or an ancestor, includes k */
+    int n = 0;
+    ++stamp;
+    for (int e = inc_first[k]; e >= 0; e = inc_next[e])
+      if (seen[inc_cls[e]] != stamp) { seen[inc_cls[e]] = stamp; walk[n++] = inc_cls[e]; }
+    for (int i = 0; i < n; i++)
+      for (int j = kid_first[walk[i]]; j >= 0; j = kid_next[j])
+        if (seen[j] != stamp) { seen[j] = stamp; walk[n++] = j; }
+    for (int i = 0; i < n; i++) {
+      int j = walk[i];
+      if (j != k && !f.mod[j]) cf_tb_bit(&f, b, j);
+    }
+    /* the subtree of k itself, by the parent chain alone */
+    int m0 = n;
+    ++stamp;
+    walk[n++] = k; seen[k] = stamp;
+    for (int i = m0; i < n; i++)
+      for (int j = kid_first[walk[i]]; j >= 0; j = kid_next[j])
+        if (seen[j] != stamp) { seen[j] = stamp; walk[n++] = j; }
+    for (int i = m0 + 1; i < n; i++) {
+      int j = walk[i];
+      if (!f.mod[j] && is_descendant(c, j, k)) cf_tb_bit(&f, b, j);
     }
     f.desc[k] = cf_pool_tb(&f, b, 0, 0);
     f.self_el[k] = cf_new_el(&f);
@@ -5376,6 +5443,8 @@ static void cf_solve(Compiler *c, int directed, int dump_facts) {
       f.open[f.nopen++] = k;
     }
   }
+  free(kid_first); free(kid_next); free(sg_first); free(sg_next);
+  free(inc_first); free(inc_cls); free(inc_next); free(walk); free(seen);
   {
     int b = cf_tb(&f, 1);
     for (int k = 0; k < c->nclasses; k++)

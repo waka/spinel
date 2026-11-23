@@ -7,6 +7,7 @@
 #include "codegen_internal.h"
 #include "builtin_ops.h"
 #include "call_plan.h"
+#include "codegen_call_arms.h"
 
 /* The receiver's C text, emitted once. A row names it as $r, possibly
    more than once; every $r prints the same text, as the arms the rows
@@ -23,6 +24,7 @@ static char *op_recv_text(Compiler *c, const BopCtx *x) {
    so the C is emitted in the order the arm the row replaces emitted it:
      $r   the receiver, emitted at its first occurrence (or the text the
           caller rendered, x->rtext); a later $r repeats the same text
+     $S   the receiver as a String handle, including a value already held
      $R   the receiver emitted again, for an arm that emitted it twice
      $N   an Integer or Float receiver with its nil beside the value (an
           sp_oint / sp_ofloat, emit_oint_expr): a receiver that can be nil
@@ -59,8 +61,7 @@ static char *op_recv_text(Compiler *c, const BopCtx *x) {
           (array_frozen_cls)
      $eN  argument N by emit_expr
      $jN  argument N run for its effect, "(void)(...), ": nothing for a plain read (a variable, self, a literal)
-     $B / $E  a String Range's begin / end in _t$T, through its handle
-          under --share-strings (sp_srange_first / sp_srange_last)
+          (sp_srange_first / sp_srange_last)
      $bN  argument N boxed (emit_boxed)
      $fN  argument N as a double (emit_float_expr)
      $FN  argument N as an arithmetic method's Float operand: any other
@@ -182,6 +183,11 @@ static int emit_op_template(Compiler *c, const BopCtx *x, Buf *b) {
       else buf_puts(b, r);
       p++;
     }
+    else if (p[0] == '$' && p[1] == 'S') {
+      if (x->rtext) buf_printf(b, "SP_STR_HDL(%s)", x->rtext);
+      else emit_str_form_handle(c, x->recv, b);
+      p++;
+    }
     else if (p[0] == '$' && p[1] == 'N') {
       /* a receiver already rendered (rtext) is reused, never emitted again:
          its hoisted preludes and side effects ran once. An unwrapped oint
@@ -269,19 +275,6 @@ static int emit_op_template(Compiler *c, const BopCtx *x, Buf *b) {
     }
     else if (p[0] == '$' && p[1] == 'T') {
       buf_printf(b, "%d", x->t0);
-      p++;
-    }
-    /* a String Range's begin / end held in _t$T: the field, or under
-       --share-strings the endpoint read off the handle it may keep
-       (sp_srange_first / sp_srange_last, #8321), where #first / #last
-       raise for a beginless / endless Range, as CRuby's do
-       (sp_srange_need_end) */
-    else if (p[0] == '$' && (p[1] == 'B' || p[1] == 'E')) {
-      int beg = p[1] == 'B';
-      int chk = x->name && is_endpoint_query(x->name);
-      if (chk)
-        buf_printf(b, "sp_srange_%s(sp_srange_need_end(_t%d, %d))", beg ? "first" : "last", x->t0, !beg);
-      else buf_printf(b, "sp_srange_%s(_t%d)", beg ? "first" : "last", x->t0);
       p++;
     }
     else if (p[0] == '$' && p[1] == 'R') {
@@ -499,6 +492,16 @@ static void plan_check_observe(Compiler *c, int id, TyKind rt, const BuiltinOp *
             id, ty_name(rt), op->name, op->argc_min, op->argc_max, ty_name(bop_result_args(op, rt, argc, arg_of, &ba, facts)));
 }
 
+/* String#unpack(fmt): an Integer Array for a literal format of integer
+   directives (an_unpack_lit_type), the boxed values otherwise */
+static int emit_op_string_unpack(Compiler *c, const BopCtx *x, Buf *b) {
+  BuiltinOp op = *x->op;
+  BopCtx y = *x;
+  op.arg = repr_of(c, x->id).as_ty == TY_INT_ARRAY ? "sp_str_unpack_ints($r, $s0)" : "sp_str_unpack($r, $s0)";
+  y.op = &op;
+  return emit_op_template(c, &y, b);
+}
+
 static int (*const bop_emitters[BOPE__COUNT])(Compiler *, const BopCtx *, Buf *) = {
   [BOPE_NONE] = NULL,
   [BOPE_RANGE_CLONE] = emit_op_range_clone,
@@ -510,14 +513,17 @@ static int (*const bop_emitters[BOPE__COUNT])(Compiler *, const BopCtx *, Buf *)
   [BOPE_THREAD_SET_REPORT] = emit_op_thread_set_report,
   [BOPE_FLOAT_RATIONALIZE] = emit_op_float_rationalize,
   [BOPE_STRING_SCAN_CHECKED] = emit_op_string_scan_checked,
+  [BOPE_STRING_UNPACK] = emit_op_string_unpack,
   [BOPE_STRING_ASET] = emit_op_string_aset,
   [BOPE_STRING_INSERT] = emit_op_string_insert,
   [BOPE_STRING_CLEAR] = emit_op_string_clear,
   [BOPE_STRING_SLICE] = emit_op_string_slice,
   [BOPE_STRING_BYTESPLICE] = emit_op_string_bytesplice,
+  [BOPE_STRING_APPEND_AS_BYTES] = emit_op_string_append_as_bytes,
   [BOPE_STRING_DEDUP] = emit_op_string_dedup,
   [BOPE_STRING_SCRUB_BLOCK] = emit_op_string_scrub_block,
   [BOPE_STRING_LINES] = emit_op_string_lines,
+  [BOPE_STRING_CASECMP] = emit_op_string_casecmp,
   [BOPE_THREAD_RAISE] = emit_op_thread_raise,
   [BOPE_THREAD_TLS] = emit_op_thread_tls,
   [BOPE_MUTEX_SLEEP] = emit_op_mutex_sleep,
@@ -621,10 +627,35 @@ static int (*const bop_emitters[BOPE__COUNT])(Compiler *, const BopCtx *, Buf *)
   [BOPE_IO_SET_WINSIZE] = emit_op_io_set_winsize,
 };
 
+/* A reader of a Method whose capture raises wherever it runs (CallPlan.absent), or where its method is closed to it
+   (CallPlan.closed): the capture, its NameError, and the row's type's zero, which nothing reads; where the capture's
+   cells tell it at the run (CP_CLOSED_RUN), the capture ahead of the row's own answer. 0 for any other row */
+static int emit_absent_method_reader(Compiler *c, const BopCtx *x, Buf *b) {
+  if (bop_family_of(x->rt) != TY_METHOD || x->op->emit == BOPE_TEMPLATE || x->recv < 0) return 0;
+  CallPlan p = cplan_method_call(c, x->id);
+  if (!p.absent && !p.closed) return 0;
+  size_t at = b->len;
+  buf_puts(b, "((void)(");
+  emit_expr_for_effect(c, x->recv, b);
+  if (p.absent || p.closed != CP_CLOSED_RUN) {
+    buf_puts(b, "), ");
+    emit_unread_value(c, x->id, b);
+    buf_puts(b, ")");
+    return 1;
+  }
+  buf_puts(b, "), ");
+  if (!bop_emitters[x->op->emit](c, x, b)) {
+    buf_erase(b, at, b->len - at);
+    return 0;
+  }
+  buf_puts(b, ")");
+  return 1;
+}
+
 static int emit_selected_op(Compiler *c, const BopCtx *x, int observe, Buf *b) {
   const BuiltinOp *op = x->op;
   if (!op || op->emit == BOPE_NONE || !bop_emitters[op->emit]) return 0;
-  if (!bop_emitters[op->emit](c, x, b)) return 0;
+  if (!emit_absent_method_reader(c, x, b) && !bop_emitters[op->emit](c, x, b)) return 0;
   if (g_plan_check && observe) plan_check_observe(c, x->id, x->rt, op);
   return 1;
 }
