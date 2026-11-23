@@ -85,10 +85,14 @@ jobs:
           git fetch --no-tags https://github.com/matz/spinel.git "${{ needs.prepare.outputs.upstream }}"
           git merge --no-edit FETCH_HEAD
 
+      # apt が止まるとジョブの上限（360 分）まで待たされる（2026-11-23 の gate-split で 2 時間以上止まった）。
+      # upstream の ci.yml と同じく、手順に上限を付け、止まった取得は apt に再試行させる。
+      # ランナーのほかの apt の処理（自動更新など）が持つロックも、待つのは 120 秒まで
       - name: Install system packages
+        timeout-minutes: 20
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
+          sudo apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=120 update
+          sudo apt-get -o Acquire::Retries=3 -o DPkg::Lock::Timeout=120 install -y --no-install-recommends \
             libsqlite3-dev libssl-dev zlib1g-dev libffi-dev libyaml-dev time
 
       - name: Set up Ruby
